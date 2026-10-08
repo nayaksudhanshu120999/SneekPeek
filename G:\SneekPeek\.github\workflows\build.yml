@@ -1,0 +1,30 @@
+name: Build SneekPeek (Windows)
+
+# Builds SneekPeek.exe with MSVC on every push/PR and uploads it as an
+# artifact you can download from the Actions tab. No local compiler needed.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (CMake + MSVC)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Upload exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: SneekPeek-windows-x64
+          path: build/bin/SneekPeek.exe
+          if-no-files-found: error
