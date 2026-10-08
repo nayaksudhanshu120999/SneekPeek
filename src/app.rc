@@ -1,0 +1,33 @@
+#include <windows.h>
+#include "resource.h"
+
+// App icon (generated from search.png via tools/make_ico.ps1).
+IDI_APPICON ICON "app.ico"
+
+1 VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "SneekPeek"
+            VALUE "FileDescription",  "SneekPeek — lightweight command palette"
+            VALUE "FileVersion",      "1.0.0"
+            VALUE "InternalName",     "SneekPeek"
+            VALUE "OriginalFilename", "SneekPeek.exe"
+            VALUE "ProductName",      "SneekPeek"
+            VALUE "ProductVersion",   "1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
