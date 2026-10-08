@@ -1,0 +1,31 @@
+name: Release SneekPeek
+
+# Push a tag like v1.0.0 and this builds SneekPeek.exe and attaches it to a
+# GitHub Release, giving you a direct download link (no login required).
+#   git tag v1.0.0
+#   git push origin v1.0.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (CMake + MSVC)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/bin/SneekPeek.exe
+          generate_release_notes: true
