@@ -6,11 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Tiny + fast: optimize for size, strip symbols, static runtime where possible.
 if(MSVC)
-    add_compile_options(/O1 /Os /W3 /EHsc)
+    add_compile_options(/O1 /Os /W3 /EHsc /utf-8)
     # /MT = static CRT (no VC++ redist needed, single portable exe)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 else()
-    add_compile_options(-Os -s -Wall -Wextra)
+    add_compile_options(-Os -s -Wall -Wextra -finput-charset=UTF-8)
 endif()
 
 add_executable(SneekPeek WIN32
@@ -22,7 +22,7 @@ add_executable(SneekPeek WIN32
 target_include_directories(SneekPeek PRIVATE src)
 
 target_link_libraries(SneekPeek PRIVATE
-    user32 shell32 gdi32 advapi32 shlwapi comctl32
+    user32 shell32 gdi32 advapi32 shlwapi comctl32 comdlg32
 )
 
 if(MINGW)

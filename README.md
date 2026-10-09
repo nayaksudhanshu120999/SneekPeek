@@ -17,10 +17,12 @@ Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 |---|---|
 | `code` | fuzzy-matches apps (`Visual Studio Code`), Enter launches |
 | `anything else` | Enter → web search with your engine (default DuckDuckGo) |
-| `!g cats` | Google for `cats` |
-| `!yt lofi` | YouTube, `!w` Wikipedia, `!gh` GitHub, `!so` Stack Overflow, `!r` Reddit, `!m` Maps, `!t` Translate, `!a` Amazon, `!d` DuckDuckGo, `!x` X |
+| `yt` + `Space` | arms a YouTube chip in the search bar — type the query, Enter searches YouTube (Backspace on empty query or click `x` exits) |
+| `!g cats` | one-shot bang without the chip (Google for `cats`) |
 | `12*8` | calculator (Enter copies result) |
 | `↑` `↓` | move selection, `Enter` open, `Shift+Enter` force web search, `Esc` dismiss, `F5` rescan apps |
+
+Bang aliases are editable in Settings (default: `yt`/`youtube`, `gh`/`github`, `w`/`wiki`, `r`, `m`, `t`, `a`, `x`, `so`, `d`, `g` — each with its own color).
 
 ## Build
 
@@ -74,6 +76,9 @@ Notes:
 Tray → **Settings…**. Stored in `%APPDATA%\SneekPeek\settings.ini`:
 
 - Search engine (DuckDuckGo / Google / Bing / Brave / Custom URL with `%s`)
+- Browser for web + bang links (System default or a picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe` — detected automatically, or Browse)
+- Hidden apps (one exact app name per line — those never appear in suggestions)
+- Bangs (one per line: `alias, alias | Name | https://...%s | #RRGGBB`, Reset button restores defaults)
 - Include `PATH` executables (more hits, more RAM — off by default)
 - Run at startup (writes `HKCU\…\Run\SneekPeek`)
 
@@ -82,7 +87,7 @@ Tray → **Settings…**. Stored in `%APPDATA%\SneekPeek\settings.ini`:
 - One hidden `HWND` + blocking `GetMessage` loop → thread sleeps until an event. No timers, no polling → **0% CPU**.
 - App index is a single `vector<{name, path}>` (~a few hundred entries, ~100 KB) built **once** on a background thread, then the thread exits. No icon extraction, no file watchers → **~1–3 MB** total.
 - Global hotkey via `RegisterHotKey` (OS-level, no low-level keyboard hook).
-- Dismiss-on-click-outside via `WM_ACTIVATE` (no mouse hook).
+- Dismiss-on-click-outside via `WM_ACTIVATE` + `WM_ACTIVATEAPP` (no mouse hook).
 - `WS_EX_TOOLWINDOW` → no taskbar button; single instance via mutex.
 
 ## Project layout

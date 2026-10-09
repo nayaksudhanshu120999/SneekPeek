@@ -75,7 +75,7 @@ static void ScanPathExes(std::vector<AppEntry>& out) {
         std::wstring dir = env.substr(start, end - start);
         start = end + 1;
         if (dir.empty() || dir.size() > MAX_PATH) continue;
-        // Skip system32 churn? No — keep, but cap files per dir.
+        // Skip system32 churn? No - keep, but cap files per dir.
         std::wstring pattern = dir + L"\\*.exe";
         WIN32_FIND_DATAW fd{};
         HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
@@ -109,7 +109,7 @@ void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes) {
     // 2) All-users Start Menu
     if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_COMMON_PROGRAMS, NULL, 0, buf)))
         ScanLnkDir(buf, out);
-    // 3) Optional PATH scan (off by default — costs RAM)
+    // 3) Optional PATH scan (off by default - costs RAM)
     if (includePathExes)
         ScanPathExes(out);
 
@@ -123,7 +123,7 @@ void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes) {
     bool first = true;
     for (auto& e : out) {
         std::wstring k = ToLower(e.name);
-        if (!first && k == prev) continue; // dupe name — drop (keeps memory flat)
+        if (!first && k == prev) continue; // dupe name - drop (keeps memory flat)
         uniq.push_back(std::move(e));
         prev = k;
         first = false;
@@ -135,7 +135,7 @@ int FuzzyScore(const std::wstring& nameLower, const std::wstring& queryLower) {
     if (queryLower.empty()) return 0;
     if (nameLower.empty()) return -1;
 
-    // 1) Prefix match — best.
+    // 1) Prefix match - best.
     if (nameLower.compare(0, queryLower.size(), queryLower) == 0)
         return 10000 - (int)nameLower.size(); // shorter names rank higher
 

@@ -1,5 +1,5 @@
 #pragma once
-// SneekPeek — tiny app index (Start Menu .lnk + optional PATH scan)
+// SneekPeek - tiny app index (Start Menu .lnk + optional PATH scan)
 // Design goals: <300KB source, lazy one-time scan, ~100KB RAM, 0% idle CPU.
 
 #include <string>
