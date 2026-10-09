@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Tiny + fast: optimize for size, strip symbols, static runtime where possible.
 if(MSVC)
-    add_compile_options(/O1 /Os /W3 /EHsc /DUNICODE /D_UNICODE)
+    add_compile_options(/O1 /Os /W3 /EHsc)
     # /MT = static CRT (no VC++ redist needed, single portable exe)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 else()
