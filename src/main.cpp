@@ -72,11 +72,11 @@ static const UINT ID_TRAY_STARTUP   = 1003;
 static const UINT ID_TRAY_QUIT      = 1004;
 
 static const int kWidth = 600;
-static const int kInputH = 52;
+static const int kInputH = 44;
 static const int kItemH = 44;
 static const int kMaxItems = 6;
 static const int kCornerR = 14;
-static const int kChipH = 28;
+static const int kChipH = 26;
 static const int kChipRowH = 40;
 static const int kMaxChips = 4;
 
@@ -101,10 +101,6 @@ static std::wstring Trim(const std::wstring& s) {
     if (a == std::wstring::npos) return L"";
     size_t b = s.find_last_not_of(L" \t\r\n");
     return s.substr(a, b - a + 1);
-}
-static std::wstring TrimLeft(const std::wstring& s) {
-    size_t a = s.find_first_not_of(L" \t\r\n");
-    return (a == std::wstring::npos) ? L"" : s.substr(a);
 }
 static std::wstring GetEditText(HWND hEdit) {
     int n = GetWindowTextLengthW(hEdit);
@@ -276,7 +272,7 @@ static std::vector<ResultItem> g_results;
 // Minimal black palette. Category accents: App blue, Web green, Calc amber,
 // Bang = per-site color, Hint = gray.
 static const COLORREF kBg     = RGB(0, 0, 0);
-static const COLORREF kInput  = RGB(12, 12, 12);
+static const COLORREF kInput  = RGB(0, 0, 0); // seamless with the bar: minimal
 static const COLORREF kSel    = RGB(28, 28, 30);
 static const COLORREF kText   = RGB(240, 240, 240);
 static const COLORREF kSub    = RGB(130, 130, 135);
@@ -373,8 +369,8 @@ static void PlacePalette() {
     int h = kInputH + kItemH;
     SetWindowPos(g_hwndPalette, HWND_TOPMOST, x, y, kWidth, h,
                  SWP_SHOWWINDOW | SWP_NOACTIVATE);
-    SetWindowPos(g_hwndEdit, NULL, 16, 10, kWidth - 32, 32, SWP_NOZORDER);
-    int chipY = 10 + (32 - kChipH) / 2;
+    SetWindowPos(g_hwndEdit, NULL, 16, 7, kWidth - 32, 30, SWP_NOZORDER);
+    int chipY = 7 + (30 - kChipH) / 2;
     SetWindowPos(g_hwndChip, NULL, 16, chipY, 10, kChipH, SWP_NOZORDER | SWP_HIDEWINDOW);
     SetWindowPos(g_hwndChipRow, NULL, 10, kInputH, kWidth - 20, kChipRowH,
                  SWP_NOZORDER | SWP_HIDEWINDOW);
@@ -434,7 +430,7 @@ static void ActivateBang(int idx, const std::wstring& query) {
     int w = ChipWidthFor(dc, b.name);
     SelectObject(dc, old);
     ReleaseDC(g_hwndPalette, dc);
-    int chipY = 10 + (32 - kChipH) / 2;
+    int chipY = 7 + (30 - kChipH) / 2;
     // HWND_TOP: the chip must stay above the edit (which has WS_CLIPSIBLINGS
     // so it never paints over the chip). Synchronous paint: no blank flash.
     SetWindowPos(g_hwndChip, HWND_TOP, 16, chipY, w, kChipH, SWP_SHOWWINDOW);
@@ -442,6 +438,7 @@ static void ActivateBang(int idx, const std::wstring& query) {
     UpdateWindow(g_hwndChip);
     SendMessageW(g_hwndEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
                  MAKELPARAM(w + 8, 10));
+    SendMessageW(g_hwndEdit, EM_SETCUEBANNER, FALSE, (LPARAM)L""); // chip only
     g_changingEdit = true;
     SetWindowTextW(g_hwndEdit, query.c_str());
     SendMessageW(g_hwndEdit, EM_SETSEL, (WPARAM)query.size(), (LPARAM)query.size());
@@ -452,9 +449,11 @@ static void ActivateBang(int idx, const std::wstring& query) {
 static void DeactivateBang() {
     g_activeBang = -1;
     if (g_hwndChip) ShowWindow(g_hwndChip, SW_HIDE);
-    if (g_hwndEdit)
+    if (g_hwndEdit) {
         SendMessageW(g_hwndEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
                      MAKELPARAM(10, 10));
+        SendMessageW(g_hwndEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search");
+    }
 }
 
 // ------------------------------------------------------------- power actions
@@ -555,17 +554,10 @@ static void UpdateResults() {
     std::wstring raw = GetEditText(g_hwndEdit);
     std::wstring q = Trim(raw);
 
-    // --- bang-chip mode: one row for the armed site (no power/quick chips here)
-    if (const Bang* b = ActiveBang()) {
+    // --- bang-chip mode: chip only, no rows, no list.
+    if (ActiveBang()) {
         g_chips.clear();
         g_chipsFocus = false;
-        ResultItem r;
-        r.kind = ResultKind::Bang;
-        r.title = q.empty() ? (L"Search " + b->name) : q;
-        r.sub = b->name + L" - Enter to search";
-        r.action = q.empty() ? BangHome(b->url) : ExpandUrl(b->url, UrlEncodeQuery(q));
-        r.color = b->color;
-        g_results.push_back(std::move(r));
         RebuildListControl();
         return;
     }
@@ -942,10 +934,9 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         // WS_CLIPSIBLINGS everywhere: the edit must never paint over the chip.
         g_hwndEdit = CreateWindowExW(0, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | ES_LEFT | ES_AUTOHSCROLL,
-            16, 10, kWidth - 32, 32,
+            16, 7, kWidth - 32, 30,
             hwnd, (HMENU)1, g_hInst, NULL);
-        SendMessageW(g_hwndEdit, EM_SETCUEBANNER, TRUE,
-            (LPARAM)L"Search apps, web, power, or type a bang + Space (yt, gh, w...)");
+        SendMessageW(g_hwndEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search");
         SendMessageW(g_hwndEdit, WM_SETFONT, (WPARAM)g_fontInput, TRUE);
         SendMessageW(g_hwndEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
                      MAKELPARAM(10, 10));
@@ -953,7 +944,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
 
         g_hwndChip = CreateWindowExW(0, kChipClass, L"",
             WS_CHILD | WS_CLIPSIBLINGS,
-            16, 12, 10, kChipH,
+            16, 9, 10, kChipH,
             hwnd, (HMENU)3, g_hInst, NULL);
 
         g_hwndChipRow = CreateWindowExW(0, kChipRowClass, L"",
@@ -1002,7 +993,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                     if (!token.empty() && token[0] != L'!') {
                         int bi = FindBangByAlias(g_settings.bangs, BangLower(token));
                         if (bi >= 0) {
-                            ActivateBang(bi, TrimLeft(editRaw.substr(p + 1)));
+                            ActivateBang(bi, L""); // armed: empty box, chip only
                             break;
                         }
                     }
@@ -1267,9 +1258,12 @@ static void ShowSettingsPage(int page) {
 static HWND NewCtrl(const wchar_t* cls, const wchar_t* text, DWORD style,
                     int x, int y, int w, int h, HWND parent, UINT id) {
     DWORD st = WS_CHILD | style;
-    // Pushbuttons are owner-drawn (dark theme); checkboxes stay native themed.
-    if (wcscmp(cls, L"BUTTON") == 0 && (style & BS_AUTOCHECKBOX) == 0)
+    // All buttons owner-drawn (dark theme); auto-checkbox state still managed.
+    if (wcscmp(cls, L"BUTTON") == 0)
         st |= BS_OWNERDRAW;
+    // ComboBoxes owner-drawn so field + list stay dark under any system theme.
+    if (wcscmp(cls, WC_COMBOBOXW) == 0)
+        st |= CBS_OWNERDRAWFIXED | CBS_HASSTRINGS;
     return CreateWindowW(cls, text, st, x, y, w, h,
                          parent, (HMENU)(UINT_PTR)id, g_hInst, NULL);
 }
@@ -1277,6 +1271,17 @@ static HWND NewCtrl(const wchar_t* cls, const wchar_t* text, DWORD style,
 static void ApplyUIFont(HWND parent) {
     for (HWND c = GetWindow(parent, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT))
         SendMessageW(c, WM_SETFONT, (WPARAM)g_fontUI, FALSE);
+}
+
+static void DarkTitleBar(HWND hwnd) {
+    if (HMODULE d = LoadLibraryW(L"dwmapi.dll")) {
+        typedef HRESULT (WINAPI *Fn)(HWND, DWORD, LPCVOID, DWORD);
+        if (Fn f = (Fn)GetProcAddress(d, "DwmSetWindowAttribute")) {
+            BOOL dark = TRUE;
+            f(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
+        }
+        FreeLibrary(d);
+    }
 }
 
 static void OpenSettings() {
@@ -1288,6 +1293,7 @@ static void OpenSettings() {
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
         x, y, W, H, g_hwndPalette, NULL, g_hInst, NULL);
     ShowWindow(g_hwndSettings, SW_SHOW);
+    DarkTitleBar(g_hwndSettings);
     UpdateWindow(g_hwndSettings);
 }
 static void CloseSettings() {
@@ -1350,12 +1356,15 @@ static void ReadQuickFromList() {
 }
 
 static bool BangEditorToBang(HWND owner, Bang& out) {
-    std::wstring line = GetWindowString(g_hwndBangAlias) + L" | " +
-                        GetWindowString(g_hwndBangName) + L" | " +
-                        GetWindowString(g_hwndBangUrl) + L" | " +
-                        GetWindowString(g_hwndBangColor);
+    std::wstring aliases = Trim(GetWindowString(g_hwndBangAlias));
+    std::wstring name = Trim(GetWindowString(g_hwndBangName));
+    std::wstring url = Trim(GetWindowString(g_hwndBangUrl));
+    COLORREF col;
+    if (!ParseColor(GetWindowString(g_hwndBangColor), col))
+        col = RandomBangColor(); // empty/invalid -> tasteful random pick
+    std::wstring line = aliases + L" | " + name + L" | " + url + L" | " + SerializeColor(col);
     if (!ParseBangLine(line, out)) {
-        MessageBoxW(owner, L"Invalid bang. Need: alias, alias | Name | https://...%s | #RRGGBB",
+        MessageBoxW(owner, L"Need: alias | Name | https://...%s (color is auto-picked if empty)",
                     L"SneekPeek", MB_ICONWARNING | MB_OK);
         return false;
     }
@@ -1466,7 +1475,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             SendMessageW(g_hwndBangAlias, EM_SETCUEBANNER, TRUE, (LPARAM)L"aliases");
             SendMessageW(g_hwndBangName, EM_SETCUEBANNER, TRUE, (LPARAM)L"Name");
             SendMessageW(g_hwndBangUrl, EM_SETCUEBANNER, TRUE, (LPARAM)L"url with %s");
-            SendMessageW(g_hwndBangColor, EM_SETCUEBANNER, TRUE, (LPARAM)L"#RRGGBB");
+            SendMessageW(g_hwndBangColor, EM_SETCUEBANNER, TRUE, (LPARAM)L"auto color if empty");
             page(g_pageBangs, NewCtrl(L"BUTTON", L"Add",
                 WS_VISIBLE, 24, 316, 84, 26, hwnd, IDC_BANG_ADD));
             page(g_pageBangs, NewCtrl(L"BUTTON", L"Update",
@@ -1539,24 +1548,90 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         HDC dc = (HDC)w;
         SetTextColor(dc, kText);
         if (m == WM_CTLCOLOREDIT) {
-            SetBkColor(dc, kInput);
-            return (LRESULT)g_brInput;
+            // Transparent: the black dialog shows through. Theme-proof, since
+            // themed (v6) controls would otherwise paint a white field.
+            SetBkMode(dc, TRANSPARENT);
+            return (HBRUSH)GetStockObject(NULL_BRUSH);
         }
         SetBkMode(dc, TRANSPARENT);
         SetBkColor(dc, kBg);
         return (LRESULT)g_brBg;
     }
     case WM_DRAWITEM: {
-        // Owner-drawn dark buttons (all Settings pushbuttons).
+        // Owner-drawn dark Settings controls: pushbuttons, checkboxes, combos.
         DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)l;
+        HDC dc = d->hDC;
+        if (d->CtlType == ODT_COMBOBOX) {
+            bool field = (d->itemState & ODS_COMBOBOXEDIT) != 0;
+            bool sel = !field && (d->itemState & ODS_SELECTED) != 0;
+            HBRUSH bg = CreateSolidBrush(sel ? RGB(29, 65, 115) : kBg);
+            FillRect(dc, &d->rcItem, bg);
+            DeleteObject(bg);
+            if ((int)d->itemID >= 0) {
+                wchar_t buf[256] = {0};
+                SendMessageW(d->hwndItem, CB_GETLBTEXT, d->itemID, (LPARAM)buf);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, kText);
+                SelectObject(dc, g_fontUI);
+                RECT tr = d->rcItem; tr.left += 8; tr.right -= 4;
+                DrawTextW(dc, buf, -1, &tr,
+                          DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
+            }
+            if (field) { // thin frame around the closed combo
+                HPEN pen = CreatePen(PS_SOLID, 1, RGB(66, 66, 72));
+                HGDIOBJ op = SelectObject(dc, pen);
+                SelectObject(dc, GetStockObject(NULL_BRUSH));
+                RoundRect(dc, d->rcItem.left, d->rcItem.top,
+                          d->rcItem.right, d->rcItem.bottom, 6, 6);
+                SelectObject(dc, op);
+                DeleteObject(pen);
+            }
+            return TRUE;
+        }
         if (d->CtlType != ODT_BUTTON) break;
+        DWORD bs = (DWORD)GetWindowLongW(d->hwndItem, GWL_STYLE);
+        bool isCheck = (bs & BS_TYPEMASK) == BS_CHECKBOX ||
+                       (bs & BS_TYPEMASK) == BS_AUTOCHECKBOX;
+        SetBkMode(dc, TRANSPARENT);
+        SelectObject(dc, g_fontUI);
+        if (isCheck) {
+            FillRect(dc, &d->rcItem, g_brBg);
+            int boxS = 14;
+            int by = d->rcItem.top + ((d->rcItem.bottom - d->rcItem.top) - boxS) / 2;
+            RECT box{d->rcItem.left + 2, by, d->rcItem.left + 2 + boxS, by + boxS};
+            HBRUSH bb = CreateSolidBrush(RGB(20, 20, 22));
+            HPEN bp = CreatePen(PS_SOLID, 1, RGB(100, 100, 108));
+            HGDIOBJ ob = SelectObject(dc, bb);
+            HGDIOBJ op = SelectObject(dc, bp);
+            RoundRect(dc, box.left, box.top, box.right, box.bottom, 4, 4);
+            SelectObject(dc, ob); SelectObject(dc, op);
+            DeleteObject(bb); DeleteObject(bp);
+            if (d->itemState & ODS_CHECKED) {
+                HPEN cp = CreatePen(PS_SOLID, 2, kAppCol);
+                HGDIOBJ ocp = SelectObject(dc, cp);
+                POINT pts[3] = {
+                    {box.left + 3, box.top + 7},
+                    {box.left + 6, box.top + 10},
+                    {box.left + 11, box.top + 4},
+                };
+                Polyline(dc, pts, 3);
+                SelectObject(dc, ocp);
+                DeleteObject(cp);
+            }
+            wchar_t text[128] = {0};
+            GetWindowTextW(d->hwndItem, text, 128);
+            SetTextColor(dc, kText);
+            RECT tr = d->rcItem; tr.left = box.right + 8;
+            DrawTextW(dc, text, -1, &tr,
+                      DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
+            return TRUE;
+        }
         bool pressed = (d->itemState & ODS_SELECTED) != 0;
         bool focus = (d->itemState & ODS_FOCUS) != 0;
         bool isSave = d->CtlID == (UINT)IDC_SAVE;
         bool isPage = d->CtlID >= (UINT)IDC_PAGE_0 && d->CtlID <= (UINT)IDC_PAGE_3;
         bool pageSel = isPage && (int)(d->CtlID - (UINT)IDC_PAGE_0) == g_settingsPage;
         bool accent = isSave || pageSel;
-        HDC dc = d->hDC;
         FillRect(dc, &d->rcItem, g_brBg);
         COLORREF fill = accent ? (pressed ? RGB(38, 82, 140) : RGB(29, 65, 115))
                                : (pressed ? RGB(52, 52, 56) : RGB(26, 26, 28));
@@ -1572,9 +1647,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         DeleteObject(bg); DeleteObject(pen);
         wchar_t text[128] = {0};
         GetWindowTextW(d->hwndItem, text, 128);
-        SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, kText);
-        SelectObject(dc, g_fontUI);
         DrawTextW(dc, text, -1, &d->rcItem,
                   DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS);
         return TRUE;
@@ -1832,6 +1905,7 @@ static void OnTrayCommand(UINT id) {
 // ------------------------------------------------------------- entry point
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     g_hInst = hInst;
+    srand((unsigned)GetTickCount()); // random bang colors for new entries
 
     // Single instance: forward to the running copy.
     HANDLE mutex = CreateMutexW(NULL, FALSE, kMutexName);

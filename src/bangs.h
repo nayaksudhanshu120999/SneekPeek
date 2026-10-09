@@ -3,6 +3,8 @@
 // Header-only. All UI strings stay plain ASCII (no mojibake, ever).
 #include <windows.h> // COLORREF, RGB
 #include <cwctype>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -23,6 +25,35 @@ inline std::wstring BangTrim(const std::wstring& s) {
 inline std::wstring BangLower(std::wstring s) {
     for (auto& c : s) c = (wchar_t)towlower(c);
     return s;
+}
+
+// #RRGGBB (leading # optional) -> COLORREF. False when malformed.
+inline bool ParseColor(const std::wstring& text, COLORREF& out) {
+    std::wstring h = BangTrim(text);
+    if (!h.empty() && h[0] == L'#') h.erase(h.begin());
+    if (h.size() != 6) return false;
+    wchar_t* end = nullptr;
+    unsigned long v = wcstoul(h.c_str(), &end, 16);
+    if (!end || *end != L'\0') return false;
+    out = RGB((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
+    return true;
+}
+
+inline std::wstring SerializeColor(COLORREF c) {
+    wchar_t b[16];
+    swprintf_s(b, 16, L"#%02X%02X%02X", GetRValue(c), GetGValue(c), GetBValue(c));
+    return b;
+}
+
+// Tasteful random pick for new bangs (user may leave the color empty).
+inline COLORREF RandomBangColor() {
+    static const COLORREF palette[] = {
+        RGB(96, 165, 250), RGB(52, 211, 153), RGB(251, 191, 36),
+        RGB(248, 113, 113), RGB(192, 132, 252), RGB(45, 212, 191),
+        RGB(251, 146, 60), RGB(244, 114, 182), RGB(163, 230, 53),
+        RGB(94, 234, 212), RGB(253, 224, 71), RGB(252, 165, 165),
+    };
+    return palette[rand() % 12];
 }
 
 inline std::vector<Bang> DefaultBangs() {
@@ -92,14 +123,8 @@ inline bool ParseBangLine(const std::wstring& line, Bang& out) {
     b.url = parts[2];
     b.color = RGB(142, 142, 147);
     if (parts.size() >= 4 && !parts[3].empty()) {
-        std::wstring h = parts[3];
-        if (!h.empty() && h[0] == L'#') h.erase(h.begin());
-        if (h.size() == 6) {
-            wchar_t* end = nullptr;
-            unsigned long v = wcstoul(h.c_str(), &end, 16);
-            if (end && *end == L'\0')
-                b.color = RGB((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
-        }
+        COLORREF c;
+        if (ParseColor(parts[3], c)) b.color = c;
     }
     if (b.aliases.empty() || b.name.empty()) return false;
     if (b.url.find(L"%s") == std::wstring::npos) return false;

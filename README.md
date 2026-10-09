@@ -17,7 +17,7 @@ Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 |---|---|
 | `code` | fuzzy-matches apps (`Visual Studio Code`), Enter launches |
 | `anything else` | Enter → web search with your engine (default DuckDuckGo) |
-| `yt` + `Space` | arms a YouTube chip in the search bar — type the query, Enter searches YouTube (Backspace on empty query or click `x` exits) |
+| `yt` + `Space` | chip-only mode: just the YouTube pill in the bar, no list — type the query, Enter searches (Backspace on empty query or click `x` exits) |
 | `!g cats` | one-shot bang without the chip (Google for `cats`) |
 | `shu` | power chips appear above the list (Shut down, Restart, Sleep, Hibernate) — Enter runs the selected chip, Tab cycles, Down jumps to the list |
 | `gmail` | quick-link chips (fixed URLs, no query) work the same way — Enter opens |
@@ -79,7 +79,7 @@ Tray → **Settings…** (tabbed, dark, matches the app). Stored in `%APPDATA%\S
 
 - **General** — engine (DuckDuckGo / Google / Bing / Brave / Custom URL with `%s`), browser for web + bang + quick links (System default or picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe`), PATH executables, Run at startup
 - **Hidden apps** — checkbox list of every indexed app; checked ones never appear in suggestions
-- **Bangs** — table (Aliases / Name / URL / Color), double-click a row to edit, Add/Update/Delete/Reset
+- **Bangs** — table (Aliases / Name / URL / Color), double-click a row to edit, Add/Update/Delete/Reset (leave the color empty for a random pick)
 - **Quick links** — table (Name / URL); typing the name in the palette shows a chip that opens the fixed URL on Enter (e.g. Gmail)
 
 ## Why it uses (almost) nothing
