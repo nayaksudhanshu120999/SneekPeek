@@ -16,8 +16,6 @@ endif()
 add_executable(SneekPeek WIN32
     src/main.cpp
     src/app_index.cpp
-
-line 18
     src/app.rc
 )
 
