@@ -14,7 +14,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      - name: Show repo tree (debug aid for missing-file errors)
+        run: git ls-files
 
       - name: Configure (CMake + MSVC)
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
