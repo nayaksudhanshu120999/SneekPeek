@@ -16,6 +16,8 @@ endif()
 add_executable(SneekPeek WIN32
     src/main.cpp
     src/app_index.cpp
+
+line 18
     src/app.rc
 )
 
@@ -30,9 +32,11 @@ if(MINGW)
     target_link_options(SneekPeek PRIVATE -static -mwindows -municode)
 endif()
 
-# MSVC: Windows GUI subsystem, no console window.
+# MSVC: Windows GUI subsystem, no console window. /MANIFEST:NO because our
+# own manifest (visual styles) comes from src/app.rc — otherwise the linker's
+# auto-generated manifest collides with it (CVT1100 duplicate resource).
 if(MSVC)
-    set_target_properties(SneekPeek PROPERTIES LINK_OPTIONS "/SUBSYSTEM:WINDOWS")
+    set_target_properties(SneekPeek PROPERTIES LINK_OPTIONS "/SUBSYSTEM:WINDOWS;/MANIFEST:NO")
 endif()
 
 # Predictable output path so CI can upload it: build/bin/SneekPeek.exe
