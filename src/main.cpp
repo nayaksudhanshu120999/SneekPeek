@@ -906,12 +906,13 @@ static void UpdateResults() {
     MatchSysPages(BangLower(q), setRows, 3);
 
     std::vector<ResultItem> webRows;
-    std::wstring directUrl; // URL-shaped input jumps straight to the site, first
-    if (IsUrlLike(q, directUrl)) {
+    std::wstring directUrl; // URL-shaped input: direct open only, no dupe search row
+    bool isUrl = IsUrlLike(q, directUrl);
+    if (isUrl) g_chipsFocus = false; // Enter opens the URL, chips stay on Tab
+    if (isUrl) {
         ResultItem r{ResultKind::Web, q, L"", directUrl, kWebCol};
         webRows.push_back(std::move(r));
-    }
-    {
+    } else {
         ResultItem web{ResultKind::Web, q, L"",
                        ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q)), kWebCol};
         webRows.push_back(std::move(web));
