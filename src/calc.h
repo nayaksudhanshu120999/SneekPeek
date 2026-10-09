@@ -10,8 +10,10 @@
 #include <string>
 
 struct CalcParser {
+    static const int kMaxDepth = 64;
     const wchar_t* p;
     bool ok = true;
+    int depth = 0;
     void Skip() { while (*p && iswspace(*p)) p++; }
     double ParseExpr() {
         double v = ParseTerm();
@@ -43,17 +45,21 @@ struct CalcParser {
     }
     double ParsePrimary() {
         Skip();
-        if (*p==L'('){ p++; double v=ParseExpr(); Skip(); if(*p==L')') p++; else ok=false; return v; }
-        if ((*p>=L'0'&&*p<=L'9')||*p==L'.'){
+        if (++depth > kMaxDepth) { ok = false; return 0; }
+        double r;
+        if (*p==L'('){ p++; double v=ParseExpr(); Skip(); if(*p==L')') p++; else ok=false; r = v; }
+        else if ((*p>=L'0'&&*p<=L'9')||*p==L'.'){
             wchar_t* end=nullptr; double v=wcstod(p,&end);
-            if(end==p){ok=false;return 0;} p=end; return v;
+            if(end==p){ok=false; r=0;} else { p=end; r=v; }
         }
-        ok=false; return 0;
+        else { ok=false; r=0; }
+        depth--;
+        return r;
     }
 };
 
 inline bool TryCalc(const std::wstring& q, double& out) {
-    if (q.empty()) return false;
+    if (q.empty() || q.size() > 256) return false; // pasted-garbage guard
     bool hasDigit=false, hasOp=false;
     for (wchar_t c:q){
         if(c>=L'0'&&c<=L'9') hasDigit=true;

@@ -270,6 +270,8 @@ static const COLORREF kAwakeCol = RGB(45, 212, 191);
 // Awake state + online worker state (see below).
 static bool g_awakeOn = false;
 static HANDLE g_onlineEvent = NULL;
+static HANDLE g_onlineStop = NULL;  // manual-reset: worker exits
+static HANDLE g_onlineThread = NULL;
 static std::atomic<int> g_onlineSeq{0};
 static std::wstring g_onlineRequested;
 static std::wstring g_onlineFor;
@@ -507,17 +509,32 @@ static void DeactivateBang() {
 }
 
 // ------------------------------------------------------------- power actions
+// Absolute system paths only: never resolve power tools from CWD or PATH.
+static std::wstring SystemExe(const wchar_t* name) {
+    wchar_t dir[MAX_PATH];
+    if (!GetSystemDirectoryW(dir, MAX_PATH)) return L"";
+    return std::wstring(dir) + L"\\" + name;
+}
 static void RunPower(PowerOp op) {
     switch (op) {
-    case PowerOp::Shutdown:
-        ShellExecuteW(NULL, L"open", L"shutdown.exe", L"/s /t 0", NULL, SW_HIDE);
+    case PowerOp::Shutdown: {
+        std::wstring exe = SystemExe(L"shutdown.exe");
+        if (!exe.empty())
+            ShellExecuteW(NULL, L"open", exe.c_str(), L"/s /t 0", NULL, SW_HIDE);
         break;
-    case PowerOp::Restart:
-        ShellExecuteW(NULL, L"open", L"shutdown.exe", L"/r /t 0", NULL, SW_HIDE);
+    }
+    case PowerOp::Restart: {
+        std::wstring exe = SystemExe(L"shutdown.exe");
+        if (!exe.empty())
+            ShellExecuteW(NULL, L"open", exe.c_str(), L"/r /t 0", NULL, SW_HIDE);
         break;
-    case PowerOp::Hibernate:
-        ShellExecuteW(NULL, L"open", L"shutdown.exe", L"/h", NULL, SW_HIDE);
+    }
+    case PowerOp::Hibernate: {
+        std::wstring exe = SystemExe(L"shutdown.exe");
+        if (!exe.empty())
+            ShellExecuteW(NULL, L"open", exe.c_str(), L"/h", NULL, SW_HIDE);
         break;
+    }
     case PowerOp::Sleep:
         SetSuspendState(FALSE, FALSE, FALSE);
         break;
@@ -536,23 +553,24 @@ static void ApplyAwake() {
 // ------------------------------------------------- online suggestions (async)
 // One persistent HTTPS session (no per-keystroke handshake), warmed on first
 // open, debounced, hard-capped ~0.5s, plus an instant local prefix cache.
+static HINTERNET g_whSession = NULL; // worker thread only: no lock needed
+static HINTERNET g_whConnect = NULL;
 static std::vector<std::wstring> FetchSuggestions(const std::wstring& q) {
-    static HINTERNET hS = NULL; // worker thread only: no lock needed
-    static HINTERNET hC = NULL;
     std::vector<std::wstring> out;
-    if (!hS) {
-        hS = WinHttpOpen(L"SneekPeek/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-        if (!hS) return out;
-        WinHttpSetTimeouts(hS, 300, 700, 300, 500); // tight per-phase caps
+    if (!g_whSession) {
+        g_whSession = WinHttpOpen(L"SneekPeek/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!g_whSession) return out;
+        WinHttpSetTimeouts(g_whSession, 300, 700, 300, 500); // tight per-phase caps
     }
-    if (!hC) {
-        hC = WinHttpConnect(hS, L"duckduckgo.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
-        if (!hC) { WinHttpCloseHandle(hS); hS = NULL; return out; }
+    if (!g_whConnect) {
+        g_whConnect = WinHttpConnect(g_whSession, L"duckduckgo.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (!g_whConnect) { WinHttpCloseHandle(g_whSession); g_whSession = NULL; return out; }
     }
     std::wstring path = L"/ac/?q=" + UrlEncodeQuery(q) + L"&type=list";
-    HINTERNET hR = WinHttpOpenRequest(hC, L"GET", path.c_str(), NULL, WINHTTP_NO_REFERER,
-                                     WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    HINTERNET hR = NULL;
+    if (g_whConnect) hR = WinHttpOpenRequest(g_whConnect, L"GET", path.c_str(), NULL, WINHTTP_NO_REFERER,
+                                             WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
     std::string data;
     bool ok = hR && WinHttpSendRequest(hR, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                        WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
@@ -568,7 +586,7 @@ static std::vector<std::wstring> FetchSuggestions(const std::wstring& q) {
             if (data.size() > 16384) break;
         }
     } else {
-        WinHttpCloseHandle(hC); hC = NULL; // drop dead connection; rebuilt next
+        WinHttpCloseHandle(g_whConnect); g_whConnect = NULL; // drop dead; rebuilt next
     }
     if (hR) WinHttpCloseHandle(hR);
     // Collect "..." tokens; skip the echo + "phrase" keys; unescape basics.
@@ -594,9 +612,16 @@ static std::vector<std::wstring> FetchSuggestions(const std::wstring& q) {
     return out;
 }
 
+static void CloseOnlineNet() {
+    if (g_whConnect) { WinHttpCloseHandle(g_whConnect); g_whConnect = NULL; }
+    if (g_whSession) { WinHttpCloseHandle(g_whSession); g_whSession = NULL; }
+}
+
 static DWORD WINAPI OnlineWorker(LPVOID) {
+    HANDLE wait[2] = { g_onlineEvent, g_onlineStop };
     for (;;) {
-        WaitForSingleObject(g_onlineEvent, INFINITE);
+        if (WaitForMultipleObjects(2, wait, FALSE, INFINITE) != WAIT_OBJECT_0)
+            break; // stop signaled: exit cleanly, no more network use
         int seq;
         std::wstring q;
         AcquireSRWLockExclusive(&g_onlineLock);
@@ -625,6 +650,7 @@ static DWORD WINAPI OnlineWorker(LPVOID) {
         ReleaseSRWLockExclusive(&g_onlineLock);
         if (current) PostMessageW(g_hwndPalette, WM_APP_ONLINE, (WPARAM)seq, 0);
     }
+    CloseOnlineNet();
     return 0;
 }
 
@@ -992,10 +1018,15 @@ static void ExecuteSelected(bool forceWeb) {
     switch (r.kind) {
     case ResultKind::App:
         if (r.action.empty()) break;
-        if (r.isStore)
-            ShellExecuteW(NULL, L"open", L"explorer.exe", r.action.c_str(), NULL, SW_SHOWNORMAL);
-        else
+        if (r.isStore) {
+            wchar_t winDir[MAX_PATH];
+            if (GetWindowsDirectoryW(winDir, MAX_PATH)) {
+                std::wstring exe = std::wstring(winDir) + L"\\explorer.exe";
+                ShellExecuteW(NULL, L"open", exe.c_str(), r.action.c_str(), NULL, SW_SHOWNORMAL);
+            }
+        } else {
             ShellExecuteW(NULL, L"open", r.action.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        }
         break;
     case ResultKind::Web:
     case ResultKind::Bang:
@@ -1667,7 +1698,7 @@ static bool BrowseForBrowser(HWND owner, std::wstring& outPath) {
     ofn.lpstrFile = file;
     ofn.nMaxFile = MAX_PATH;
     ofn.lpstrTitle = L"Choose browser";
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (!GetOpenFileNameW(&ofn)) return false;
     outPath = file;
     return true;
@@ -2205,6 +2236,11 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 SaveEngineBrowser(hwnd);
             }
         } else if (id == IDC_BANG_ADD) {
+            if ((int)g_settings.bangs.size() >= kMaxCustomEntries) {
+                MessageBoxW(hwnd, L"Bang list is full (200 entries).",
+                            L"SneekPeek", MB_ICONWARNING | MB_OK);
+                break;
+            }
             Bang b{{L"newsite"}, L"New site", L"https://example.com/?q=%s",
                    RandomBangColor()};
             g_settings.bangs.push_back(b);
@@ -2216,6 +2252,11 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             ListView_EnsureVisible(g_hwndBangsList, row, FALSE);
             ListView_EditLabel(g_hwndBangsList, row); // type the alias in place
         } else if (id == IDC_QUICK_ADD) {
+            if ((int)g_settings.quicks.size() >= kMaxCustomEntries) {
+                MessageBoxW(hwnd, L"Quick-link list is full (200 entries).",
+                            L"SneekPeek", MB_ICONWARNING | MB_OK);
+                break;
+            }
             QuickLink q{L"New link", L"https://example.com"};
             g_settings.quicks.push_back(q);
             int row = LVAppendRow(g_hwndQuickList, q.name.c_str());
@@ -2396,8 +2437,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
 
     // Suggestion worker: one thread, event-driven, sleeps until typed to.
     g_onlineEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (g_onlineEvent)
-        CloseHandle(CreateThread(NULL, 0, OnlineWorker, NULL, 0, NULL));
+    g_onlineStop = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (g_onlineEvent && g_onlineStop)
+        g_onlineThread = CreateThread(NULL, 0, OnlineWorker, NULL, 0, NULL);
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
@@ -2408,6 +2450,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
         DispatchMessageW(&msg);
     }
 
+    if (g_onlineStop) SetEvent(g_onlineStop); // stop the suggestion worker
+    if (g_onlineThread) {
+        WaitForSingleObject(g_onlineThread, 5000);
+        CloseHandle(g_onlineThread);
+    }
+    if (g_onlineEvent) CloseHandle(g_onlineEvent);
+    if (g_onlineStop) CloseHandle(g_onlineStop);
     UnregisterHotKey(g_hwndPalette, HOTKEY_ID);
     SetThreadExecutionState(ES_CONTINUOUS); // release any Awake hold
     DeleteObject(g_fontInput); DeleteObject(g_fontTitle);

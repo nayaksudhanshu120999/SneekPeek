@@ -2,11 +2,14 @@
 // Built by CMake (SneekPeekTests) and run by CI via ctest.
 // Returns nonzero on any failure; prints failing expressions.
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <cmath>
 #include "calc.h"
 #include "bangs.h"
+#include "minjson.h"
+#include "settings.h"
 #include "app_index.h"
 
 static int g_fail = 0;
@@ -39,6 +42,22 @@ int main() {
     CHECK(!TryCalc(L"hello", v));
     CHECK(!TryCalc(L"", v));
     CHECK(!TryCalc(L"12", v));      // bare number is not an expression
+    // calculator: input-length and nesting-depth limits
+    {
+        std::wstring big;
+        for (int i = 0; i < 150; i++) big += L"1+";
+        big += L"1"; // >256 chars
+        CHECK(big.size() > 256 && !TryCalc(big, v));
+        std::wstring deep(70, L'(');
+        deep += L"1";
+        deep += std::wstring(70, L')');
+        CHECK(!TryCalc(deep, v)); // too deep
+        std::wstring ok10(10, L'(');
+        ok10 += L"1";
+        ok10 += std::wstring(10, L')');
+        ok10 += L"+0";
+        CHECK(CalcEq(ok10.c_str(), 1)); // shallow nesting still fine
+    }
     // fuzzy search ranking
     std::vector<AppEntry> apps = {
         {L"Visual Studio Code", L"C:\\vscode.lnk", L"visual studio code", false},
@@ -74,6 +93,29 @@ int main() {
         CHECK(!ParseColor(L"notacolor", c));
         CHECK(SerializeColor(RGB(255, 0, 51)) == L"#FF0033");
     }
+    // JSON string decoding incl. UTF-16 surrogate pairs
+    {
+        const char* s1 = "\"plain\"";
+        const char* p1 = s1;
+        std::wstring w;
+        CHECK(DecodeJsonString(p1, s1 + strlen(s1), w) && w == L"plain");
+        const char* s2 = "\"A\\u00e9\\ud83d\\ude00\""; // e-acute + grinning face
+        const char* p2 = s2;
+        CHECK(DecodeJsonString(p2, s2 + strlen(s2), w));
+        CHECK(w.size() == 4 && w[0] == L'A' && w[1] == 0xE9 &&
+              w[2] == 0xD83D && w[3] == 0xDE00);
+        const char* s3 = "\"\\ud83d\""; // lone high surrogate: reject
+        const char* p3 = s3;
+        CHECK(!DecodeJsonString(p3, s3 + strlen(s3), w));
+        const char* s4 = "\"x\\ude00\""; // lone low surrogate: reject
+        const char* p4 = s4;
+        CHECK(!DecodeJsonString(p4, s4 + strlen(s4), w));
+    }
+    // settings list cap is consistent everywhere
+    CHECK(ClampCustomCount(-5) == 0);
+    CHECK(ClampCustomCount(0) == 0);
+    CHECK(ClampCustomCount(199) == 199);
+    CHECK(ClampCustomCount(500) == kMaxCustomEntries);
     // URL detection
     {
         std::wstring u;

@@ -1,4 +1,5 @@
 #include "app_index.h"
+#include "minjson.h"
 #include <windows.h>
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -244,47 +245,7 @@ static void ScanPathExes(std::vector<AppEntry>& out) {
     }
 }
 
-// Decode one "..." JSON string; *p must point at the opening quote.
-static bool DecodeJsonString(const char*& p, const char* end, std::wstring& out) {
-    std::string raw;
-    p++; // opening quote
-    while (p < end && *p != '"') {
-        if (*p == '\\' && p + 1 < end) {
-            p++;
-            char e = *p++;
-            if (e == 'u' && p + 4 <= end) {
-                unsigned v = 0;
-                for (int k = 0; k < 4; k++) {
-                    char h = *p++;
-                    v <<= 4;
-                    if (h >= '0' && h <= '9') v += (unsigned)(h - '0');
-                    else if (h >= 'a' && h <= 'f') v += (unsigned)(h - 'a' + 10);
-                    else if (h >= 'A' && h <= 'F') v += (unsigned)(h - 'A' + 10);
-                }
-                if (v < 0x80) raw += (char)v;
-                else if (v < 0x800) {
-                    raw += (char)(0xC0 | (v >> 6));
-                    raw += (char)(0x80 | (v & 63));
-                } else {
-                    raw += (char)(0xE0 | (v >> 12));
-                    raw += (char)(0x80 | ((v >> 6) & 63));
-                    raw += (char)(0x80 | (v & 63));
-                }
-            } else if (e == 'n') raw += '\n';
-            else if (e == 't') raw += '\t';
-            else if (e == 'r') raw += '\r';
-            else raw += e;
-        } else {
-            raw += *p++;
-        }
-    }
-    if (p < end) p++; // closing quote
-    int n = MultiByteToWideChar(CP_UTF8, 0, raw.c_str(), (int)raw.size(), NULL, 0);
-    if (n <= 0) return false;
-    out.assign((size_t)n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, raw.c_str(), (int)raw.size(), out.data(), n);
-    return true;
-}
+// JSON string decoding lives in minjson.h (shared with the unit tests).
 
 // Tertiary source: Get-StartApps lists desktop + Store apps exactly like
 // Start Menu search does (Camera, ...). One hidden PowerShell run, one-time
@@ -300,8 +261,18 @@ static void ScanStartAppsPS(std::vector<AppEntry>& out) {
     std::wstring psExe = L"powershell.exe";
     if (GetSystemDirectoryW(sysDir, MAX_PATH))
         psExe = std::wstring(sysDir) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
-    std::wstring cmd = L"\"" + psExe + L"\" -NoProfile -NonInteractive -Command \"Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress | Out-File -Encoding utf8 '" +
-        file + L"'\"";
+    // Fixed script text: the output path travels in a private environment
+    // block, never interpolated into script (quote-proof by construction).
+    std::wstring cmd = L"\"" + psExe + L"\" -NoProfile -NonInteractive -Command \"Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress | Out-File -Encoding utf8 $env:SNEEKPEEK_APPS_JSON\"";
+    std::wstring envBlock;
+    if (LPWCH parent = GetEnvironmentStringsW()) {
+        for (LPWCH p = parent; *p; p += wcslen(p) + 1)
+            envBlock.append(p, wcslen(p) + 1);
+        FreeEnvironmentStringsW(parent);
+    }
+    std::wstring var = L"SNEEKPEEK_APPS_JSON=" + file;
+    envBlock.append(var.c_str(), var.size() + 1);
+    envBlock.push_back(L'\0');
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
@@ -310,7 +281,8 @@ static void ScanStartAppsPS(std::vector<AppEntry>& out) {
     std::vector<wchar_t> cmdLine(cmd.begin(), cmd.end());
     cmdLine.push_back(L'\0');
     if (!CreateProcessW(NULL, cmdLine.data(), NULL, NULL, FALSE,
-                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+                        CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                        (LPVOID)envBlock.data(), NULL, &si, &pi))
         return;
     bool done = WaitForSingleObject(pi.hProcess, 20000) == WAIT_OBJECT_0;
     if (!done) TerminateProcess(pi.hProcess, 1); // stuck helper: kill, don't leak

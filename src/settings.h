@@ -15,6 +15,15 @@ struct QuickLink {
     std::wstring url; // fixed URL, no %s / no query
 };
 
+// Shared cap for custom lists (bangs, quick links): load, save, and the UI
+// all enforce the same limit, so entries can never silently disappear.
+inline constexpr int kMaxCustomEntries = 200;
+
+inline int ClampCustomCount(int n) {
+    if (n < 0) return 0;
+    return n > kMaxCustomEntries ? kMaxCustomEntries : n;
+}
+
 inline bool ParseQuickLine(const std::wstring& line, QuickLink& out) {
     size_t p = line.find(L'|');
     if (p == std::wstring::npos) return false;
@@ -82,15 +91,27 @@ inline void LoadSettings(Settings& s) {
     if (buf[0]) s.engineName = buf;
     GetPrivateProfileStringW(L"General", L"BrowserPath", L"", buf, 4096, ini.c_str());
     s.browserPath = buf;
-    GetPrivateProfileStringW(L"General", L"HiddenApps", L"", buf, 4096, ini.c_str());
-    s.hiddenApps = SplitPipe(buf);
+    int hcount = GetPrivateProfileIntW(L"General", L"HiddenCount", -1, ini.c_str());
+    if (hcount >= 0) {
+        s.hiddenApps.clear();
+        wchar_t key[32];
+        for (int i = 0; i < hcount && i < 2000; i++) {
+            swprintf_s(key, 32, L"Hidden%d", i);
+            GetPrivateProfileStringW(L"General", key, L"", buf, 4096, ini.c_str());
+            if (buf[0]) s.hiddenApps.push_back(buf);
+        }
+    } else {
+        GetPrivateProfileStringW(L"General", L"HiddenApps", L"", buf, 4096, ini.c_str());
+        s.hiddenApps = SplitPipe(buf); // legacy single-value format
+    }
     s.includePathExes = GetPrivateProfileIntW(L"General", L"IncludePathExes", 0, ini.c_str()) != 0;
     s.runAtStartup = GetPrivateProfileIntW(L"General", L"RunAtStartup", 0, ini.c_str()) != 0;
     s.awakeOn = GetPrivateProfileIntW(L"General", L"Awake", 0, ini.c_str()) != 0;
     s.onlineOn = GetPrivateProfileIntW(L"General", L"OnlineSug", 1, ini.c_str()) != 0;
 
     int count = GetPrivateProfileIntW(L"Bangs", L"Count", 0, ini.c_str());
-    if (count > 0 && count <= 200) {
+    count = ClampCustomCount(count); // clamp, never drop all
+    if (count > 0) {
         std::vector<Bang> custom;
         wchar_t key[32];
         for (int i = 0; i < count; i++) {
@@ -107,7 +128,8 @@ inline void LoadSettings(Settings& s) {
     int qcount = GetPrivateProfileIntW(L"Quick", L"Count", -1, ini.c_str());
     if (qcount < 0) {
         s.quicks = {{L"Gmail", L"https://mail.google.com"}};
-    } else if (qcount > 0 && qcount <= 200) {
+    } else if (qcount > 0) {
+        qcount = ClampCustomCount(qcount);
         wchar_t key[32];
         for (int i = 0; i < qcount; i++) {
             swprintf_s(key, 32, L"Quick%d", i);
@@ -125,22 +147,37 @@ inline void SaveSettings(const Settings& s) {
     WritePrivateProfileStringW(L"General", L"EngineName", s.engineName.c_str(), ini.c_str());
     WritePrivateProfileStringW(L"General", L"BrowserPath", s.browserPath.c_str(), ini.c_str());
     WritePrivateProfileStringW(L"General", L"HiddenApps", JoinPipe(s.hiddenApps).c_str(), ini.c_str());
+    {
+        wchar_t hc[16];
+        size_t hn = s.hiddenApps.size() < 2000 ? s.hiddenApps.size() : 2000;
+        swprintf_s(hc, 16, L"%d", (int)hn);
+        WritePrivateProfileStringW(L"General", L"HiddenCount", hc, ini.c_str());
+        wchar_t key[32];
+        for (size_t i = 0; i < hn; i++) {
+            swprintf_s(key, 32, L"Hidden%d", (int)i);
+            WritePrivateProfileStringW(L"General", key, s.hiddenApps[i].c_str(), ini.c_str());
+        }
+    }
     WritePrivateProfileStringW(L"General", L"IncludePathExes", s.includePathExes ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"General", L"RunAtStartup", s.runAtStartup ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"General", L"Awake", s.awakeOn ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"General", L"OnlineSug", s.onlineOn ? L"1" : L"0", ini.c_str());
+    size_t nbangs = s.bangs.size() < (size_t)kMaxCustomEntries
+        ? s.bangs.size() : (size_t)kMaxCustomEntries;
     wchar_t count[16];
-    swprintf_s(count, 16, L"%d", (int)s.bangs.size());
+    swprintf_s(count, 16, L"%d", (int)nbangs);
     WritePrivateProfileStringW(L"Bangs", L"Count", count, ini.c_str());
     wchar_t key[32];
-    for (size_t i = 0; i < s.bangs.size() && i < 200; i++) {
+    for (size_t i = 0; i < nbangs; i++) {
         swprintf_s(key, 32, L"Bang%d", (int)i);
         WritePrivateProfileStringW(L"Bangs", key, SerializeBang(s.bangs[i]).c_str(), ini.c_str());
     }
+    size_t nquick = s.quicks.size() < (size_t)kMaxCustomEntries
+        ? s.quicks.size() : (size_t)kMaxCustomEntries;
     wchar_t qcount[16];
-    swprintf_s(qcount, 16, L"%d", (int)s.quicks.size());
+    swprintf_s(qcount, 16, L"%d", (int)nquick);
     WritePrivateProfileStringW(L"Quick", L"Count", qcount, ini.c_str());
-    for (size_t i = 0; i < s.quicks.size() && i < 200; i++) {
+    for (size_t i = 0; i < nquick; i++) {
         swprintf_s(key, 32, L"Quick%d", (int)i);
         std::wstring line = s.quicks[i].name + L" | " + s.quicks[i].url;
         WritePrivateProfileStringW(L"Quick", key, line.c_str(), ini.c_str());
