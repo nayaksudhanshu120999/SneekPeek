@@ -32,6 +32,7 @@
 #include <commdlg.h>
 #include <powrprof.h>
 #include <gdiplus.h>
+#include <winhttp.h>
 #include <cwctype>
 #include <cmath>
 #include <cstdio>
@@ -39,6 +40,8 @@
 #include <string>
 #include <vector>
 #include <unordered_set>
+#include <unordered_map>
+#include <algorithm>
 #include <thread>
 #include <atomic>
 #include <algorithm>
@@ -46,6 +49,7 @@
 #include "app_index.h"
 #include "bangs.h"
 #include "settings.h"
+#include "syspages.h"
 #include "resource.h"
 
 #pragma comment(lib, "user32.lib")
@@ -58,6 +62,7 @@
 #pragma comment(lib, "powrprof.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "gdiplus.lib")
 
 // ---------------------------------------------------------------- constants
@@ -69,15 +74,17 @@ static const wchar_t* kMutexName     = L"SneekPeek_SingleInstance_v1";
 static const UINT HOTKEY_ID = 1;
 static const UINT WM_TRAYICON = WM_APP + 10;
 static const UINT WM_APP_SHOW = WM_APP + 11;
+static const UINT WM_APP_ONLINE = WM_APP + 21; // background suggestions arrived
 static const UINT ID_TRAY_SETTINGS = 1001;
 static const UINT ID_TRAY_REFRESH  = 1002;
 static const UINT ID_TRAY_STARTUP   = 1003;
 static const UINT ID_TRAY_QUIT      = 1004;
+static const UINT ID_TRAY_AWAKE     = 1005;
 
 static const int kWidth = 600;
 static const int kInputH = 44;
-static const int kItemH = 44;
-static const int kMaxItems = 6;
+static const int kItemH = 38; // single-line rows + slim headers
+static const int kMaxItems = 9;
 static const int kCornerR = 14;
 static const int kChipH = 28;
 static const int kChipRowH = 40;
@@ -270,7 +277,7 @@ static const PowerDef kPowers[] = {
 };
 static const COLORREF kQuickCol = RGB(192, 132, 252);
 
-enum class ChipKind { Power, Quick, Bang };
+enum class ChipKind { Power, Quick, Bang, Awake };
 struct ChipItem {
     ChipKind kind;
     std::wstring title;
@@ -282,12 +289,12 @@ static std::vector<RECT> g_chipRects;
 static int  g_chipSel = 0;
 static bool g_chipsFocus = false; // true = Enter runs the chip, list has no selection
 
-enum class ResultKind { App, Web, Bang, Calc };
+enum class ResultKind { App, Web, Bang, Calc, Setting, Header, Online };
 struct ResultItem {
     ResultKind kind;
-    std::wstring title;   // main line (never a file path)
-    std::wstring sub;     // small hint line
-    std::wstring action;  // lnk path | shell:AppsFolder target | url | calc text
+    std::wstring title;   // single line (headers, names, queries)
+    std::wstring sub;     // reserved, currently unused
+    std::wstring action;  // lnk path | shell:AppsFolder target | url | ms-settings: | calc text
     COLORREF color;       // category accent color
     bool isStore = false; // Store app: launch via explorer.exe
 };
@@ -304,6 +311,19 @@ static const COLORREF kAppCol = RGB(96, 165, 250);
 static const COLORREF kWebCol = RGB(52, 211, 153);
 static const COLORREF kCalcCol= RGB(251, 191, 36);
 static const COLORREF kHintCol= RGB(110, 110, 115);
+static const COLORREF kSetCol = RGB(45, 212, 191);  // system settings pages
+static const COLORREF kAwakeCol = RGB(45, 212, 191);
+
+// Awake state + online worker state (see below).
+static bool g_awakeOn = false;
+static HANDLE g_onlineEvent = NULL;
+static std::atomic<int> g_onlineSeq{0};
+static std::wstring g_onlineRequested;
+static std::wstring g_onlineFor;
+static std::vector<std::wstring> g_online;
+static SRWLOCK g_onlineLock = SRWLOCK_INIT;
+static std::unordered_map<std::wstring, std::vector<std::wstring>> g_sugCache;
+static bool g_warmedUp = false;
 
 // ------------------------------------------------------- forward declarations
 static void ShowPalette();
@@ -323,6 +343,8 @@ static bool IsHiddenApp(const std::wstring& name);
 static void ActivateBang(int idx, const std::wstring& query);
 static void DeactivateBang();
 static void CloseCellEdit(bool commit);
+static void ApplyAwake();
+static void RequestOnline(const std::wstring& q);
 static void ApplyRoundCorners();
 static void EnableRoundCorners(HWND hwnd);
 static void RunPower(PowerOp op);
@@ -417,6 +439,10 @@ static void ShowPalette() {
     SetForegroundWindow(g_hwndPalette);
     SetFocus(g_hwndEdit);
     UpdateResults();
+    if (!g_warmedUp && g_onlineEvent) {
+        g_warmedUp = true;
+        RequestOnline(L"the"); // warm DNS/TLS/proxy while the user starts typing
+    }
 }
 
 static void HidePalette() {
@@ -518,16 +544,134 @@ static void RunPower(PowerOp op) {
     }
 }
 
-// ------------------------------------------------------------- results model
-static void PushAppRow(const AppEntry& app) {
+// Instant Screen Stays Awake: hold the machine + display awake without
+// touching permanent power settings. ES_CONTINUOUS persists until changed;
+// Windows auto-clears it if the process ever exits (no stuck-awake risk).
+static void ApplyAwake() {
+    SetThreadExecutionState(g_awakeOn
+        ? (ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+        : ES_CONTINUOUS);
+}
+
+// ------------------------------------------------- online suggestions (async)
+// One persistent HTTPS session (no per-keystroke handshake), warmed on first
+// open, debounced, hard-capped ~0.5s, plus an instant local prefix cache.
+static std::vector<std::wstring> FetchSuggestions(const std::wstring& q) {
+    static HINTERNET hS = NULL; // worker thread only: no lock needed
+    static HINTERNET hC = NULL;
+    std::vector<std::wstring> out;
+    if (!hS) {
+        hS = WinHttpOpen(L"SneekPeek/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hS) return out;
+        WinHttpSetTimeouts(hS, 1000, 1000, 1500, 450);
+    }
+    if (!hC) {
+        hC = WinHttpConnect(hS, L"duckduckgo.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (!hC) { WinHttpCloseHandle(hS); hS = NULL; return out; }
+    }
+    std::wstring path = L"/ac/?q=" + UrlEncodeQuery(q) + L"&type=list";
+    HINTERNET hR = WinHttpOpenRequest(hC, L"GET", path.c_str(), NULL, WINHTTP_NO_REFERER,
+                                     WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    std::string data;
+    bool ok = hR && WinHttpSendRequest(hR, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                       WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+              WinHttpReceiveResponse(hR, NULL);
+    if (ok) {
+        DWORD avail = 0;
+        char buf[4096];
+        while (WinHttpQueryDataAvailable(hR, &avail) && avail) {
+            DWORD chunk = avail > sizeof(buf) ? (DWORD)sizeof(buf) : avail;
+            DWORD rd = 0;
+            if (!WinHttpReadData(hR, buf, chunk, &rd) || !rd) break;
+            data.append(buf, rd);
+            if (data.size() > 16384) break;
+        }
+    } else {
+        WinHttpCloseHandle(hC); hC = NULL; // drop dead connection; rebuilt next
+    }
+    if (hR) WinHttpCloseHandle(hR);
+    // Collect "..." tokens; skip the echo + "phrase" keys; unescape basics.
+    bool first = true;
+    for (size_t i = 0; i < data.size() && out.size() < 5;) {
+        if (data[i] != '"') { i++; continue; }
+        std::string tok;
+        i++;
+        while (i < data.size() && data[i] != '"') {
+            if (data[i] == '\\' && i + 1 < data.size()) { i++; tok += data[i++]; }
+            else tok += data[i++];
+        }
+        if (i < data.size()) i++;
+        if (first) { first = false; continue; }
+        if (tok.empty() || tok == "phrase") continue;
+        int n = MultiByteToWideChar(CP_UTF8, 0, tok.c_str(), (int)tok.size(), NULL, 0);
+        if (n > 0) {
+            std::wstring w((size_t)n, L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, tok.c_str(), (int)tok.size(), w.data(), n);
+            out.push_back(std::move(w));
+        }
+    }
+    return out;
+}
+
+static DWORD WINAPI OnlineWorker(LPVOID) {
+    for (;;) {
+        WaitForSingleObject(g_onlineEvent, INFINITE);
+        int seq;
+        std::wstring q;
+        AcquireSRWLockExclusive(&g_onlineLock);
+        seq = g_onlineSeq.load();
+        q = g_onlineRequested;
+        ReleaseSRWLockExclusive(&g_onlineLock);
+        Sleep(130); // debounce: let fast typing settle
+        AcquireSRWLockExclusive(&g_onlineLock);
+        bool stale = (seq != g_onlineSeq.load());
+        ReleaseSRWLockExclusive(&g_onlineLock);
+        if (stale || q.size() < 2) continue;
+        std::vector<std::wstring> out = FetchSuggestions(q);
+        AcquireSRWLockExclusive(&g_onlineLock);
+        bool current = (seq == g_onlineSeq.load());
+        if (current) {
+            g_online = out;
+            g_onlineFor = q;
+            g_sugCache[q] = out; // instant next time (<5ms, offline-safe)
+            if (g_sugCache.size() > 60) {
+                // keep it bounded: drop everything except the fresh entry
+                std::vector<std::wstring> keep = out;
+                g_sugCache.clear();
+                g_sugCache[q] = std::move(keep);
+            }
+        }
+        ReleaseSRWLockExclusive(&g_onlineLock);
+        if (current) PostMessageW(g_hwndPalette, WM_APP_ONLINE, (WPARAM)seq, 0);
+    }
+    return 0;
+}
+
+// Ask the worker for fresh suggestions unless already requested.
+static void RequestOnline(const std::wstring& q) {
+    if (q.size() < 2 || !g_onlineEvent) return;
+    AcquireSRWLockExclusive(&g_onlineLock);
+    bool need = (q != g_onlineRequested);
+    if (need) {
+        g_onlineRequested = q;
+        g_onlineSeq++;
+    }
+    ReleaseSRWLockExclusive(&g_onlineLock);
+    if (need) SetEvent(g_onlineEvent);
+}
+static ResultItem MakeAppRow(const AppEntry& app) {
     ResultItem r;
     r.kind = ResultKind::App;
     r.title = app.name;      // name only - never the file path
-    r.sub = L"Application";
+    r.sub = L"";
     r.action = app.target;
     r.color = kAppCol;
     r.isStore = app.isStore;
-    g_results.push_back(std::move(r));
+    return r;
+}
+static void PushAppRow(const AppEntry& app) {
+    g_results.push_back(MakeAppRow(app));
 }
 
 // Prefix-matched power + bang + quick-link chips (separate row above list).
@@ -541,6 +685,17 @@ static void BuildChips(const std::wstring& qlower) {
                 g_chips.push_back({ChipKind::Power, kPowers[i].title, kPowers[i].color, i});
                 break;
             }
+        }
+    }
+    static const wchar_t* awakeAliases[] =
+        {L"awake", L"stay awake", L"stayawake", L"screen on", L"keep awake"};
+    for (int a = 0; a < 5 && (int)g_chips.size() < kMaxChips; a++) {
+        std::wstring al = awakeAliases[a];
+        if (al.size() >= qlower.size() && al.compare(0, qlower.size(), qlower) == 0) {
+            g_chips.push_back({ChipKind::Awake,
+                               g_awakeOn ? L"Awake: On" : L"Awake: Off",
+                               kAwakeCol, 0});
+            break;
         }
     }
     for (size_t i = 0; i < g_settings.bangs.size() && (int)g_chips.size() < kMaxChips; i++) {
@@ -637,6 +792,27 @@ static bool IsUrlLike(const std::wstring& q, std::wstring& outUrl) {
     return true;
 }
 
+// Best system-settings pages for the query (name + keywords), capped.
+static void MatchSysPages(const std::wstring& qlower, std::vector<ResultItem>& out,
+                          size_t limit) {
+    struct Hit { const SysPage* p; int score; };
+    std::vector<Hit> hits;
+    for (int i = 0; i < SysPageCount(); i++) {
+        const SysPage* p = &kSysPages[i];
+        int s1 = FuzzyScore(BangLower(p->name), qlower);
+        int s2 = FuzzyScore(BangLower(p->keywords), qlower);
+        int s = s1 > s2 ? s1 : s2;
+        if (s >= 0) hits.push_back({p, s});
+    }
+    std::sort(hits.begin(), hits.end(),
+              [](const Hit& a, const Hit& b) { return a.score > b.score; });
+    for (size_t i = 0; i < hits.size() && out.size() < limit; i++) {
+        ResultItem r{ResultKind::Setting, hits[i].p->name, L"",
+                     hits[i].p->uri, kSetCol};
+        out.push_back(std::move(r));
+    }
+}
+
 static void UpdateResults() {
     g_results.clear();
     g_results.reserve(8);
@@ -700,27 +876,68 @@ static void UpdateResults() {
         return;
     }
 
-    // --- normal: app matches + web fallback
+    // --- normal: sectioned results (Calculator / Apps / Settings / Web / Online)
+    std::vector<ResultItem> calcRows;
+    calcRows.swap(g_results); // whatever the calculator produced above
+
+    RequestOnline(q);
+    std::vector<std::wstring> online;
+    AcquireSRWLockShared(&g_onlineLock);
+    if (g_onlineFor == q) online = g_online;
+    else {
+        auto cit = g_sugCache.find(q);
+        if (cit != g_sugCache.end()) online = cit->second;
+    }
+    ReleaseSRWLockShared(&g_onlineLock);
+    if (online.size() > 3) online.resize(3);
+
+    std::vector<ResultItem> appRows;
     if (g_indexReady.load()) {
-        for (auto& h : SearchApps(g_apps, q, kMaxItems - 1)) {
-            if (g_hidden.count(h.app->lower) == 0) PushAppRow(*h.app);
+        for (auto& h : SearchApps(g_apps, q, 4)) {
+            if (g_hidden.count(h.app->lower) == 0) appRows.push_back(MakeAppRow(*h.app));
         }
     } else {
-        ResultItem r{ResultKind::App, L"Indexing apps...",
-                     L"First run scans once - a moment", L"", kAppCol};
-        g_results.push_back(std::move(r));
+        ResultItem r{ResultKind::App, L"Indexing apps...", L"",
+                     L"", kAppCol};
+        appRows.push_back(std::move(r));
     }
-    ResultItem web{ResultKind::Web, q,
-                   L"Search " + g_settings.engineName,
-                   ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q)), kWebCol};
-    g_results.push_back(std::move(web));
 
-    // URL-shaped input jumps straight to the site (row 0, Enter opens it).
-    std::wstring directUrl;
+    std::vector<ResultItem> setRows;
+    MatchSysPages(BangLower(q), setRows, 3);
+
+    std::vector<ResultItem> webRows;
+    std::wstring directUrl; // URL-shaped input jumps straight to the site, first
     if (IsUrlLike(q, directUrl)) {
-        ResultItem r{ResultKind::Web, q, L"Open website", directUrl, kWebCol};
-        g_results.insert(g_results.begin(), std::move(r));
+        ResultItem r{ResultKind::Web, q, L"", directUrl, kWebCol};
+        webRows.push_back(std::move(r));
     }
+    {
+        ResultItem web{ResultKind::Web, q, L"",
+                       ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q)), kWebCol};
+        webRows.push_back(std::move(web));
+    }
+
+    std::vector<ResultItem> onlineRows;
+    for (const auto& s : online) {
+        ResultItem r{ResultKind::Online, s, L"",
+                     ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(s)), kWebCol};
+        onlineRows.push_back(std::move(r));
+    }
+
+    auto pushSection = [&](const wchar_t* h, std::vector<ResultItem>& rows) {
+        if (rows.empty()) return;
+        size_t room = g_results.size() >= 9 ? 0 : 9 - g_results.size();
+        if (room < 2) return; // header + at least one row, else skip the section
+        size_t take = rows.size() < room - 1 ? rows.size() : room - 1;
+        ResultItem hh{ResultKind::Header, h, L"", L"", kHintCol};
+        g_results.push_back(std::move(hh));
+        for (size_t i = 0; i < take; i++) g_results.push_back(std::move(rows[i]));
+    };
+    pushSection(L"Calculator", calcRows);
+    pushSection(L"Apps", appRows);
+    pushSection(L"Settings", setRows);
+    pushSection(L"Web", webRows);
+    pushSection(L"Online", onlineRows);
 
     RebuildListControl();
 }
@@ -736,6 +953,14 @@ static int CurrentSelection() {
 static void ExecuteChip(int idx) {
     if (idx < 0 || idx >= (int)g_chips.size()) return;
     ChipItem c = g_chips[(size_t)idx]; // copy: HidePalette clears the vector
+    if (c.kind == ChipKind::Awake) {
+        g_awakeOn = !g_awakeOn;
+        ApplyAwake();
+        g_settings.awakeOn = g_awakeOn;
+        SaveSettings(g_settings);
+        UpdateResults(); // refresh the chip title, stay open
+        return;
+    }
     if (c.kind == ChipKind::Power) {
         int nPowers = (int)(sizeof(kPowers) / sizeof(kPowers[0]));
         if (c.data < 0 || c.data >= nPowers) return;
@@ -801,6 +1026,7 @@ static void ExecuteSelected(bool forceWeb) {
         return;
     }
     ResultItem r = g_results[(size_t)idx]; // copy: HidePalette clears the vector
+    if (r.kind == ResultKind::Header) return; // section labels do nothing
     HidePalette(); // hide first: never wait for the target app
     switch (r.kind) {
     case ResultKind::App:
@@ -812,7 +1038,12 @@ static void ExecuteSelected(bool forceWeb) {
         break;
     case ResultKind::Web:
     case ResultKind::Bang:
+    case ResultKind::Online:
         OpenUrl(r.action, g_settings.browserPath);
+        break;
+    case ResultKind::Setting:
+        if (!r.action.empty())
+            ShellExecuteW(NULL, L"open", r.action.c_str(), NULL, NULL, SW_SHOWNORMAL);
         break;
     case ResultKind::Calc:
         CopyText(r.action);
@@ -824,7 +1055,7 @@ static void ExecuteSelected(bool forceWeb) {
 // Moving with arrows mirrors the selected row's text into the box WITHOUT
 // refiltering: the list stays frozen until the user types or deletes.
 static bool IsSelectable(size_t i) {
-    return i < g_results.size();
+    return i < g_results.size() && g_results[i].kind != ResultKind::Header;
 }
 // Same, but no wrapping: -1 past either end (caller restores original text).
 static int MoveSelNoWrap(int from, int dir) {
@@ -860,7 +1091,9 @@ static void SyncSelToBox(int listSel) {
     const ResultItem& r = g_results[(size_t)listSel];
     std::wstring keep = GetEditText(g_hwndEdit);
     std::wstring t = keep;
-    if (r.kind == ResultKind::App) t = r.title;
+    if (r.kind == ResultKind::App || r.kind == ResultKind::Setting ||
+        r.kind == ResultKind::Online)
+        t = r.title;
     if (t == keep) return;
     g_changingEdit = true; // programmatic: no refilter, list stays frozen
     SetWindowTextW(g_hwndEdit, t.c_str());
@@ -1147,11 +1380,19 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             if (code == LBN_DBLCLK) {
                 g_chipsFocus = false;
                 ExecuteSelected(false);
-            } else if (code == LBN_SELCHANGE && g_chipsFocus) {
-                g_chipsFocus = false; // mouse took over the list
-                InvalidateRect(g_hwndChipRow, NULL, FALSE);
+            } else if (code == LBN_SELCHANGE) {
+                int s = (int)SendMessageW(g_hwndList, LB_GETCURSEL, 0, 0);
+                if (s >= 0 && s < (int)g_results.size() &&
+                    g_results[(size_t)s].kind == ResultKind::Header) {
+                    int to = MoveSelNoWrap(s, +1); // clicked a header: jump past
+                    SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
+                }
+                if (g_chipsFocus) {
+                    g_chipsFocus = false; // mouse took over the list
+                    InvalidateRect(g_hwndChipRow, NULL, FALSE);
+                }
             }
-        } else if (id >= ID_TRAY_SETTINGS && id <= ID_TRAY_QUIT) {
+        } else if (id >= ID_TRAY_SETTINGS && id <= ID_TRAY_AWAKE) {
             OnTrayCommand(id);
         }
         break;
@@ -1167,28 +1408,33 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         bool sel = (d->itemState & ODS_SELECTED) != 0;
         HDC dc = d->hDC;
         size_t ri = (d->itemData < (UINT)g_results.size()) ? d->itemData : 9999;
-        FillRect(dc, &d->rcItem, sel ? g_brSel : g_brBg);
+        bool isHead = ((int)ri < (int)g_results.size()) &&
+                      g_results[ri].kind == ResultKind::Header;
+        FillRect(dc, &d->rcItem, (!isHead && sel) ? g_brSel : g_brBg);
         if ((int)ri < (int)g_results.size()) {
             const ResultItem& r = g_results[ri];
             SetBkMode(dc, TRANSPARENT);
+            if (isHead) { // section label: small gray, never highlights
+                SelectObject(dc, g_fontSub);
+                SetTextColor(dc, kSub);
+                RECT tr = d->rcItem; tr.left += 14;
+                DrawTextW(dc, r.title.c_str(), -1, &tr,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                return TRUE;
+            }
             // Category color bar: thin, brighter when selected.
             HBRUSH bar = CreateSolidBrush(sel ? r.color : Darken(r.color, 65));
             RECT br = d->rcItem;
             br.left += 14; br.right = br.left + 2;
-            br.top += 10; br.bottom -= 10;
+            br.top += 9; br.bottom -= 9;
             FillRect(dc, &br, bar);
             DeleteObject(bar);
 
-            RECT tr = d->rcItem; tr.left += 30; tr.top += 5; tr.right -= 10;
-            RECT sr = tr; sr.top += 22;
+            RECT tr = d->rcItem; tr.left += 30; tr.right -= 10;
             SetTextColor(dc, sel ? kText : RGB(218, 218, 226));
             SelectObject(dc, g_fontTitle);
             DrawTextW(dc, r.title.c_str(), -1, &tr,
-                      DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
-            SetTextColor(dc, kSub);
-            SelectObject(dc, g_fontSub);
-            DrawTextW(dc, r.sub.c_str(), -1, &sr,
-                      DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
         return TRUE;
     }
@@ -1217,6 +1463,15 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         break;
     case WM_APP + 20: // index finished
         if (IsWindowVisible(hwnd)) UpdateResults();
+        break;
+    case WM_APP_ONLINE: // background suggestions arrived
+        if ((int)w == g_onlineSeq.load() && IsWindowVisible(hwnd)) {
+            std::wstring cur = Trim(GetEditText(g_hwndEdit));
+            AcquireSRWLockShared(&g_onlineLock);
+            bool match = (!g_online.empty() && g_onlineFor == cur && !ActiveBang());
+            ReleaseSRWLockShared(&g_onlineLock);
+            if (match) UpdateResults(); // same query -> merges, no refetch loop
+        }
         break;
     case WM_TRAYICON:
         if (LOWORD(l) == WM_RBUTTONUP || LOWORD(l) == WM_CONTEXTMENU)
@@ -1256,6 +1511,8 @@ static void ShowTrayMenu(HWND hwnd) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, ID_TRAY_SETTINGS, L"Settings...");
     AppendMenuW(menu, MF_STRING, ID_TRAY_REFRESH, L"Refresh apps");
+    AppendMenuW(menu, MF_STRING | (g_awakeOn ? MF_CHECKED : MF_UNCHECKED),
+                ID_TRAY_AWAKE, L"Keep screen awake");
     AppendMenuW(menu, MF_STRING | (g_settings.runAtStartup ? MF_CHECKED : MF_UNCHECKED),
                 ID_TRAY_STARTUP, L"Run at startup");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
@@ -2008,6 +2265,12 @@ static void OnTrayCommand(UINT id) {
         g_indexReady.store(false);
         BuildIndexAsync();
         break;
+    case ID_TRAY_AWAKE:
+        g_awakeOn = !g_awakeOn;
+        ApplyAwake();
+        g_settings.awakeOn = g_awakeOn;
+        SaveSettings(g_settings);
+        break;
     case ID_TRAY_STARTUP:
         g_settings.runAtStartup = !g_settings.runAtStartup;
         SaveSettings(g_settings);
@@ -2046,6 +2309,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
 
     LoadSettings(g_settings);
     RebuildHiddenSet();
+    g_awakeOn = g_settings.awakeOn;
+    if (g_awakeOn) ApplyAwake(); // restore the held-awake state silently
 
     // Fonts + brushes (created once, tiny GDI footprint).
     HDC screen = GetDC(NULL);
@@ -2135,9 +2400,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     // Costs one short burst; afterwards the thread exits (0% CPU).
     BuildIndexAsync();
 
+    // Suggestion worker: one thread, event-driven, sleeps until typed to.
+    g_onlineEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (g_onlineEvent)
+        CloseHandle(CreateThread(NULL, 0, OnlineWorker, NULL, 0, NULL));
+
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
-        // Dialog-manager keys (Tab navigation, Enter = Save) for Settings.
+        // Dialog-manager keys (Tab navigation) for Settings.
         if (g_hwndSettings && IsDialogMessageW(g_hwndSettings, &msg))
             continue;
         TranslateMessage(&msg);
@@ -2145,6 +2415,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     }
 
     UnregisterHotKey(g_hwndPalette, HOTKEY_ID);
+    SetThreadExecutionState(ES_CONTINUOUS); // release any Awake hold
     DeleteObject(g_fontInput); DeleteObject(g_fontTitle);
     DeleteObject(g_fontSub); DeleteObject(g_fontChip); DeleteObject(g_fontUI);
     DeleteObject(g_brBg); DeleteObject(g_brInput); DeleteObject(g_brSel);

@@ -22,7 +22,7 @@ add_executable(SneekPeek WIN32
 target_include_directories(SneekPeek PRIVATE src)
 
 target_link_libraries(SneekPeek PRIVATE
-    user32 shell32 gdi32 advapi32 shlwapi comctl32 comdlg32 powrprof ole32 gdiplus
+    user32 shell32 gdi32 advapi32 shlwapi comctl32 comdlg32 powrprof ole32 gdiplus winhttp
 )
 
 if(MINGW)

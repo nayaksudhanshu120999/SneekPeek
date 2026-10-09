@@ -32,6 +32,7 @@ struct Settings {
     std::vector<std::wstring> hiddenApps; // exact app names (case-insensitive) never shown
     std::vector<Bang> bangs;
     std::vector<QuickLink> quicks; // name -> fixed URL launched on Enter (no query)
+    bool awakeOn = false;          // keep display+system awake (tray + Awake chip)
     bool includePathExes = false;
     bool runAtStartup = false;
 };
@@ -84,6 +85,7 @@ inline void LoadSettings(Settings& s) {
     s.hiddenApps = SplitPipe(buf);
     s.includePathExes = GetPrivateProfileIntW(L"General", L"IncludePathExes", 0, ini.c_str()) != 0;
     s.runAtStartup = GetPrivateProfileIntW(L"General", L"RunAtStartup", 0, ini.c_str()) != 0;
+    s.awakeOn = GetPrivateProfileIntW(L"General", L"Awake", 0, ini.c_str()) != 0;
 
     int count = GetPrivateProfileIntW(L"Bangs", L"Count", 0, ini.c_str());
     if (count > 0 && count <= 200) {
@@ -123,6 +125,7 @@ inline void SaveSettings(const Settings& s) {
     WritePrivateProfileStringW(L"General", L"HiddenApps", JoinPipe(s.hiddenApps).c_str(), ini.c_str());
     WritePrivateProfileStringW(L"General", L"IncludePathExes", s.includePathExes ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"General", L"RunAtStartup", s.runAtStartup ? L"1" : L"0", ini.c_str());
+    WritePrivateProfileStringW(L"General", L"Awake", s.awakeOn ? L"1" : L"0", ini.c_str());
     wchar_t count[16];
     swprintf_s(count, 16, L"%d", (int)s.bangs.size());
     WritePrivateProfileStringW(L"Bangs", L"Count", count, ini.c_str());

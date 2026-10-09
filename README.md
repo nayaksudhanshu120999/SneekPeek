@@ -3,7 +3,7 @@
 One hotkey. One text box. Zero idle cost.
 
 - Press **Ctrl+Space** → only a search bar appears (nothing else until you type).
-- Type → fuzzy **app search** (Start Menu programs, exe-targets only, plus Microsoft Store apps), **power/bang/quick chips**, **web search**, calculator.
+- Type → fuzzy **app search** (Start Menu, exe-only, plus Store apps), **system settings pages**, **power/awake/bang/quick chips**, **web search** with live **online suggestions** (<0.5s), calculator — grouped under one header per section.
 - **Enter** runs the top result — the palette hides instantly, before the app even opens. Click anywhere outside (or `Esc`) → it disappears.
 - Next **Ctrl+Space** → fresh empty bar.
 - Tray icon → **Settings… / Refresh apps / Run at startup / Quit**.
@@ -21,6 +21,8 @@ Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 | `yt` | matching site bangs appear as chips above the list — Enter arms the chip (`yt` + `Space` does the same): just the pill in the bar, no list — type the query, Enter searches (Backspace on empty query or click `x` exits) |
 | `!g cats` | one-shot bang without the chip (Google for `cats`) |
 | `shu` | power chips appear above the list (Shut down, Restart, Sleep, Hibernate) — Enter runs the selected chip, Tab cycles, Down jumps to the list |
+| `awake` | `Awake: On/Off` chip — keeps display + system awake without touching power settings; persists across restarts, also in the tray menu |
+| `bluetooth` | matching Windows Settings pages under their own header — Enter opens the page |
 | `gmail` | quick-link chips (fixed URLs, no query) work the same way — Enter opens |
 | `12*8` | calculator (Enter copies result) |
 | `↑` `↓` | move selection (mirrors into the box without refiltering; wraps past either end back to your typed text; Up from the first row jumps back to the chips), `Enter` open, `Shift+Enter` force web search, `Esc` dismiss, `F5` rescan apps |

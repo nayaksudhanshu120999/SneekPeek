@@ -19,7 +19,7 @@ if %ERRORLEVEL%==0 (
         if exist src\app.res set RES_OBJS=src\app.res
     )
     cl /std:c++17 /O1 /Os /EHsc /utf-8 /DUNICODE /D_UNICODE /MT %SRC% %RES_OBJS% ^
-       /link user32.lib shell32.lib gdi32.lib advapi32.lib shlwapi.lib comctl32.lib comdlg32.lib powrprof.lib ole32.lib gdiplus.lib ^
+       /link user32.lib shell32.lib gdi32.lib advapi32.lib shlwapi.lib comctl32.lib comdlg32.lib powrprof.lib ole32.lib gdiplus.lib winhttp.lib ^
        /SUBSYSTEM:WINDOWS /MANIFEST:NO /OUT:%OUT%
     if %ERRORLEVEL%==0 echo [build] OK -^> %OUT%
     exit /b %ERRORLEVEL%
@@ -37,7 +37,7 @@ if %ERRORLEVEL%==0 (
         if exist src\app.o set RES_OBJS=src\app.o
     )
     g++ -std=c++17 -Os -s -DUNICODE -D_UNICODE -finput-charset=UTF-8 %SRC% %RES_OBJS% -o %OUT% ^
-        -mwindows -municode -luser32 -lshell32 -lgdi32 -ladvapi32 -lshlwapi -lcomctl32 -lcomdlg32 -lpowrprof -lole32 -lgdiplus -static
+        -mwindows -municode -luser32 -lshell32 -lgdi32 -ladvapi32 -lshlwapi -lcomctl32 -lcomdlg32 -lpowrprof -lole32 -lgdiplus -lwinhttp -static
     if %ERRORLEVEL%==0 echo [build] OK -^> %OUT%
     exit /b %ERRORLEVEL%
 )
