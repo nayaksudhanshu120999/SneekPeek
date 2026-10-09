@@ -875,10 +875,13 @@ static LRESULT CALLBACK ChipProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
         RECT r; GetClientRect(hwnd, &r);
+        FillRect(dc, &r, g_brInput); // corners too: nothing peeks through
         HBRUSH bg = CreateSolidBrush(ChipFill(col));
         HGDIOBJ oldB = SelectObject(dc, bg);
         HGDIOBJ oldP = SelectObject(dc, GetStockObject(NULL_PEN));
-        RoundRect(dc, 0, 0, r.right, r.bottom, 14, 14);
+        int rad = r.bottom - r.top; // stadium ends: fully round pill
+        if (rad < 8) rad = 8;
+        RoundRect(dc, 0, 0, r.right, r.bottom, rad, rad);
         SelectObject(dc, oldB); SelectObject(dc, oldP);
         DeleteObject(bg);
         SetBkMode(dc, TRANSPARENT);
@@ -950,7 +953,9 @@ static LRESULT CALLBACK ChipRowProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             HBRUSH bg = CreateSolidBrush(sel ? base : Darken(base, 50));
             HGDIOBJ oldB = SelectObject(dc, bg);
             HGDIOBJ oldP = SelectObject(dc, GetStockObject(NULL_PEN));
-            RoundRect(dc, r.left, r.top, r.right, r.bottom, 14, 14);
+            int rad = r.bottom - r.top; // stadium ends: fully round pill
+            if (rad < 8) rad = 8;
+            RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
             SelectObject(dc, oldB);
             SelectObject(dc, oldP);
             DeleteObject(bg);
