@@ -8,8 +8,12 @@
 // Hide   : click outside (WM_ACTIVATE), Esc, Enter-after-launch
 // Tray   : Settings / Refresh / Run-at-startup / Quit
 
+#ifndef UNICODE
 #define UNICODE
+#endif
+#ifndef _UNICODE
 #define _UNICODE
+#endif
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #ifndef _WIN32_WINNT
@@ -799,7 +803,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
 
     LoadAppIcons();
 
-    WNDCLASSW wc{};
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
     wc.hInstance = hInst;
     wc.lpszClassName = kPaletteClass;
     wc.lpfnWndProc = PaletteProc;
@@ -807,9 +812,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     wc.hIcon = g_hIconBig;
     wc.hIconSm = g_hIconSmall;
     wc.hbrBackground = g_brBg;
-    RegisterClassW(&wc);
+    RegisterClassExW(&wc);
 
-    WNDCLASSW ws{};
+    WNDCLASSEXW ws{};
+    ws.cbSize = sizeof(ws);
     ws.hInstance = hInst;
     ws.lpszClassName = kSettingsClass;
     ws.lpfnWndProc = SettingsProc;
@@ -817,7 +823,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     ws.hIcon = g_hIconBig;
     ws.hIconSm = g_hIconSmall;
     ws.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    RegisterClassW(&ws);
+    RegisterClassExW(&ws);
 
     g_hwndPalette = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW, // topmost + no taskbar button
