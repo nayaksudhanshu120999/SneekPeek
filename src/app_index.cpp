@@ -76,6 +76,8 @@ static void ScanLnkDir(const std::wstring& root, std::vector<AppEntry>& out) {
         if (h == INVALID_HANDLE_VALUE) continue;
         do {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+                    continue; // junctions/symlinks: never recurse (loop risk)
                 if (fd.cFileName[0] == L'.' &&
                     (fd.cFileName[1] == L'\0' ||
                      (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0')))
@@ -292,7 +294,13 @@ static void ScanStartAppsPS(std::vector<AppEntry>& out) {
     if (!GetTempPathW(MAX_PATH, tmp)) return;
     std::wstring file = std::wstring(tmp) + L"SneekPeek_apps_" +
         std::to_wstring(GetCurrentProcessId()) + L".json";
-    std::wstring cmd = L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress | Out-File -Encoding utf8 '" +
+    // Explicit system PowerShell; no -ExecutionPolicy flag (-Command strings
+    // are not subject to execution policy).
+    wchar_t sysDir[MAX_PATH];
+    std::wstring psExe = L"powershell.exe";
+    if (GetSystemDirectoryW(sysDir, MAX_PATH))
+        psExe = std::wstring(sysDir) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+    std::wstring cmd = L"\"" + psExe + L"\" -NoProfile -NonInteractive -Command \"Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress | Out-File -Encoding utf8 '" +
         file + L"'\"";
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -305,23 +313,26 @@ static void ScanStartAppsPS(std::vector<AppEntry>& out) {
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
         return;
     bool done = WaitForSingleObject(pi.hProcess, 20000) == WAIT_OBJECT_0;
+    if (!done) TerminateProcess(pi.hProcess, 1); // stuck helper: kill, don't leak
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
-    if (!done) return;
 
-    HANDLE hf = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
-                            OPEN_EXISTING, 0, NULL);
     std::string data;
-    if (hf != INVALID_HANDLE_VALUE) {
-        char buf[8192];
-        DWORD rd = 0;
-        while (ReadFile(hf, buf, sizeof(buf), &rd, NULL) && rd) {
-            data.append(buf, rd);
-            if (data.size() > 1048576) break;
+    if (done) {
+        HANDLE hf = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                                OPEN_EXISTING, 0, NULL);
+        if (hf != INVALID_HANDLE_VALUE) {
+            char buf[8192];
+            DWORD rd = 0;
+            while (ReadFile(hf, buf, sizeof(buf), &rd, NULL) && rd) {
+                data.append(buf, rd);
+                if (data.size() > 1048576) break;
+            }
+            CloseHandle(hf);
         }
-        CloseHandle(hf);
     }
-    DeleteFileW(file.c_str());
+    DeleteFileW(file.c_str()); // every exit path cleans the temp file
+    if (!done) return;
     if (data.size() > 3 && (unsigned char)data[0] == 0xEF &&
         (unsigned char)data[1] == 0xBB && (unsigned char)data[2] == 0xBF)
         data.erase(0, 3); // PS5.1 UTF-8 BOM

@@ -48,6 +48,7 @@
 
 #include "app_index.h"
 #include "bangs.h"
+#include "calc.h"
 #include "settings.h"
 #include "syspages.h"
 #include "resource.h"
@@ -102,6 +103,7 @@ enum {
     IDC_QUICK_LIST = 120, IDC_QUICK_NAME = 121, IDC_QUICK_URL = 122,
     IDC_QUICK_ADD = 123, IDC_QUICK_UPDATE = 124, IDC_QUICK_DEL = 125,
     IDC_SAVE = 201, IDC_RESCAN = 202, IDC_CLOSE = 203,
+    IDC_CHK_ONLINE = 204,
     IDC_PAGE_0 = 301, IDC_PAGE_1, IDC_PAGE_2, IDC_PAGE_3,
 };
 
@@ -154,61 +156,10 @@ static void FillPill(HDC dc, const RECT& r, COLORREF col) {
     g.FillPath(&br, &path);
 }
 
-// ------------------------------------------------------------- calculator
-// Tiny recursive-descent evaluator: numbers, + - * / % ^, parens, unary minus.
-// Returns false if the text is not a pure arithmetic expression.
-struct CalcParser {
-    const wchar_t* p;
-    bool ok = true;
-    void Skip() { while (*p && iswspace(*p)) p++; }
-    double ParseExpr() {
-        double v = ParseTerm();
-        for (;;) { Skip(); if (*p==L'+'){p++; v+=ParseTerm();} else if(*p==L'-'){p++; v-=ParseTerm();} else break; }
-        return v;
-    }
-    double ParseTerm() {
-        double v = ParseFactor();
-        for (;;) { Skip(); if(*p==L'*'){p++; v*=ParseFactor();} else if(*p==L'/'){p++; double d=ParseFactor(); v = d==0?0:v/d;} else if(*p==L'%'){p++; double d=ParseFactor(); v=d==0?0:fmod(v,d);} else break; }
-        return v;
-    }
-    double ParseFactor() {
-        Skip();
-        double base = ParseUnary();
-        Skip();
-        if (*p==L'^'){ p++; double e=ParseFactor(); base = pow(base,e); }
-        return base;
-    }
-    double ParseUnary() {
-        Skip();
-        if (*p==L'-'){ p++; return -ParseUnary(); }
-        if (*p==L'+'){ p++; return ParseUnary(); }
-        return ParsePrimary();
-    }
-    double ParsePrimary() {
-        Skip();
-        if (*p==L'('){ p++; double v=ParseExpr(); Skip(); if(*p==L')') p++; else ok=false; return v; }
-        if ((*p>=L'0'&&*p<=L'9')||*p==L'.'){
-            wchar_t* end=nullptr; double v=wcstod(p,&end);
-            if(end==p){ok=false;return 0;} p=end; return v;
-        }
-        ok=false; return 0;
-    }
-};
-static bool TryCalc(const std::wstring& q, double& out) {
-    if (q.empty()) return false;
-    bool hasDigit=false, hasOp=false;
-    for (wchar_t c:q){
-        if(c>=L'0'&&c<=L'9') hasDigit=true;
-        else if(c==L'+'||c==L'-'||c==L'*'||c==L'/'||c==L'%'||c==L'^'||c==L'('||c==L')'||c==L'.'||c==L' '||c==L'\t') { if(c!=L' '&&c!=L'\t'&&c!=L'.') hasOp=true; }
-        else return false;
-    }
-    if(!hasDigit||!hasOp) return false;
-    CalcParser cp{ q.c_str() };
-    double v = cp.ParseExpr();
-    cp.Skip();
-    if(!cp.ok || *cp.p!=L'\0') return false;
-    out=v; return true;
-}
+// Calculator lives in calc.h (shared with the unit tests).
+
+// ------------------------------------------------------------------ globals
+
 
 // ------------------------------------------------------------------ globals
 static HINSTANCE   g_hInst = NULL;
@@ -223,6 +174,7 @@ static int         g_settingsPage = 0;
 static HWND        g_hwndEngineCombo = NULL;
 static HWND        g_hwndEngineUrl = NULL;
 static HWND        g_hwndBrowserCombo = NULL;
+static HWND        g_hwndChkOnline = NULL;
 static HWND        g_hwndAppsList = NULL;
 static HWND        g_hwndBangsList = NULL;
 static HWND        g_hwndQuickList = NULL;
@@ -288,6 +240,7 @@ static std::vector<ChipItem> g_chips;
 static std::vector<RECT> g_chipRects;
 static int  g_chipSel = 0;
 static bool g_chipsFocus = false; // true = Enter runs the chip, list has no selection
+static int  g_confirmPower = -1;  // armed PowerOp awaiting a second Enter
 
 enum class ResultKind { App, Web, Bang, Calc, Setting, Header, Online };
 struct ResultItem {
@@ -345,24 +298,34 @@ static void DeactivateBang();
 static void CloseCellEdit(bool commit);
 static void ApplyAwake();
 static void RequestOnline(const std::wstring& q);
+static int MoveSelNoWrap(int from, int dir);
+static void FillAppsList();
+static std::wstring LVGetCell(HWND lv, int row, int col);
 static void ApplyRoundCorners();
 static void EnableRoundCorners(HWND hwnd);
 static void RunPower(PowerOp op);
 
 // ------------------------------------------------------------- index thread
+// Publish pattern: the worker builds into a fresh vector, swaps it into an
+// atomic slot, and the UI thread adopts it on WM_APP_INDEX. The UI never
+// touches g_apps while the worker runs, so no lock is needed. Options are
+// captured on the UI thread before the worker starts.
+static std::atomic<std::vector<AppEntry>*> g_pendingIndex{nullptr};
+static const UINT WM_APP_INDEX = WM_APP + 22; // background index published
 static void BuildIndexAsync() {
     bool expected = false;
     if (!g_indexing.compare_exchange_strong(expected, true)) return; // already running
-    std::thread([]{
+    bool pathExes = g_settings.includePathExes; // captured on the UI thread
+    std::thread([pathExes]{
         SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
         std::vector<AppEntry> fresh;
-        BuildAppIndex(fresh, g_settings.includePathExes);
-        g_apps.swap(fresh);
-        g_indexReady.store(true);
+        BuildAppIndex(fresh, pathExes);
+        auto* old = g_pendingIndex.exchange(
+            new std::vector<AppEntry>(std::move(fresh)));
+        delete old; // drop a superseded pending index, if any
         g_indexing.store(false);
         SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
-        if (g_hwndPalette && IsWindowVisible(g_hwndPalette))
-            PostMessageW(g_hwndPalette, WM_APP + 20, 0, 0);
+        if (g_hwndPalette) PostMessageW(g_hwndPalette, WM_APP_INDEX, 0, 0);
     }).detach();
 }
 
@@ -373,6 +336,22 @@ static void RebuildHiddenSet() {
 }
 static bool IsHiddenApp(const std::wstring& name) {
     return g_hidden.find(ToLower(name)) != g_hidden.end();
+}
+
+// Refill the Hidden-apps checklist after a background index finishes,
+// preserving whatever the user has currently checked (unsaved toggles win).
+static void RefreshAppsListPreservingChecks() {
+    if (!g_hwndAppsList) return;
+    std::unordered_set<std::wstring> checked;
+    int n = ListView_GetItemCount(g_hwndAppsList);
+    for (int i = 0; i < n; i++)
+        if (ListView_GetCheckState(g_hwndAppsList, i))
+            checked.insert(LVGetCell(g_hwndAppsList, i, 0));
+    FillAppsList();
+    n = ListView_GetItemCount(g_hwndAppsList);
+    for (int i = 0; i < n; i++)
+        if (checked.count(LVGetCell(g_hwndAppsList, i, 0)))
+            ListView_SetCheckState(g_hwndAppsList, i, TRUE);
 }
 
 // ------------------------------------------------------------- app icon
@@ -439,7 +418,7 @@ static void ShowPalette() {
     SetForegroundWindow(g_hwndPalette);
     SetFocus(g_hwndEdit);
     UpdateResults();
-    if (!g_warmedUp && g_onlineEvent) {
+    if (!g_warmedUp && g_onlineEvent && g_settings.onlineOn) {
         g_warmedUp = true;
         RequestOnline(L"the"); // warm DNS/TLS/proxy while the user starts typing
     }
@@ -517,6 +496,7 @@ static void ActivateBang(int idx, const std::wstring& query) {
 
 static void DeactivateBang() {
     g_activeBang = -1;
+    g_confirmPower = -1; // any context change disarms a pending confirm
     g_navigating = false;
     g_bangChipW = 0;
     if (g_hwndChip) ShowWindow(g_hwndChip, SW_HIDE);
@@ -564,7 +544,7 @@ static std::vector<std::wstring> FetchSuggestions(const std::wstring& q) {
         hS = WinHttpOpen(L"SneekPeek/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!hS) return out;
-        WinHttpSetTimeouts(hS, 1000, 1000, 1500, 450);
+        WinHttpSetTimeouts(hS, 300, 700, 300, 500); // tight per-phase caps
     }
     if (!hC) {
         hC = WinHttpConnect(hS, L"duckduckgo.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
@@ -650,7 +630,7 @@ static DWORD WINAPI OnlineWorker(LPVOID) {
 
 // Ask the worker for fresh suggestions unless already requested.
 static void RequestOnline(const std::wstring& q) {
-    if (q.size() < 2 || !g_onlineEvent) return;
+    if (q.size() < 2 || !g_onlineEvent || !g_settings.onlineOn) return;
     AcquireSRWLockExclusive(&g_onlineLock);
     bool need = (q != g_onlineRequested);
     if (need) {
@@ -682,7 +662,9 @@ static void BuildChips(const std::wstring& qlower) {
         for (int a = 0; a < 4 && kPowers[i].aliases[a]; a++) {
             std::wstring al = kPowers[i].aliases[a];
             if (al.size() >= qlower.size() && al.compare(0, qlower.size(), qlower) == 0) {
-                g_chips.push_back({ChipKind::Power, kPowers[i].title, kPowers[i].color, i});
+                std::wstring pt = kPowers[i].title;
+                if (g_confirmPower == i) pt += L"?"; // armed: second Enter runs it
+                g_chips.push_back({ChipKind::Power, pt, kPowers[i].color, i});
                 break;
             }
         }
@@ -722,11 +704,12 @@ static void RebuildListControl() {
         if (idx >= 0)
             SendMessageW(g_hwndList, LB_SETITEMDATA, idx, (LPARAM)i);
     }
-    // Chips own the selection when they have focus; otherwise row 0.
+    // Chips own the selection when they have focus; otherwise the first
+    // selectable row (headers never take Enter).
     if (g_chipsFocus && !g_chips.empty())
         SendMessageW(g_hwndList, LB_SETCURSEL, (WPARAM)-1, 0);
-    else if (!g_results.empty())
-        SendMessageW(g_hwndList, LB_SETCURSEL, 0, 0);
+    else
+        SendMessageW(g_hwndList, LB_SETCURSEL, MoveSelNoWrap(-1, +1), 0);
 
     bool showChips = !g_chips.empty();
     size_t rows = g_results.size() > kMaxItems ? kMaxItems : g_results.size();
@@ -757,40 +740,7 @@ static void RebuildListControl() {
     if (showChips) InvalidateRect(g_hwndChipRow, NULL, FALSE);
 }
 
-// Domain-shaped input (google.com, not "weather today") opens directly,
-// like a browser address bar. No spaces; scheme optional (https assumed).
-static bool IsUrlLike(const std::wstring& q, std::wstring& outUrl) {
-    if (q.empty()) return false;
-    if (q.find_first_of(L" \t\r\n") != std::wstring::npos) return false;
-    std::wstring low = BangLower(q);
-    if (low.compare(0, 7, L"http://") == 0 || low.compare(0, 8, L"https://") == 0) {
-        outUrl = q;
-        return true;
-    }
-    for (wchar_t c : q) {
-        bool ok = (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
-                  (c >= L'0' && c <= L'9') ||
-                  c == L'-' || c == L'.' || c == L'_' || c == L'~' || c == L':' ||
-                  c == L'/' || c == L'?' || c == L'#' || c == L'@' || c == L'!' ||
-                  c == L'$' || c == L'&' || c == L'\'' || c == L'(' || c == L')' ||
-                  c == L',' || c == L';' || c == L'=' || c == L'%';
-        if (!ok) return false;
-    }
-    bool hasDot = q.find(L'.') != std::wstring::npos;
-    bool hasPort = q.find(L':') != std::wstring::npos; // localhost:3000
-    if (!hasDot && !hasPort) return false;
-    if (q.front() == L'.' || q.front() == L'-' || q.front() == L'/' ||
-        q.back() == L'.' || q.back() == L'-' || q.back() == L'/')
-        return false;
-    if (hasDot) {
-        std::wstring tail = q.substr(q.find_last_of(L'.') + 1);
-        size_t cut = tail.find_first_of(L"/?#:");
-        if (cut != std::wstring::npos) tail.resize(cut);
-        if (tail.empty()) return false;
-    }
-    outUrl = L"https://" + q;
-    return true;
-}
+// Domain-shaped input lives in bangs.h now (shared with the unit tests).
 
 // Best system-settings pages for the query (name + keywords), capped.
 static void MatchSysPages(const std::wstring& qlower, std::vector<ResultItem>& out,
@@ -954,6 +904,7 @@ static int CurrentSelection() {
 static void ExecuteChip(int idx) {
     if (idx < 0 || idx >= (int)g_chips.size()) return;
     ChipItem c = g_chips[(size_t)idx]; // copy: HidePalette clears the vector
+    if (c.kind != ChipKind::Power) g_confirmPower = -1; // only power confirms
     if (c.kind == ChipKind::Awake) {
         g_awakeOn = !g_awakeOn;
         ApplyAwake();
@@ -966,6 +917,15 @@ static void ExecuteChip(int idx) {
         int nPowers = (int)(sizeof(kPowers) / sizeof(kPowers[0]));
         if (c.data < 0 || c.data >= nPowers) return;
         PowerOp op = kPowers[c.data].op;
+        // Shutdown/restart need a deliberate second Enter; sleep/hibernate
+        // wake with any keypress, so they stay instant.
+        bool needsConfirm = (op == PowerOp::Shutdown || op == PowerOp::Restart);
+        if (needsConfirm && g_confirmPower != (int)op) {
+            g_confirmPower = (int)op; // arm: second Enter executes
+            UpdateResults(); // repaint the chip as a question, stay open
+            return;
+        }
+        g_confirmPower = -1;
         HidePalette(); // hide first: instant, never wait for the action
         RunPower(op);
         return;
@@ -1124,6 +1084,7 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
         }
         case VK_TAB: {
             bool back = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            g_confirmPower = -1; // navigating disarms a pending confirm
             if (haveChips) {
                 int n = (int)g_chips.size();
                 g_chipSel = back ? (g_chipSel <= 0 ? n - 1 : g_chipSel - 1)
@@ -1135,6 +1096,7 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
             return 0; // never let Tab move focus out of the box
         }
         case VK_DOWN:
+            g_confirmPower = -1; // navigating disarms a pending confirm
             if (g_chipsFocus && haveChips) {
                 g_chipsFocus = false;
                 EnsureNavStart();
@@ -1153,9 +1115,11 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                     RestoreOrigSel(); // past last: back to the typed text
                 }
                 InvalidateRect(g_hwndList, NULL, FALSE);
+                if (haveChips) InvalidateRect(g_hwndChipRow, NULL, FALSE);
             }
             return 0;
         case VK_UP:
+            g_confirmPower = -1; // navigating disarms a pending confirm
             if (!g_chipsFocus && (sel <= 0) && haveChips) {
                 g_chipsFocus = true;
                 EnsureNavStart();
@@ -1172,6 +1136,7 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                     RestoreOrigSel(); // above first: back to the typed text
                 }
                 InvalidateRect(g_hwndList, NULL, FALSE);
+                if (haveChips) InvalidateRect(g_hwndChipRow, NULL, FALSE);
             }
             return 0;
         case VK_BACK:
@@ -1358,6 +1323,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         if ((HWND)l == g_hwndEdit && code == EN_CHANGE) {
             if (g_changingEdit) break;
             g_navigating = false; // real typing restarts arrow cycling
+            g_confirmPower = -1; // and disarms any pending power confirm
             // Bang-chip trigger: "alias<space>" with nothing else typed.
             if (g_activeBang < 0) {
                 std::wstring editRaw = GetEditText(g_hwndEdit);
@@ -1382,14 +1348,11 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 g_chipsFocus = false;
                 ExecuteSelected(false);
             } else if (code == LBN_SELCHANGE) {
-                int s = (int)SendMessageW(g_hwndList, LB_GETCURSEL, 0, 0);
-                if (s >= 0 && s < (int)g_results.size() &&
-                    g_results[(size_t)s].kind == ResultKind::Header) {
-                    int to = MoveSelNoWrap(s, +1); // clicked a header: jump past
-                    SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
-                }
+                g_confirmPower = -1;
                 if (g_chipsFocus) {
                     g_chipsFocus = false; // mouse took over the list
+                    InvalidateRect(g_hwndChipRow, NULL, FALSE);
+                } else if (!g_chips.empty()) {
                     InvalidateRect(g_hwndChipRow, NULL, FALSE);
                 }
             }
@@ -1465,6 +1428,17 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     case WM_APP + 20: // index finished
         if (IsWindowVisible(hwnd)) UpdateResults();
         break;
+    case WM_APP_INDEX: { // background index published: adopt on the UI thread
+        auto* p = g_pendingIndex.exchange(nullptr);
+        if (p) {
+            g_apps.swap(*p);
+            delete p;
+            g_indexReady.store(true);
+        }
+        RefreshAppsListPreservingChecks();
+        if (IsWindowVisible(hwnd)) UpdateResults();
+        break;
+    }
     case WM_APP_ONLINE: // background suggestions arrived
         if ((int)w == g_onlineSeq.load() && IsWindowVisible(hwnd)) {
             std::wstring cur = Trim(GetEditText(g_hwndEdit));
@@ -1881,12 +1855,17 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 24, 180, 360, 200, hwnd, IDC_BROWSER_COMBO));
             page(g_pageGeneral, NewCtrl(L"BUTTON", L"Browse...",
                 WS_VISIBLE, 394, 179, 122, 26, hwnd, IDC_BROWSER_BROWSE));
+            g_hwndChkOnline = page(g_pageGeneral, NewCtrl(L"BUTTON",
+                L"Online suggestions (sends typed text to DuckDuckGo)",
+                WS_VISIBLE | BS_AUTOCHECKBOX, 24, 214, 536, 22, hwnd, IDC_CHK_ONLINE));
             page(g_pageGeneral, NewCtrl(L"STATIC",
                 L"Web + bang + quick links open in the chosen browser.\r\n"
                 L"Every change saves automatically.",
-                WS_VISIBLE, 24, 216, 536, 44, hwnd, 0));
+                WS_VISIBLE, 24, 242, 536, 44, hwnd, 0));
             FillEngineCombo();
             FillBrowserCombo();
+            SendMessageW(g_hwndChkOnline, BM_SETCHECK,
+                         g_settings.onlineOn ? BST_CHECKED : BST_UNCHECKED, 0);
         }
 
         // ---- Hidden apps page (checkbox list)
@@ -2187,6 +2166,19 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             SaveEngineBrowser(hwnd); // instant save, no Save button
         } else if (id == IDC_ENGINE_URL && code == EN_KILLFOCUS) {
             SaveEngineBrowser(hwnd);
+        } else if (id == IDC_CHK_ONLINE) {
+            g_settings.onlineOn =
+                SendMessageW(g_hwndChkOnline, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            SaveSettings(g_settings);
+            if (!g_settings.onlineOn) {
+                AcquireSRWLockExclusive(&g_onlineLock);
+                g_online.clear();
+                g_onlineFor.clear();
+                g_onlineRequested.clear();
+                g_onlineSeq++;
+                ReleaseSRWLockExclusive(&g_onlineLock);
+                if (g_hwndPalette && IsWindowVisible(g_hwndPalette)) UpdateResults();
+            }
         } else if (id == IDC_BROWSER_COMBO && code == CBN_SELCHANGE) {
             int sel = (int)SendMessageW(g_hwndBrowserCombo, CB_GETCURSEL, 0, 0);
             int count = (int)SendMessageW(g_hwndBrowserCombo, CB_GETCOUNT, 0, 0);
@@ -2248,6 +2240,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     case WM_DESTROY:
         g_hwndSettings = NULL;
         g_hwndCellEdit = NULL;
+        g_hwndChkOnline = NULL;
         g_cellLv = 0; g_cellRow = -1; g_cellCol = 0;
         g_hwndEngineCombo = g_hwndEngineUrl = g_hwndBrowserCombo = NULL;
         g_hwndAppsList = g_hwndBangsList = g_hwndQuickList = NULL;

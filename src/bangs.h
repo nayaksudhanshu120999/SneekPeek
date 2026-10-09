@@ -176,6 +176,42 @@ inline std::wstring ExpandUrl(const std::wstring& tmpl, const std::wstring& enco
     return url;
 }
 
+// Domain-shaped input (google.com, not "weather today") opens directly,
+// like a browser address bar. No spaces; scheme optional (https assumed).
+// Pure string logic (uses BangLower above) so unit tests cover it.
+inline bool IsUrlLike(const std::wstring& q, std::wstring& outUrl) {
+    if (q.empty()) return false;
+    if (q.find_first_of(L" \t\r\n") != std::wstring::npos) return false;
+    std::wstring low = BangLower(q);
+    if (low.compare(0, 7, L"http://") == 0 || low.compare(0, 8, L"https://") == 0) {
+        outUrl = q;
+        return true;
+    }
+    for (wchar_t c : q) {
+        bool ok = (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+                  (c >= L'0' && c <= L'9') ||
+                  c == L'-' || c == L'.' || c == L'_' || c == L'~' || c == L':' ||
+                  c == L'/' || c == L'?' || c == L'#' || c == L'@' || c == L'!' ||
+                  c == L'$' || c == L'&' || c == L'\'' || c == L'(' || c == L')' ||
+                  c == L',' || c == L';' || c == L'=' || c == L'%';
+        if (!ok) return false;
+    }
+    bool hasDot = q.find(L'.') != std::wstring::npos;
+    bool hasPort = q.find(L':') != std::wstring::npos; // localhost:3000
+    if (!hasDot && !hasPort) return false;
+    if (q.front() == L'.' || q.front() == L'-' || q.front() == L'/' ||
+        q.back() == L'.' || q.back() == L'-' || q.back() == L'/')
+        return false;
+    if (hasDot) {
+        std::wstring tail = q.substr(q.find_last_of(L'.') + 1);
+        size_t cut = tail.find_first_of(L"/?#:");
+        if (cut != std::wstring::npos) tail.resize(cut);
+        if (tail.empty()) return false;
+    }
+    outUrl = L"https://" + q;
+    return true;
+}
+
 // Homepage fallback for empty bang queries: template minus %s and dangling ? & = /.
 inline std::wstring BangHome(const std::wstring& tmpl) {
     std::wstring u = tmpl;

@@ -16,7 +16,7 @@ Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 | Input | Action |
 |---|---|
 | `code` | fuzzy-matches apps (`Visual Studio Code`), Enter launches |
-| `anything else` | Enter → web search with your engine (default DuckDuckGo) |
+| `anything else` | Enter → web search with your engine (default DuckDuckGo) + live online suggestions (typically <0.5s on a warm connection; per-phase network caps, local-only fallback) |
 | `google.com` | URL-shaped input opens the site directly (scheme optional, `https` assumed) |
 | `yt` | matching site bangs appear as chips above the list — Enter arms the chip (`yt` + `Space` does the same): just the pill in the bar, no list — type the query, Enter searches (Backspace on empty query or click `x` exits) |
 | `!g cats` | one-shot bang without the chip (Google for `cats`) |
@@ -24,7 +24,7 @@ Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 | `awake` | `Awake: On/Off` chip — keeps display + system awake without touching power settings; persists across restarts, also in the tray menu |
 | `bluetooth` | matching Windows Settings pages under their own header — Enter opens the page |
 | `gmail` | quick-link chips (fixed URLs, no query) work the same way — Enter opens |
-| `12*8` | calculator (Enter copies result) |
+| `12*8` | calculator (Enter copies result; undefined math like `1/0` shows nothing) |
 | `↑` `↓` | move selection (mirrors into the box without refiltering; wraps past either end back to your typed text; Up from the first row jumps back to the chips), `Enter` open, `Shift+Enter` force web search, `Esc` dismiss, `F5` rescan apps |
 
 Bang aliases are editable in Settings (default: `yt`/`youtube`, `gh`/`github`, `w`/`wiki`, `r`, `m`, `t`, `a`, `x`, `so`, `d`, `g` — each with its own color).
@@ -42,7 +42,10 @@ That produces `SneekPeek.exe`. Or with CMake:
 ```bat
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
+ctest --test-dir build -C Release
 ```
+
+The last line runs the unit tests (calculator incl. divide-by-zero and `-2^2` precedence, fuzzy ranking, bang parsing, URL detection).
 
 No compiler yet? One line (then reopen the terminal and re-run `build.bat`):
 
@@ -80,7 +83,7 @@ Notes:
 
 Tray → **Settings…** (tabbed, dark, matches the app — every change saves instantly, no Save button). Stored in `%APPDATA%\SneekPeek\settings.ini`:
 
-- **General** — engine (DuckDuckGo / Google / Bing / Brave / Custom URL with `%s`), browser for web + bang + quick links (System default or picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe`)
+- **General** — engine (DuckDuckGo / Google / Bing / Brave / Custom URL with `%s`), browser for web + bang + quick links (System default or picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe`), online suggestions on/off (sends typed text to DuckDuckGo; off = fully local)
 - **Hidden apps** — checkbox list of every indexed app; checked ones never appear in suggestions
 - **Bangs** — table (Aliases / Name / URL): Add appends an editable row, double-click any cell to edit in place, Del removes rows, colors auto-picked
 - **Quick links** — table (Name / URL) with the same editing; typing the name in the palette shows a chip that opens the fixed URL on Enter (e.g. Gmail)

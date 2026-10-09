@@ -45,3 +45,18 @@ set_target_properties(SneekPeek PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/bin"
 )
+
+# Unit tests: pure logic (calc, fuzzy, bangs, URL), run by CI via ctest.
+option(SNEEKPEEK_BUILD_TESTS "Build unit tests" ON)
+if(SNEEKPEEK_BUILD_TESTS)
+    add_executable(SneekPeekTests tests/test.cpp src/app_index.cpp)
+    target_include_directories(SneekPeekTests PRIVATE src)
+    target_link_libraries(SneekPeekTests PRIVATE user32 shell32 ole32 shlwapi)
+    set_target_properties(SneekPeekTests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin"
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/bin"
+    )
+    enable_testing()
+    add_test(NAME unit COMMAND SneekPeekTests)
+endif()
