@@ -19,8 +19,10 @@ Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 | `anything else` | Enter → web search with your engine (default DuckDuckGo) |
 | `yt` + `Space` | arms a YouTube chip in the search bar — type the query, Enter searches YouTube (Backspace on empty query or click `x` exits) |
 | `!g cats` | one-shot bang without the chip (Google for `cats`) |
+| `shu` | power chips appear above the list (Shut down, Restart, Sleep, Hibernate) — Enter runs the selected chip, Tab cycles, Down jumps to the list |
+| `gmail` | quick-link chips (fixed URLs, no query) work the same way — Enter opens |
 | `12*8` | calculator (Enter copies result) |
-| `↑` `↓` | move selection, `Enter` open, `Shift+Enter` force web search, `Esc` dismiss, `F5` rescan apps |
+| `↑` `↓` | move selection (Up from the first row jumps back to the chips), `Enter` open, `Shift+Enter` force web search, `Esc` dismiss, `F5` rescan apps |
 
 Bang aliases are editable in Settings (default: `yt`/`youtube`, `gh`/`github`, `w`/`wiki`, `r`, `m`, `t`, `a`, `x`, `so`, `d`, `g` — each with its own color).
 
@@ -73,14 +75,12 @@ Notes:
 
 ## Settings
 
-Tray → **Settings…**. Stored in `%APPDATA%\SneekPeek\settings.ini`:
+Tray → **Settings…** (tabbed). Stored in `%APPDATA%\SneekPeek\settings.ini`:
 
-- Search engine (DuckDuckGo / Google / Bing / Brave / Custom URL with `%s`)
-- Browser for web + bang links (System default or a picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe` — detected automatically, or Browse)
-- Hidden apps (one exact app name per line — those never appear in suggestions)
-- Bangs (one per line: `alias, alias | Name | https://...%s | #RRGGBB`, Reset button restores defaults)
-- Include `PATH` executables (more hits, more RAM — off by default)
-- Run at startup (writes `HKCU\…\Run\SneekPeek`)
+- **General** — engine (DuckDuckGo / Google / Bing / Brave / Custom URL with `%s`), browser for web + bang + quick links (System default or picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe`), PATH executables, Run at startup
+- **Hidden apps** — checkbox list of every indexed app; checked ones never appear in suggestions
+- **Bangs** — table (Aliases / Name / URL / Color), double-click a row to edit, Add/Update/Delete/Reset
+- **Quick links** — table (Name / URL); typing the name in the palette shows a chip that opens the fixed URL on Enter (e.g. Gmail)
 
 ## Why it uses (almost) nothing
 

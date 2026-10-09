@@ -14,6 +14,7 @@ struct Settings {
     std::wstring browserPath; // empty = system default browser
     std::vector<std::wstring> hiddenApps; // exact app names (case-insensitive) never shown
     std::vector<Bang> bangs;
+    std::vector<QuickLink> quicks; // name -> fixed URL launched on Enter (no query)
     bool includePathExes = false;
     bool runAtStartup = false;
 };
@@ -80,6 +81,21 @@ inline void LoadSettings(Settings& s) {
         }
         if (!custom.empty()) s.bangs = std::move(custom);
     }
+
+    // -1 = never configured: seed one example so the feature is discoverable.
+    int qcount = GetPrivateProfileIntW(L"Quick", L"Count", -1, ini.c_str());
+    if (qcount < 0) {
+        s.quicks = {{L"Gmail", L"https://mail.google.com"}};
+    } else if (qcount > 0 && qcount <= 200) {
+        wchar_t key[32];
+        for (int i = 0; i < qcount; i++) {
+            swprintf_s(key, 32, L"Quick%d", i);
+            GetPrivateProfileStringW(L"Quick", key, L"", buf, 4096, ini.c_str());
+            if (!buf[0]) continue;
+            QuickLink q;
+            if (ParseQuickLine(buf, q)) s.quicks.push_back(std::move(q));
+        }
+    }
 }
 
 inline void SaveSettings(const Settings& s) {
@@ -97,6 +113,14 @@ inline void SaveSettings(const Settings& s) {
     for (size_t i = 0; i < s.bangs.size() && i < 200; i++) {
         swprintf_s(key, 32, L"Bang%d", (int)i);
         WritePrivateProfileStringW(L"Bangs", key, SerializeBang(s.bangs[i]).c_str(), ini.c_str());
+    }
+    wchar_t qcount[16];
+    swprintf_s(qcount, 16, L"%d", (int)s.quicks.size());
+    WritePrivateProfileStringW(L"Quick", L"Count", qcount, ini.c_str());
+    for (size_t i = 0; i < s.quicks.size() && i < 200; i++) {
+        swprintf_s(key, 32, L"Quick%d", (int)i);
+        std::wstring line = s.quicks[i].name + L" | " + s.quicks[i].url;
+        WritePrivateProfileStringW(L"Quick", key, line.c_str(), ini.c_str());
     }
 }
 
@@ -117,6 +141,22 @@ inline void ApplyRunAtStartup(bool enable) {
         RegDeleteValueW(h, L"SneekPeek");
     }
     RegCloseKey(h);
+}
+
+// ------------------------------------------------- quick links (name -> URL)
+struct QuickLink {
+    std::wstring name;
+    std::wstring url; // fixed URL, no %s / no query
+};
+
+inline bool ParseQuickLine(const std::wstring& line, QuickLink& out) {
+    size_t p = line.find(L'|');
+    if (p == std::wstring::npos) return false;
+    QuickLink q{BangTrim(line.substr(0, p)), BangTrim(line.substr(p + 1))};
+    if (q.name.empty()) return false;
+    if (q.url.find(L"://") == std::wstring::npos) return false;
+    out = std::move(q);
+    return true;
 }
 
 // ------------------------------------------------- browsers (not system default)
