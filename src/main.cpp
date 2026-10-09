@@ -458,7 +458,6 @@ static void ActivateBang(int idx, const std::wstring& query) {
     UpdateWindow(g_hwndChip);
     g_bangChipW = w;
     ApplyEditMargins();
-    InvalidateRect(g_hwndPalette, NULL, FALSE); // refresh the box outline
     SendMessageW(g_hwndEdit, EM_SETCUEBANNER, FALSE, (LPARAM)L""); // chip only
     g_changingEdit = true;
     SetWindowTextW(g_hwndEdit, query.c_str());
@@ -475,7 +474,6 @@ static void DeactivateBang() {
         ApplyEditMargins();
         SendMessageW(g_hwndEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search");
     }
-    InvalidateRect(g_hwndPalette, NULL, FALSE); // refresh the box outline
 }
 
 // ------------------------------------------------------------- power actions
@@ -1024,22 +1022,6 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         RECT r; GetClientRect(hwnd, &r);
         FillRect(dc, &r, g_brBg);
         return 1;
-    }
-    case WM_PAINT: {
-        // Rounded outline around the text box (bang color when armed).
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(hwnd, &ps);
-        RECT er; GetWindowRect(g_hwndEdit, &er);
-        MapWindowPoints(NULL, hwnd, (POINT*)&er, 2);
-        const Bang* ab = ActiveBang();
-        HPEN pen = CreatePen(PS_SOLID, 1, ab ? ab->color : RGB(64, 64, 70));
-        HGDIOBJ op = SelectObject(dc, pen);
-        SelectObject(dc, GetStockObject(NULL_BRUSH));
-        RoundRect(dc, er.left - 5, er.top - 5, er.right + 5, er.bottom + 5, 10, 10);
-        SelectObject(dc, op);
-        DeleteObject(pen);
-        EndPaint(hwnd, &ps);
-        return 0;
     }
     case WM_CTLCOLOREDIT: {
         HDC dc = (HDC)w;
