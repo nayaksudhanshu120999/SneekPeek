@@ -8,6 +8,23 @@
 #include <vector>
 #include "bangs.h"
 
+// ------------------------------------------------- quick links (name -> URL)
+// Declared before Settings: the struct stores a vector of these.
+struct QuickLink {
+    std::wstring name;
+    std::wstring url; // fixed URL, no %s / no query
+};
+
+inline bool ParseQuickLine(const std::wstring& line, QuickLink& out) {
+    size_t p = line.find(L'|');
+    if (p == std::wstring::npos) return false;
+    QuickLink q{BangTrim(line.substr(0, p)), BangTrim(line.substr(p + 1))};
+    if (q.name.empty()) return false;
+    if (q.url.find(L"://") == std::wstring::npos) return false;
+    out = std::move(q);
+    return true;
+}
+
 struct Settings {
     std::wstring engineUrl = L"https://duckduckgo.com/?q=%s";
     std::wstring engineName = L"DuckDuckGo";
@@ -141,22 +158,6 @@ inline void ApplyRunAtStartup(bool enable) {
         RegDeleteValueW(h, L"SneekPeek");
     }
     RegCloseKey(h);
-}
-
-// ------------------------------------------------- quick links (name -> URL)
-struct QuickLink {
-    std::wstring name;
-    std::wstring url; // fixed URL, no %s / no query
-};
-
-inline bool ParseQuickLine(const std::wstring& line, QuickLink& out) {
-    size_t p = line.find(L'|');
-    if (p == std::wstring::npos) return false;
-    QuickLink q{BangTrim(line.substr(0, p)), BangTrim(line.substr(p + 1))};
-    if (q.name.empty()) return false;
-    if (q.url.find(L"://") == std::wstring::npos) return false;
-    out = std::move(q);
-    return true;
 }
 
 // ------------------------------------------------- browsers (not system default)
