@@ -17,12 +17,13 @@ Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 |---|---|
 | `code` | fuzzy-matches apps (`Visual Studio Code`), Enter launches |
 | `anything else` | Enter → web search with your engine (default DuckDuckGo) |
+| `google.com` | URL-shaped input opens the site directly (scheme optional, `https` assumed) |
 | `yt` | matching site bangs appear as chips above the list — Enter arms the chip (`yt` + `Space` does the same): just the pill in the bar, no list — type the query, Enter searches (Backspace on empty query or click `x` exits) |
 | `!g cats` | one-shot bang without the chip (Google for `cats`) |
 | `shu` | power chips appear above the list (Shut down, Restart, Sleep, Hibernate) — Enter runs the selected chip, Tab cycles, Down jumps to the list |
 | `gmail` | quick-link chips (fixed URLs, no query) work the same way — Enter opens |
 | `12*8` | calculator (Enter copies result) |
-| `↑` `↓` | move selection (mirrors into the box without refiltering; Up from the first row jumps back to the chips), `Enter` open, `Shift+Enter` force web search, `Esc` dismiss, `F5` rescan apps |
+| `↑` `↓` | move selection (mirrors into the box without refiltering; wraps past either end back to your typed text; Up from the first row jumps back to the chips), `Enter` open, `Shift+Enter` force web search, `Esc` dismiss, `F5` rescan apps |
 
 Bang aliases are editable in Settings (default: `yt`/`youtube`, `gh`/`github`, `w`/`wiki`, `r`, `m`, `t`, `a`, `x`, `so`, `d`, `g` — each with its own color).
 

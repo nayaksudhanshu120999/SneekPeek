@@ -31,6 +31,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <powrprof.h>
+#include <gdiplus.h>
 #include <cwctype>
 #include <cmath>
 #include <cstdio>
@@ -56,6 +57,8 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "powrprof.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "gdiplus.lib")
 
 // ---------------------------------------------------------------- constants
 static const wchar_t* kPaletteClass  = L"SneekPeekPalette";
@@ -76,7 +79,7 @@ static const int kInputH = 44;
 static const int kItemH = 44;
 static const int kMaxItems = 6;
 static const int kCornerR = 14;
-static const int kChipH = 26;
+static const int kChipH = 28;
 static const int kChipRowH = 40;
 static const int kMaxChips = 4;
 
@@ -127,6 +130,21 @@ static COLORREF Darken(COLORREF c, int pct) {
 static COLORREF ChipFill(COLORREF c) {
     int lum = (GetRValue(c) * 299 + GetGValue(c) * 587 + GetBValue(c) * 114) / 1000;
     return lum > 170 ? Darken(c, 55) : c;
+}
+// Antialiased stadium pill (GDI shapes are jagged; GDI+ is not).
+static void FillPill(HDC dc, const RECT& r, COLORREF col) {
+    int d = r.bottom - r.top;
+    if (d < 8) d = 8;
+    if (r.right - r.left < d) return;
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    Gdiplus::GraphicsPath path;
+    path.AddArc(r.left, r.top, d, d, 90.0f, 180.0f);
+    path.AddArc(r.right - d, r.top, d, d, 270.0f, 180.0f);
+    path.CloseFigure();
+    Gdiplus::SolidBrush br(Gdiplus::Color(255, GetRValue(col),
+                                          GetGValue(col), GetBValue(col)));
+    g.FillPath(&br, &path);
 }
 
 // ------------------------------------------------------------- calculator
@@ -227,6 +245,10 @@ static std::atomic<bool> g_indexing{false};
 // Bang-chip mode: -1 = off, else index into g_settings.bangs.
 static int  g_activeBang = -1;
 static bool g_changingEdit = false;
+// Arrow navigation: original typed text, restored when wrapping past the ends.
+static std::wstring g_origQuery;
+static bool g_navigating = false;
+static ULONG_PTR g_gdiplusToken = 0;
 
 // ------------------------------------------------------- power + quick chips
 enum class PowerOp { Shutdown, Restart, Sleep, Hibernate };
@@ -434,6 +456,7 @@ static void ApplyEditMargins() {
 static void ActivateBang(int idx, const std::wstring& query) {
     if (idx < 0 || idx >= (int)g_settings.bangs.size()) return;
     g_activeBang = idx;
+    g_navigating = false; // fresh mode, fresh arrow cycling
     const Bang& b = g_settings.bangs[(size_t)idx];
     HDC dc = GetDC(g_hwndPalette);
     HGDIOBJ old = SelectObject(dc, g_fontChip);
@@ -446,7 +469,7 @@ static void ActivateBang(int idx, const std::wstring& query) {
     RECT er; GetWindowRect(g_hwndEdit, &er);
     MapWindowPoints(NULL, g_hwndPalette, (POINT*)&er, 2);
     int boxH = er.bottom - er.top;
-    int chH = boxH - 8;
+    int chH = boxH - 4;
     if (chH > kChipH) chH = kChipH;
     if (chH < 18) chH = 18;
     int chipX = er.left + 2;
@@ -468,6 +491,7 @@ static void ActivateBang(int idx, const std::wstring& query) {
 
 static void DeactivateBang() {
     g_activeBang = -1;
+    g_navigating = false;
     g_bangChipW = 0;
     if (g_hwndChip) ShowWindow(g_hwndChip, SW_HIDE);
     if (g_hwndEdit) {
@@ -578,6 +602,41 @@ static void RebuildListControl() {
     if (showChips) InvalidateRect(g_hwndChipRow, NULL, FALSE);
 }
 
+// Domain-shaped input (google.com, not "weather today") opens directly,
+// like a browser address bar. No spaces; scheme optional (https assumed).
+static bool IsUrlLike(const std::wstring& q, std::wstring& outUrl) {
+    if (q.empty()) return false;
+    if (q.find_first_of(L" \t\r\n") != std::wstring::npos) return false;
+    std::wstring low = BangLower(q);
+    if (low.compare(0, 7, L"http://") == 0 || low.compare(0, 8, L"https://") == 0) {
+        outUrl = q;
+        return true;
+    }
+    for (wchar_t c : q) {
+        bool ok = (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+                  (c >= L'0' && c <= L'9') ||
+                  c == L'-' || c == L'.' || c == L'_' || c == L'~' || c == L':' ||
+                  c == L'/' || c == L'?' || c == L'#' || c == L'@' || c == L'!' ||
+                  c == L'$' || c == L'&' || c == L'\'' || c == L'(' || c == L')' ||
+                  c == L',' || c == L';' || c == L'=' || c == L'%';
+        if (!ok) return false;
+    }
+    bool hasDot = q.find(L'.') != std::wstring::npos;
+    bool hasPort = q.find(L':') != std::wstring::npos; // localhost:3000
+    if (!hasDot && !hasPort) return false;
+    if (q.front() == L'.' || q.front() == L'-' || q.front() == L'/' ||
+        q.back() == L'.' || q.back() == L'-' || q.back() == L'/')
+        return false;
+    if (hasDot) {
+        std::wstring tail = q.substr(q.find_last_of(L'.') + 1);
+        size_t cut = tail.find_first_of(L"/?#:");
+        if (cut != std::wstring::npos) tail.resize(cut);
+        if (tail.empty()) return false;
+    }
+    outUrl = L"https://" + q;
+    return true;
+}
+
 static void UpdateResults() {
     g_results.clear();
     g_results.reserve(8);
@@ -655,6 +714,13 @@ static void UpdateResults() {
                    L"Search " + g_settings.engineName,
                    ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q)), kWebCol};
     g_results.push_back(std::move(web));
+
+    // URL-shaped input jumps straight to the site (row 0, Enter opens it).
+    std::wstring directUrl;
+    if (IsUrlLike(q, directUrl)) {
+        ResultItem r{ResultKind::Web, q, L"Open website", directUrl, kWebCol};
+        g_results.insert(g_results.begin(), std::move(r));
+    }
 
     RebuildListControl();
 }
@@ -760,15 +826,34 @@ static void ExecuteSelected(bool forceWeb) {
 static bool IsSelectable(size_t i) {
     return i < g_results.size();
 }
-static int MoveSel(int from, int dir) {
-    int n = (int)g_results.size(); // listbox order == result order (no sort)
+// Same, but no wrapping: -1 past either end (caller restores original text).
+static int MoveSelNoWrap(int from, int dir) {
+    int n = (int)g_results.size();
     if (n <= 0) return -1;
-    int cur = from;
+    int cur = (from < 0) ? (dir > 0 ? -1 : n) : from;
     for (int k = 0; k < n; k++) {
-        cur = (cur + dir + n) % n;
+        cur += dir;
+        if (cur < 0 || cur >= n) return -1;
         if (IsSelectable((size_t)cur)) return cur;
     }
     return -1;
+}
+static void EnsureNavStart() {
+    if (!g_navigating) {
+        g_origQuery = GetEditText(g_hwndEdit);
+        g_navigating = true;
+    }
+}
+static void RestoreOrigSel() {
+    SendMessageW(g_hwndList, LB_SETCURSEL, (WPARAM)-1, 0);
+    if (!g_navigating) return;
+    if (GetEditText(g_hwndEdit) != g_origQuery) {
+        g_changingEdit = true; // programmatic: no refilter, list stays frozen
+        SetWindowTextW(g_hwndEdit, g_origQuery.c_str());
+        SendMessageW(g_hwndEdit, EM_SETSEL,
+                     (WPARAM)g_origQuery.size(), (LPARAM)g_origQuery.size());
+        g_changingEdit = false;
+    }
 }
 static void SyncSelToBox(int listSel) {
     if (listSel < 0 || listSel >= (int)g_results.size()) return;
@@ -818,32 +903,41 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
         case VK_DOWN:
             if (g_chipsFocus && haveChips) {
                 g_chipsFocus = false;
-                int to = MoveSel(-1, +1);
-                if (to >= 0) SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
+                EnsureNavStart();
+                int to = MoveSelNoWrap(-1, +1);
+                SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
+                if (to >= 0) SyncSelToBox(to);
                 InvalidateRect(g_hwndChipRow, NULL, FALSE);
                 InvalidateRect(g_hwndList, NULL, FALSE);
             } else if (count > 0) {
-                int to = MoveSel(sel, +1);
+                EnsureNavStart();
+                int to = MoveSelNoWrap(sel, +1);
                 if (to >= 0) {
                     SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
                     SyncSelToBox(to);
-                    InvalidateRect(g_hwndList, NULL, FALSE);
+                } else {
+                    RestoreOrigSel(); // past last: back to the typed text
                 }
+                InvalidateRect(g_hwndList, NULL, FALSE);
             }
             return 0;
         case VK_UP:
             if (!g_chipsFocus && (sel <= 0) && haveChips) {
                 g_chipsFocus = true;
+                EnsureNavStart();
                 SendMessageW(g_hwndList, LB_SETCURSEL, (WPARAM)-1, 0);
                 InvalidateRect(g_hwndChipRow, NULL, FALSE);
                 InvalidateRect(g_hwndList, NULL, FALSE);
             } else if (count > 0) {
-                int to = MoveSel(sel, -1);
+                EnsureNavStart();
+                int to = MoveSelNoWrap(sel, -1);
                 if (to >= 0) {
                     SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
                     SyncSelToBox(to);
-                    InvalidateRect(g_hwndList, NULL, FALSE);
+                } else {
+                    RestoreOrigSel(); // above first: back to the typed text
                 }
+                InvalidateRect(g_hwndList, NULL, FALSE);
             }
             return 0;
         case VK_BACK:
@@ -876,14 +970,7 @@ static LRESULT CALLBACK ChipProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         HDC dc = BeginPaint(hwnd, &ps);
         RECT r; GetClientRect(hwnd, &r);
         FillRect(dc, &r, g_brInput); // corners too: nothing peeks through
-        HBRUSH bg = CreateSolidBrush(ChipFill(col));
-        HGDIOBJ oldB = SelectObject(dc, bg);
-        HGDIOBJ oldP = SelectObject(dc, GetStockObject(NULL_PEN));
-        int rad = r.bottom - r.top; // stadium ends: fully round pill
-        if (rad < 8) rad = 8;
-        RoundRect(dc, 0, 0, r.right, r.bottom, rad, rad);
-        SelectObject(dc, oldB); SelectObject(dc, oldP);
-        DeleteObject(bg);
+        FillPill(dc, r, ChipFill(col));
         SetBkMode(dc, TRANSPARENT);
         SelectObject(dc, g_fontChip);
         SetTextColor(dc, RGB(255, 255, 255));
@@ -914,12 +1001,12 @@ static LRESULT CALLBACK ChipProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
 static int ChipTextW(HDC dc, const std::wstring& text) {
     RECT r{0, 0, 0, 0};
     DrawTextW(dc, text.c_str(), -1, &r, DT_SINGLELINE | DT_CALCRECT);
-    return (r.right - r.left) + 24;
+    return (r.right - r.left) + 32;
 }
 static void LayoutChipRects(const RECT& client) {
     g_chipRects.clear();
     int x = 12;
-    int h = 26;
+    int h = 28;
     int y = (client.bottom - client.top - h) / 2;
     HDC dc = GetDC(g_hwndChipRow);
     HGDIOBJ old = SelectObject(dc, g_fontChip);
@@ -950,15 +1037,7 @@ static LRESULT CALLBACK ChipRowProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             bool sel = g_chipsFocus && (int)i == g_chipSel;
             COLORREF base = ChipFill(c.color);
             // Solid pills, white bold text; selection = full brightness.
-            HBRUSH bg = CreateSolidBrush(sel ? base : Darken(base, 50));
-            HGDIOBJ oldB = SelectObject(dc, bg);
-            HGDIOBJ oldP = SelectObject(dc, GetStockObject(NULL_PEN));
-            int rad = r.bottom - r.top; // stadium ends: fully round pill
-            if (rad < 8) rad = 8;
-            RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
-            SelectObject(dc, oldB);
-            SelectObject(dc, oldP);
-            DeleteObject(bg);
+            FillPill(dc, r, sel ? base : Darken(base, 50));
             SetTextColor(dc, RGB(255, 255, 255));
             RECT tr = r;
             DrawTextW(dc, c.title.c_str(), -1, &tr,
@@ -1044,6 +1123,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         WORD id = LOWORD(w), code = HIWORD(w);
         if ((HWND)l == g_hwndEdit && code == EN_CHANGE) {
             if (g_changingEdit) break;
+            g_navigating = false; // real typing restarts arrow cycling
             // Bang-chip trigger: "alias<space>" with nothing else typed.
             if (g_activeBang < 0) {
                 std::wstring editRaw = GetEditText(g_hwndEdit);
@@ -1943,6 +2023,8 @@ static void OnTrayCommand(UINT id) {
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     g_hInst = hInst;
     srand((unsigned)GetTickCount()); // random bang colors for new entries
+    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+    Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, NULL);
 
     // Single instance: forward to the running copy.
     HANDLE mutex = CreateMutexW(NULL, FALSE, kMutexName);
@@ -2068,6 +2150,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     DeleteObject(g_brBg); DeleteObject(g_brInput); DeleteObject(g_brSel);
     if (g_hIconBig) DestroyIcon(g_hIconBig);
     if (g_hIconSmall) DestroyIcon(g_hIconSmall);
+    Gdiplus::GdiplusShutdown(g_gdiplusToken);
     CloseHandle(mutex);
     return (int)msg.wParam;
 }
