@@ -55,6 +55,7 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "powrprof.lib")
+#pragma comment(lib, "ole32.lib")
 
 // ---------------------------------------------------------------- constants
 static const wchar_t* kPaletteClass  = L"SneekPeekPalette";
@@ -72,7 +73,7 @@ static const UINT ID_TRAY_QUIT      = 1004;
 
 static const int kWidth = 600;
 static const int kInputH = 52;
-static const int kItemH = 42;
+static const int kItemH = 44;
 static const int kMaxItems = 6;
 static const int kCornerR = 14;
 static const int kChipH = 28;
@@ -212,6 +213,7 @@ static HFONT       g_fontInput = NULL;
 static HFONT       g_fontTitle = NULL;
 static HFONT       g_fontSub = NULL;
 static HFONT       g_fontChip = NULL;
+static HFONT       g_fontUI = NULL; // Segoe UI for all Settings controls
 static HBRUSH      g_brBg = NULL;
 static HBRUSH      g_brInput = NULL;
 static HBRUSH      g_brSel = NULL;
@@ -265,8 +267,9 @@ struct ResultItem {
     ResultKind kind;
     std::wstring title;   // main line (never a file path)
     std::wstring sub;     // small hint line
-    std::wstring action;  // lnk path | url | calc text (execution only)
+    std::wstring action;  // lnk path | shell:AppsFolder target | url | calc text
     COLORREF color;       // category accent color
+    bool isStore = false; // Store app: launch via explorer.exe
 };
 static std::vector<ResultItem> g_results;
 
@@ -432,9 +435,11 @@ static void ActivateBang(int idx, const std::wstring& query) {
     SelectObject(dc, old);
     ReleaseDC(g_hwndPalette, dc);
     int chipY = 10 + (32 - kChipH) / 2;
-    // Edit has WS_CLIPSIBLINGS so it never paints over the chip.
-    SetWindowPos(g_hwndChip, NULL, 16, chipY, w, kChipH,
-                 SWP_NOZORDER | SWP_SHOWWINDOW);
+    // HWND_TOP: the chip must stay above the edit (which has WS_CLIPSIBLINGS
+    // so it never paints over the chip). Synchronous paint: no blank flash.
+    SetWindowPos(g_hwndChip, HWND_TOP, 16, chipY, w, kChipH, SWP_SHOWWINDOW);
+    InvalidateRect(g_hwndChip, NULL, TRUE);
+    UpdateWindow(g_hwndChip);
     SendMessageW(g_hwndEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
                  MAKELPARAM(w + 8, 10));
     g_changingEdit = true;
@@ -478,6 +483,7 @@ static void PushAppRow(const AppEntry& app) {
     r.sub = L"Application";
     r.action = app.target;
     r.color = kAppCol;
+    r.isStore = app.isStore;
     g_results.push_back(std::move(r));
 }
 
@@ -515,7 +521,7 @@ static void RebuildListControl() {
         SendMessageW(g_hwndList, LB_SETCURSEL, 0, 0);
 
     bool showChips = !g_chips.empty();
-    size_t rows = g_results.empty() ? 1 : (g_results.size() > kMaxItems ? kMaxItems : g_results.size());
+    size_t rows = g_results.size() > kMaxItems ? kMaxItems : g_results.size();
     int listY = kInputH + (showChips ? kChipRowH : 0);
     int h = listY + (int)rows * kItemH + 10;
 
@@ -532,8 +538,11 @@ static void RebuildListControl() {
                          SWP_NOZORDER | SWP_SHOWWINDOW);
         else
             ShowWindow(g_hwndChipRow, SW_HIDE);
-        SetWindowPos(g_hwndList, NULL, 10, listY, cr.right - 20,
-                     (int)rows * kItemH, SWP_NOZORDER);
+        if (rows == 0)
+            ShowWindow(g_hwndList, SW_HIDE); // bar-only: no list at all
+        else
+            SetWindowPos(g_hwndList, NULL, 10, listY, cr.right - 20,
+                         (int)rows * kItemH, SWP_NOZORDER | SWP_SHOWWINDOW);
     }
     // No background erase (controls paint every pixel themselves).
     InvalidateRect(g_hwndList, NULL, FALSE);
@@ -562,11 +571,9 @@ static void UpdateResults() {
     }
 
     if (q.empty()) {
+        // Bar-only start: no rows, no list until the user types.
         g_chips.clear();
         g_chipsFocus = false;
-        ResultItem hint{ResultKind::Hint, L"Start typing to search",
-                        L"apps  /  web  /  alias + Space for site  /  math", L"", kHintCol};
-        g_results.push_back(std::move(hint));
         RebuildListControl();
         return;
     }
@@ -640,17 +647,21 @@ static int CurrentSelection() {
 
 static void ExecuteChip(int idx) {
     if (idx < 0 || idx >= (int)g_chips.size()) return;
-    const ChipItem& c = g_chips[(size_t)idx];
-    if (c.kind == ChipKind::Power) {
-        PowerOp op = kPowers[c.data].op;
-        if (op == PowerOp::Sleep) HidePalette(); // hide before suspend
-        RunPower(op);
-        if (op != PowerOp::Sleep) HidePalette();
+    ChipItem c = g_chips[(size_t)idx]; // copy: HidePalette clears the vector
+    bool isPower = (c.kind == ChipKind::Power);
+    PowerOp op = PowerOp::Shutdown;
+    std::wstring url;
+    if (isPower) {
+        int nPowers = (int)(sizeof(kPowers) / sizeof(kPowers[0]));
+        if (c.data < 0 || c.data >= nPowers) return;
+        op = kPowers[c.data].op;
     } else {
-        if (c.data >= 0 && c.data < (int)g_settings.quicks.size())
-            OpenUrl(g_settings.quicks[(size_t)c.data].url, g_settings.browserPath);
-        HidePalette();
+        if (c.data < 0 || c.data >= (int)g_settings.quicks.size()) return;
+        url = g_settings.quicks[(size_t)c.data].url;
     }
+    HidePalette(); // hide first: instant, never wait for the action
+    if (isPower) RunPower(op);
+    else OpenUrl(url, g_settings.browserPath);
 }
 
 static void ExecuteSelected(bool forceWeb) {
@@ -667,38 +678,46 @@ static void ExecuteSelected(bool forceWeb) {
 
     // Bang-chip mode: the armed site always wins (Shift+Enter = engine instead).
     if (const Bang* b = ActiveBang()) {
-        if (forceWeb)
-            OpenUrl(ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q)), g_settings.browserPath);
-        else
-            OpenUrl(q.empty() ? BangHome(b->url) : ExpandUrl(b->url, UrlEncodeQuery(q)),
-                    g_settings.browserPath);
-        HidePalette(); return;
+        std::wstring url = forceWeb ? ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q))
+            : (q.empty() ? BangHome(b->url) : ExpandUrl(b->url, UrlEncodeQuery(q)));
+        HidePalette(); // hide first: never wait for the browser
+        OpenUrl(url, g_settings.browserPath);
+        return;
     }
 
     if (q.empty()) { HidePalette(); return; }
 
     // Shift+Enter forces a web search with the raw text.
     if (forceWeb) {
+        std::wstring url;
         int bidx = -1; std::wstring term;
         if (ParseBangLeading(q, g_settings.bangs, bidx, term) && bidx >= 0) {
             const Bang& b = g_settings.bangs[(size_t)bidx];
-            OpenUrl(term.empty() ? BangHome(b.url) : ExpandUrl(b.url, UrlEncodeQuery(term)),
-                    g_settings.browserPath);
+            url = term.empty() ? BangHome(b.url) : ExpandUrl(b.url, UrlEncodeQuery(term));
         } else {
-            OpenUrl(ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q)), g_settings.browserPath);
+            url = ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q));
         }
-        HidePalette(); return;
+        HidePalette(); // hide first: never wait for the browser
+        OpenUrl(url, g_settings.browserPath);
+        return;
     }
 
     int idx = CurrentSelection();
     if (idx < 0) {
-        OpenUrl(ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q)), g_settings.browserPath);
-        HidePalette(); return;
+        std::wstring url = ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q));
+        HidePalette();
+        OpenUrl(url, g_settings.browserPath);
+        return;
     }
-    ResultItem& r = g_results[idx];
+    ResultItem r = g_results[(size_t)idx]; // copy: HidePalette clears the vector
+    if (r.kind == ResultKind::Hint) return;
+    HidePalette(); // hide first: never wait for the target app
     switch (r.kind) {
     case ResultKind::App:
-        if (!r.action.empty())
+        if (r.action.empty()) break;
+        if (r.isStore)
+            ShellExecuteW(NULL, L"open", L"explorer.exe", r.action.c_str(), NULL, SW_SHOWNORMAL);
+        else
             ShellExecuteW(NULL, L"open", r.action.c_str(), NULL, NULL, SW_SHOWNORMAL);
         break;
     case ResultKind::Web:
@@ -709,9 +728,8 @@ static void ExecuteSelected(bool forceWeb) {
         CopyText(r.action);
         break;
     case ResultKind::Hint:
-        return; // empty-query hint row: keep the palette open
+        break;
     }
-    HidePalette();
 }
 
 // ------------------------------------------------------------- edit subclass
@@ -1019,17 +1037,17 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         if ((int)ri < (int)g_results.size()) {
             const ResultItem& r = g_results[ri];
             SetBkMode(dc, TRANSPARENT);
-            // Category color bar.
-            HBRUSH bar = CreateSolidBrush(r.color);
+            // Category color bar: thin, brighter when selected.
+            HBRUSH bar = CreateSolidBrush(sel ? r.color : Darken(r.color, 65));
             RECT br = d->rcItem;
-            br.left += 12; br.right = br.left + 3;
-            br.top += 9; br.bottom -= 9;
+            br.left += 14; br.right = br.left + 2;
+            br.top += 10; br.bottom -= 10;
             FillRect(dc, &br, bar);
             DeleteObject(bar);
 
-            RECT tr = d->rcItem; tr.left += 26; tr.top += 4; tr.right -= 10;
-            RECT sr = tr; sr.top += 21;
-            SetTextColor(dc, kText);
+            RECT tr = d->rcItem; tr.left += 30; tr.top += 5; tr.right -= 10;
+            RECT sr = tr; sr.top += 22;
+            SetTextColor(dc, sel ? kText : RGB(218, 218, 226));
             SelectObject(dc, g_fontTitle);
             DrawTextW(dc, r.title.c_str(), -1, &tr,
                       DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -1247,8 +1265,17 @@ static void ShowSettingsPage(int page) {
 
 static HWND NewCtrl(const wchar_t* cls, const wchar_t* text, DWORD style,
                     int x, int y, int w, int h, HWND parent, UINT id) {
-    return CreateWindowW(cls, text, WS_CHILD | style, x, y, w, h,
+    DWORD st = WS_CHILD | style;
+    // Pushbuttons are owner-drawn (dark theme); checkboxes stay native themed.
+    if (wcscmp(cls, L"BUTTON") == 0 && (style & BS_AUTOCHECKBOX) == 0)
+        st |= BS_OWNERDRAW;
+    return CreateWindowW(cls, text, st, x, y, w, h,
                          parent, (HMENU)(UINT_PTR)id, g_hInst, NULL);
+}
+
+static void ApplyUIFont(HWND parent) {
+    for (HWND c = GetWindow(parent, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT))
+        SendMessageW(c, WM_SETFONT, (WPARAM)g_fontUI, FALSE);
 }
 
 static void OpenSettings() {
@@ -1403,6 +1430,9 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             ListView_SetExtendedListViewStyle(g_hwndAppsList,
                 LVS_EX_FULLROWSELECT | LVS_EX_CHECKBOXES | LVS_EX_DOUBLEBUFFER);
             LVAddColumn(g_hwndAppsList, 0, L"Application", 500);
+            ListView_SetBkColor(g_hwndAppsList, kBg);
+            ListView_SetTextColor(g_hwndAppsList, kText);
+            ListView_SetTextBkColor(g_hwndAppsList, kBg);
             FillAppsList();
         }
 
@@ -1419,6 +1449,9 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             LVAddColumn(g_hwndBangsList, 1, L"Name", 110);
             LVAddColumn(g_hwndBangsList, 2, L"URL", 218);
             LVAddColumn(g_hwndBangsList, 3, L"Color", 64);
+            ListView_SetBkColor(g_hwndBangsList, kBg);
+            ListView_SetTextColor(g_hwndBangsList, kText);
+            ListView_SetTextBkColor(g_hwndBangsList, kBg);
             FillBangsList();
             g_hwndBangAlias = page(g_pageBangs, NewCtrl(L"EDIT", L"",
                 WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 24, 284, 150, 24, hwnd, IDC_BANG_ALIAS));
@@ -1454,6 +1487,9 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
             LVAddColumn(g_hwndQuickList, 0, L"Name", 170);
             LVAddColumn(g_hwndQuickList, 1, L"URL", 362);
+            ListView_SetBkColor(g_hwndQuickList, kBg);
+            ListView_SetTextColor(g_hwndQuickList, kText);
+            ListView_SetTextBkColor(g_hwndQuickList, kBg);
             FillQuickList();
             g_hwndQuickName = page(g_pageQuick, NewCtrl(L"EDIT", L"",
                 WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 24, 284, 180, 24, hwnd, IDC_QUICK_NAME));
@@ -1485,8 +1521,58 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             SetWindowSubclass(plainEdits[i], PlainEditSubclass, 10 + (UINT_PTR)i, 0);
 
         ShowSettingsPage(0);
+        ApplyUIFont(hwnd);
         g_fillingSettings = false;
         break;
+    }
+    case WM_ERASEBKGND: {
+        HDC dc = (HDC)w;
+        RECT r; GetClientRect(hwnd, &r);
+        FillRect(dc, &r, g_brBg);
+        return 1;
+    }
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORLISTBOX: {
+        HDC dc = (HDC)w;
+        SetTextColor(dc, kText);
+        if (m == WM_CTLCOLOREDIT) {
+            SetBkColor(dc, kInput);
+            return (LRESULT)g_brInput;
+        }
+        SetBkMode(dc, TRANSPARENT);
+        SetBkColor(dc, kBg);
+        return (LRESULT)g_brBg;
+    }
+    case WM_DRAWITEM: {
+        // Owner-drawn dark buttons (all Settings pushbuttons).
+        DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)l;
+        if (d->CtlType != ODT_BUTTON) break;
+        bool pressed = (d->itemState & ODS_SELECTED) != 0;
+        bool focus = (d->itemState & ODS_FOCUS) != 0;
+        bool isSave = d->CtlID == (UINT)IDC_SAVE;
+        HDC dc = d->hDC;
+        FillRect(dc, &d->rcItem, g_brBg);
+        COLORREF fill = isSave ? (pressed ? RGB(38, 82, 140) : RGB(29, 65, 115))
+                               : (pressed ? RGB(52, 52, 56) : RGB(26, 26, 28));
+        COLORREF edge = isSave ? kAppCol
+                               : (focus ? RGB(130, 130, 140) : RGB(66, 66, 72));
+        HBRUSH bg = CreateSolidBrush(fill);
+        HPEN pen = CreatePen(PS_SOLID, 1, edge);
+        HGDIOBJ oldB = SelectObject(dc, bg);
+        HGDIOBJ oldP = SelectObject(dc, pen);
+        RoundRect(dc, d->rcItem.left, d->rcItem.top,
+                  d->rcItem.right, d->rcItem.bottom, 8, 8);
+        SelectObject(dc, oldB); SelectObject(dc, oldP);
+        DeleteObject(bg); DeleteObject(pen);
+        wchar_t text[128] = {0};
+        GetWindowTextW(d->hwndItem, text, 128);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, kText);
+        SelectObject(dc, g_fontUI);
+        DrawTextW(dc, text, -1, &d->rcItem,
+                  DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS);
+        return TRUE;
     }
     case WM_NOTIFY: {
         NMHDR* nm = (NMHDR*)l;
@@ -1500,6 +1586,24 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                     LoadEditorFromSelection(nm->hwndFrom);
             } else if (nm->code == NM_DBLCLK) {
                 LoadEditorFromSelection(nm->hwndFrom);
+            }
+        }
+        if (nm->code == NM_CUSTOMDRAW) {
+            // Dark tab strip + dark listview headers (minimal theme).
+            bool isTab = (nm->hwndFrom == g_hwndTab);
+            bool isHeader = !isTab &&
+                (nm->hwndFrom == ListView_GetHeader(g_hwndAppsList) ||
+                 nm->hwndFrom == ListView_GetHeader(g_hwndBangsList) ||
+                 nm->hwndFrom == ListView_GetHeader(g_hwndQuickList));
+            if (isTab || isHeader) {
+                LPNMCUSTOMDRAW cd = (LPNMCUSTOMDRAW)l;
+                if (cd->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+                if (cd->dwDrawStage == CDDS_ITEMPREPAINT) {
+                    cd->clrText = kText;
+                    cd->clrTextBk = kBg;
+                    SelectObject(cd->hdc, g_fontUI);
+                    return CDRF_NEWFONT;
+                }
             }
         }
         break;
@@ -1752,6 +1856,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     g_fontChip = CreateFontW(-MulDiv(10, dpiY, 72), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    g_fontUI = CreateFontW(-MulDiv(9, dpiY, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     g_brBg = CreateSolidBrush(kBg);
     g_brInput = CreateSolidBrush(kInput);
     g_brSel = CreateSolidBrush(kSel);
@@ -1832,7 +1939,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
 
     UnregisterHotKey(g_hwndPalette, HOTKEY_ID);
     DeleteObject(g_fontInput); DeleteObject(g_fontTitle);
-    DeleteObject(g_fontSub); DeleteObject(g_fontChip);
+    DeleteObject(g_fontSub); DeleteObject(g_fontChip); DeleteObject(g_fontUI);
     DeleteObject(g_brBg); DeleteObject(g_brInput); DeleteObject(g_brSel);
     if (g_hIconBig) DestroyIcon(g_hIconBig);
     if (g_hIconSmall) DestroyIcon(g_hIconSmall);

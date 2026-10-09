@@ -1,6 +1,8 @@
 #include "app_index.h"
 #include <windows.h>
 #include <shlobj.h>
+#include <shobjidl.h>
+#include <shlguid.h>
 #include <shlwapi.h>
 #include <algorithm>
 
@@ -9,11 +11,60 @@ std::wstring ToLower(std::wstring s) {
     return s;
 }
 
+static std::wstring ExpandEnvLocal(const std::wstring& s) {
+    DWORD n = ExpandEnvironmentStringsW(s.c_str(), NULL, 0);
+    if (n == 0 || n > 32768) return s;
+    std::wstring out(n, L'\0');
+    DWORD w = ExpandEnvironmentStringsW(s.c_str(), out.data(), n);
+    if (w == 0 || w > n) return s;
+    out.resize(w > 0 ? w - 1 : 0);
+    return out;
+}
+
+// Resolve a .lnk to its target path. False when unresolvable (special shell
+// links) - callers keep those; they are usually real system tools.
+static bool ResolveLnk(const std::wstring& lnk, std::wstring& target) {
+    IShellLinkW* sl = NULL;
+    if (CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                         IID_IShellLinkW, (void**)&sl) != S_OK)
+        return false;
+    IPersistFile* pf = NULL;
+    bool ok = false;
+    if (sl->QueryInterface(IID_IPersistFile, (void**)&pf) == S_OK) {
+        if (pf->Load(lnk.c_str(), STGM_READ) == S_OK) {
+            wchar_t path[1024] = {0};
+            WIN32_FIND_DATAW fd{};
+            if (sl->GetPath(path, 1024, &fd, SLGP_UNCPRIORITY) == S_OK && path[0]) {
+                target = ExpandEnvLocal(path);
+                ok = true;
+            }
+        }
+        pf->Release();
+    }
+    sl->Release();
+    return ok;
+}
+
+// Only executable targets belong in the index: drops .txt/.chm/.pdf links etc.
+static bool IsRunnableTarget(const std::wstring& target) {
+    size_t dot = target.find_last_of(L'.');
+    size_t sep = target.find_last_of(L"\\/");
+    if (dot == std::wstring::npos || (sep != std::wstring::npos && dot < sep))
+        return true; // no extension: keep (some tools are extensionless)
+    std::wstring ext = ToLower(target.substr(dot + 1));
+    return ext == L"exe" || ext == L"msc" || ext == L"bat" ||
+           ext == L"cmd" || ext == L"com" || ext == L"pif" ||
+           ext == L"scr" || ext == L"cpl";
+}
+
+static bool StartsWithUninstall(const std::wstring& name) {
+    std::wstring n = ToLower(name);
+    return n.compare(0, 9, L"uninstall") == 0;
+}
+
 static void ScanLnkDir(const std::wstring& root, std::vector<AppEntry>& out) {
-    // Iterative stack-based recursive scan (no recursion, tiny stack use).
     std::vector<std::wstring> stack;
     stack.push_back(root);
-    wchar_t buf[MAX_PATH];
 
     while (!stack.empty()) {
         std::wstring dir = std::move(stack.back());
@@ -24,42 +75,89 @@ static void ScanLnkDir(const std::wstring& root, std::vector<AppEntry>& out) {
         HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
         do {
-            if (fd.cFileName[0] == L'.') {
-                // Skip "." / ".." but allow ".hidden" files? Keep simple: skip dot-dirs.
-                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                    if (fd.cFileName[1] == L'\0' ||
-                        (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0'))
-                        continue;
-                }
-            }
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                stack.push_back(dir + L"\\" + fd.cFileName);
-            } else {
-                const wchar_t* ext = PathFindExtensionW(fd.cFileName);
-                if (_wcsicmp(ext, L".lnk") == 0 || _wcsicmp(ext, L".url") == 0) {
-                    AppEntry e;
-                    e.target = dir + L"\\" + fd.cFileName;
-                    // Display name = filename without extension.
-                    std::wstring n = fd.cFileName;
-                    n.resize(ext - fd.cFileName);
-                    e.name = n;
-                    out.push_back(std::move(e));
-                } else if (_wcsicmp(ext, L".exe") == 0) {
-                    // Rare inside start-menu dirs, but handle it.
-                    AppEntry e;
-                    e.target = dir + L"\\" + fd.cFileName;
-                    std::wstring n = fd.cFileName;
-                    n.resize(ext - fd.cFileName);
-                    e.name = n;
-                    out.push_back(std::move(e));
-                }
+                if (fd.cFileName[0] == L'.' &&
+                    (fd.cFileName[1] == L'\0' ||
+                     (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0')))
+                    continue;
+                if (out.size() < 4000)
+                    stack.push_back(dir + L"\\" + fd.cFileName);
+                continue;
             }
-            // Hard cap: stay light even on pathological machines.
-            if (out.size() >= 4000) { FindClose(h); return; }
+            const wchar_t* ext = PathFindExtensionW(fd.cFileName);
+            bool isLnk = _wcsicmp(ext, L".lnk") == 0;
+            bool isExe = _wcsicmp(ext, L".exe") == 0;
+            if (!isLnk && !isExe) continue; // no .url/docs/pics: apps only
+            if (out.size() >= 4000) break;
+
+            std::wstring base(fd.cFileName, ext - fd.cFileName);
+            if (base.empty() || StartsWithUninstall(base)) continue;
+
+            std::wstring full = dir + L"\\" + fd.cFileName;
+            if (isLnk) {
+                std::wstring target;
+                if (ResolveLnk(full, target) && !IsRunnableTarget(target))
+                    continue; // .lnk to a doc/help file: drop
+            }
+            AppEntry e;
+            e.name = base;
+            e.target = full;
+            e.isStore = false;
+            out.push_back(std::move(e));
         } while (FindNextFileW(h, &fd));
         FindClose(h);
-        (void)buf;
     }
+}
+
+// AppUserModelId property key {9F4C2855-9F79-4B39-A8D0-E1D42DE3D5F3},5.
+// Hardcoded so no extra libs/headers are needed for one GUID.
+static const PROPERTYKEY kKeyAumid = {
+    {0x9F4C2855, 0x9F79, 0x4B39,
+     {0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE3, 0xD5, 0xF3}},
+    5
+};
+
+// Microsoft Store (UWP) apps via shell:AppsFolder - the only complete,
+// launchable enumeration (Camera, Dolby Audio, ...).
+static void ScanStoreApps(std::vector<AppEntry>& out) {
+    PIDLIST_ABSOLUTE pidl = NULL;
+    if (SHGetKnownFolderIDList(FOLDERID_AppsFolder, KF_FLAG_DEFAULT, NULL, &pidl) != S_OK)
+        return;
+    IShellItem* folder = NULL;
+    if (SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&folder)) == S_OK) {
+        IEnumShellItems* en = NULL;
+        if (SUCCEEDED(folder->BindToHandler(NULL, BHID_EnumItems, IID_PPV_ARGS(&en)))) {
+            for (;;) {
+                IShellItem* it = NULL;
+                ULONG n = 0;
+                if (en->Next(1, &it, &n) != S_OK || n != 1 || !it) break;
+                LPWSTR name = NULL;
+                if (it->GetDisplayName(SIGDN_NORMALDISPLAY, &name) == S_OK && name && *name) {
+                    IShellItem2* i2 = NULL;
+                    if (it->QueryInterface(IID_IShellItem2, (void**)&i2) == S_OK) {
+                        LPWSTR aumid = NULL;
+                        if (i2->GetString(kKeyAumid, &aumid) == S_OK && aumid && *aumid) {
+                            AppEntry e;
+                            e.name = name;
+                            e.target = std::wstring(L"shell:AppsFolder\\") + aumid;
+                            e.isStore = true;
+                            out.push_back(std::move(e));
+                        }
+                        if (aumid) CoTaskMemFree(aumid);
+                        i2->Release();
+                    }
+                    CoTaskMemFree(name);
+                } else if (name) {
+                    CoTaskMemFree(name);
+                }
+                it->Release();
+                if (out.size() >= 6000) break;
+            }
+            en->Release();
+        }
+        folder->Release();
+    }
+    CoTaskMemFree(pidl);
 }
 
 static void ScanPathExes(std::vector<AppEntry>& out) {
@@ -75,7 +173,6 @@ static void ScanPathExes(std::vector<AppEntry>& out) {
         std::wstring dir = env.substr(start, end - start);
         start = end + 1;
         if (dir.empty() || dir.size() > MAX_PATH) continue;
-        // Skip system32 churn? No - keep, but cap files per dir.
         std::wstring pattern = dir + L"\\*.exe";
         WIN32_FIND_DATAW fd{};
         HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
@@ -88,34 +185,40 @@ static void ScanPathExes(std::vector<AppEntry>& out) {
             std::wstring fn = fd.cFileName;
             auto dot = fn.rfind(L'.');
             e.name = (dot == std::wstring::npos) ? fn : fn.substr(0, dot);
+            e.isStore = false;
             out.push_back(std::move(e));
-            if (++perDir > 150 || out.size() >= 5000) break;
+            if (++perDir > 150 || out.size() >= 6000) break;
         } while (FindNextFileW(h, &fd));
         FindClose(h);
         dirsScanned++;
-        if (out.size() >= 5000) return;
+        if (out.size() >= 6000) return;
     }
 }
 
 void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes) {
     out.clear();
-    out.reserve(600);
+    out.reserve(900);
+
+    // COM for .lnk resolve + Store enumeration (this runs on a worker thread).
+    bool com = SUCCEEDED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED |
+                                              COINIT_DISABLE_OLE1DDE));
 
     wchar_t buf[MAX_PATH];
-
-    // 1) Per-user Start Menu
     if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_PROGRAMS, NULL, 0, buf)))
         ScanLnkDir(buf, out);
-    // 2) All-users Start Menu
     if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_COMMON_PROGRAMS, NULL, 0, buf)))
         ScanLnkDir(buf, out);
-    // 3) Optional PATH scan (off by default - costs RAM)
+    ScanStoreApps(out);
     if (includePathExes)
         ScanPathExes(out);
 
-    // De-dupe by lowercase name, keep first (user dir wins).
+    if (com) CoUninitialize();
+
+    // Sort by name; .lnk wins ties over Store/PATH dupes. Then de-dupe.
     std::sort(out.begin(), out.end(), [](const AppEntry& a, const AppEntry& b) {
-        return ToLower(a.name) < ToLower(b.name);
+        std::wstring x = ToLower(a.name), y = ToLower(b.name);
+        if (x != y) return x < y;
+        return (a.isStore ? 1 : 0) < (b.isStore ? 1 : 0);
     });
     std::vector<AppEntry> uniq;
     uniq.reserve(out.size());
@@ -123,7 +226,7 @@ void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes) {
     bool first = true;
     for (auto& e : out) {
         std::wstring k = ToLower(e.name);
-        if (!first && k == prev) continue; // dupe name - drop (keeps memory flat)
+        if (!first && k == prev) continue;
         uniq.push_back(std::move(e));
         prev = k;
         first = false;
@@ -131,44 +234,60 @@ void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes) {
     out.swap(uniq);
 }
 
+static bool IsWordBoundary(wchar_t prev) {
+    return prev == L' ' || prev == L'-' || prev == L'_' || prev == L'.' ||
+           prev == L'/' || prev == L'\\' || prev == L'(' || prev == L'[';
+}
+
 int FuzzyScore(const std::wstring& nameLower, const std::wstring& queryLower) {
     if (queryLower.empty()) return 0;
-    if (nameLower.empty()) return -1;
+    if (nameLower.empty() || queryLower.size() > nameLower.size()) return -1;
 
-    // 1) Prefix match - best.
+    // 1) Exact + prefix: strongest signals.
+    if (nameLower == queryLower) return 100000;
     if (nameLower.compare(0, queryLower.size(), queryLower) == 0)
-        return 10000 - (int)nameLower.size(); // shorter names rank higher
+        return 50000 - (int)nameLower.size();
 
-    // 2) Word-prefix match ("Visual Studio Code" vs "code").
+    // 2) Contiguous substring, word-boundary hits rank higher.
     size_t pos = nameLower.find(queryLower);
     if (pos != std::wstring::npos) {
-        bool atWordStart = (pos == 0 || nameLower[pos - 1] == L' ' ||
-                            nameLower[pos - 1] == L'-' || nameLower[pos - 1] == L'_');
-        return (atWordStart ? 5000 : 3000) - (int)pos - (int)nameLower.size() / 4;
+        int base = (pos == 0 || IsWordBoundary(nameLower[pos - 1])) ? 20000 : 8000;
+        return base - (int)pos * 8 - (int)nameLower.size() / 4;
     }
 
-    // 3) Subsequence (fuzzy initials "vsc" -> "Visual Studio Code").
-    size_t qi = 0;
+    // 3) Fuzzy subsequence with bonuses: word starts, camel humps,
+    //    consecutive runs; gaps and long names penalized.
+    int total = 0;
     int gaps = 0;
-    size_t lastHit = 0;
-    for (size_t i = 0; i < nameLower.size() && qi < queryLower.size(); ++i) {
-        if (nameLower[i] == queryLower[qi]) {
-            if (qi > 0) gaps += (int)(i - lastHit - 1);
-            lastHit = i;
-            qi++;
+    size_t ni = 0;
+    int consec = 0;
+    for (size_t qi = 0; qi < queryLower.size(); qi++) {
+        size_t f = nameLower.find(queryLower[qi], ni);
+        if (f == std::wstring::npos) return -1;
+        if (qi == 0 && f == 0) {
+            total += 30; // matches the very first character
+            consec = 1;
+        } else if (f == 0 || IsWordBoundary(nameLower[f - 1])) {
+            total += 16;
+            consec = 1;
+        } else if (f == ni) {
+            total += 10 + consec * 2; // consecutive run bonus grows
+            consec++;
+        } else {
+            total += 1;
+            consec = 0;
+            gaps += (int)(f - ni);
         }
+        ni = f + 1;
     }
-    if (qi == queryLower.size())
-        return 1000 - gaps * 10 - (int)nameLower.size() / 8;
-
-    return -1;
+    total -= gaps * 2 + (int)nameLower.size() / 8;
+    return total > 0 ? total : 1; // every full subsequence still matches, weakly
 }
 
 std::vector<ScoredApp> SearchApps(const std::vector<AppEntry>& apps,
                                  const std::wstring& query,
                                  size_t limit) {
     std::wstring q = ToLower(query);
-    // trim
     size_t a = q.find_first_not_of(L" \t");
     if (a == std::wstring::npos) return {};
     size_t b = q.find_last_not_of(L" \t");

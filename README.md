@@ -2,10 +2,10 @@
 
 One hotkey. One text box. Zero idle cost.
 
-- Press **Ctrl+Space** → a text box appears at the top of the screen.
-- Type → live **app search** (Start Menu), **web search**, **!bang search**, calculator.
-- **Enter** opens the top result. Click anywhere outside (or `Esc`) → it disappears.
-- Next **Ctrl+Space** → fresh empty box.
+- Press **Ctrl+Space** → only a search bar appears (nothing else until you type).
+- Type → fuzzy **app search** (Start Menu programs, exe-targets only, plus Microsoft Store apps like Camera), **power/quick chips**, **web search**, **!bang search**, calculator.
+- **Enter** runs the top result — the palette hides instantly, before the app even opens. Click anywhere outside (or `Esc`) → it disappears.
+- Next **Ctrl+Space** → fresh empty bar.
 - Tray icon → **Settings… / Refresh apps / Run at startup / Quit**.
 - Background: a single blocking `GetMessage` loop — **0% CPU**, **~1–3 MB RAM**, no polling, no hooks, no services.
 
@@ -75,7 +75,7 @@ Notes:
 
 ## Settings
 
-Tray → **Settings…** (tabbed). Stored in `%APPDATA%\SneekPeek\settings.ini`:
+Tray → **Settings…** (tabbed, dark, matches the app). Stored in `%APPDATA%\SneekPeek\settings.ini`:
 
 - **General** — engine (DuckDuckGo / Google / Bing / Brave / Custom URL with `%s`), browser for web + bang + quick links (System default or picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe`), PATH executables, Run at startup
 - **Hidden apps** — checkbox list of every indexed app; checked ones never appear in suggestions
@@ -85,7 +85,7 @@ Tray → **Settings…** (tabbed). Stored in `%APPDATA%\SneekPeek\settings.ini`:
 ## Why it uses (almost) nothing
 
 - One hidden `HWND` + blocking `GetMessage` loop → thread sleeps until an event. No timers, no polling → **0% CPU**.
-- App index is a single `vector<{name, path}>` (~a few hundred entries, ~100 KB) built **once** on a background thread, then the thread exits. No icon extraction, no file watchers → **~1–3 MB** total.
+- App index is a single `vector<{name, path}>` built **once** on a background thread (Start Menu `.lnk` targets resolved to keep exe-tools only, Store apps enumerated via `shell:AppsFolder`), then the thread exits. No icon extraction, no file watchers → **~1–3 MB** total.
 - Global hotkey via `RegisterHotKey` (OS-level, no low-level keyboard hook).
 - Dismiss-on-click-outside via `WM_ACTIVATE` + `WM_ACTIVATEAPP` (no mouse hook).
 - `WS_EX_TOOLWINDOW` → no taskbar button; single instance via mutex.

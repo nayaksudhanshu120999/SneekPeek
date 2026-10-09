@@ -1,13 +1,14 @@
 #pragma once
-// SneekPeek - tiny app index (Start Menu .lnk + optional PATH scan)
-// Design goals: <300KB source, lazy one-time scan, ~100KB RAM, 0% idle CPU.
+// SneekPeek - app index: Start Menu (.lnk, exe-targets only) + Microsoft Store
+// (UWP) apps + optional PATH scan. Lazy one-time scan, ~100KB RAM, 0% idle CPU.
 
 #include <string>
 #include <vector>
 
 struct AppEntry {
-    std::wstring name;   // "Visual Studio Code" (from .lnk filename)
-    std::wstring target; // full path to .lnk (ShellExecute resolves it)
+    std::wstring name;    // display name ("Visual Studio Code", "Camera")
+    std::wstring target;  // .lnk path, or "shell:AppsFolder\<AUMID>" for Store
+    bool isStore = false; // Store apps launch via explorer.exe + target
 };
 
 struct ScoredApp {
@@ -15,10 +16,12 @@ struct ScoredApp {
     int score;
 };
 
-// Scan two Start Menu trees + optional PATH exes. Runs once, on first hotkey.
+// Scan Start Menu + Store apps + optional PATH exes. Runs once, on first hotkey.
+// Initializes COM on the calling thread (needed for .lnk resolve + Store enum).
 void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes);
 
-// Fuzzy score. Returns -1 = no match, higher = better.
+// Fuzzy score: exact > prefix > word-boundary > substring > subsequence
+// (with consecutive / boundary bonuses). Returns -1 = no match.
 int FuzzyScore(const std::wstring& nameLower, const std::wstring& queryLower);
 
 // Filter + rank. Returns pointers into `apps`, max `limit` entries.
