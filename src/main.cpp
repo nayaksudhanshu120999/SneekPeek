@@ -1551,7 +1551,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             // Transparent: the black dialog shows through. Theme-proof, since
             // themed (v6) controls would otherwise paint a white field.
             SetBkMode(dc, TRANSPARENT);
-            return (HBRUSH)GetStockObject(NULL_BRUSH);
+            return (LRESULT)GetStockObject(NULL_BRUSH);
         }
         SetBkMode(dc, TRANSPARENT);
         SetBkColor(dc, kBg);
