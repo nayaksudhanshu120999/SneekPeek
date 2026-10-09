@@ -3,7 +3,7 @@
 One hotkey. One text box. Zero idle cost.
 
 - Press **Ctrl+Space** → only a search bar appears (nothing else until you type).
-- Type → fuzzy **app search** (Start Menu programs, exe-targets only, plus Microsoft Store apps like Camera), **power/quick chips**, **web search**, **!bang search**, calculator.
+- Type → fuzzy **app search** (Start Menu programs, exe-targets only, plus Microsoft Store apps), **power/quick chips**, **bang previews**, **web search** with live **online suggestions** (Local / Online sections), calculator.
 - **Enter** runs the top result — the palette hides instantly, before the app even opens. Click anywhere outside (or `Esc`) → it disappears.
 - Next **Ctrl+Space** → fresh empty bar.
 - Tray icon → **Settings… / Refresh apps / Run at startup / Quit**.
@@ -16,13 +16,13 @@ Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 | Input | Action |
 |---|---|
 | `code` | fuzzy-matches apps (`Visual Studio Code`), Enter launches |
-| `anything else` | Enter → web search with your engine (default DuckDuckGo) |
-| `yt` + `Space` | chip-only mode: just the YouTube pill in the bar, no list — type the query, Enter searches (Backspace on empty query or click `x` exits) |
+| `anything else` | Enter → web search with your engine (default DuckDuckGo) + live online suggestions below, grouped under Local / Online |
+| `yt` | matching site bangs appear as rows — Enter (or `yt` + `Space`) arms the chip: just the pill in the bar, no list — type the query, Enter searches (Backspace on empty query or click `x` exits) |
 | `!g cats` | one-shot bang without the chip (Google for `cats`) |
 | `shu` | power chips appear above the list (Shut down, Restart, Sleep, Hibernate) — Enter runs the selected chip, Tab cycles, Down jumps to the list |
 | `gmail` | quick-link chips (fixed URLs, no query) work the same way — Enter opens |
 | `12*8` | calculator (Enter copies result) |
-| `↑` `↓` | move selection (Up from the first row jumps back to the chips), `Enter` open, `Shift+Enter` force web search, `Esc` dismiss, `F5` rescan apps |
+| `↑` `↓` | move selection (mirrors into the box without refiltering; Up from the first row jumps back to the chips), `Enter` open, `Shift+Enter` force web search, `Esc` dismiss, `F5` rescan apps |
 
 Bang aliases are editable in Settings (default: `yt`/`youtube`, `gh`/`github`, `w`/`wiki`, `r`, `m`, `t`, `a`, `x`, `so`, `d`, `g` — each with its own color).
 
@@ -75,12 +75,12 @@ Notes:
 
 ## Settings
 
-Tray → **Settings…** (tabbed, dark, matches the app). Stored in `%APPDATA%\SneekPeek\settings.ini`:
+Tray → **Settings…** (tabbed, dark, matches the app — every change saves instantly, no Save button). Stored in `%APPDATA%\SneekPeek\settings.ini`:
 
-- **General** — engine (DuckDuckGo / Google / Bing / Brave / Custom URL with `%s`), browser for web + bang + quick links (System default or picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe`), PATH executables, Run at startup
+- **General** — engine (DuckDuckGo / Google / Bing / Brave / Custom URL with `%s`), browser for web + bang + quick links (System default or picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe`)
 - **Hidden apps** — checkbox list of every indexed app; checked ones never appear in suggestions
-- **Bangs** — table (Aliases / Name / URL / Color), double-click a row to edit, Add/Update/Delete/Reset (leave the color empty for a random pick)
-- **Quick links** — table (Name / URL); typing the name in the palette shows a chip that opens the fixed URL on Enter (e.g. Gmail)
+- **Bangs** — table (Aliases / Name / URL): Add appends an editable row, double-click any cell to edit in place, Del removes rows, colors auto-picked
+- **Quick links** — table (Name / URL) with the same editing; typing the name in the palette shows a chip that opens the fixed URL on Enter (e.g. Gmail)
 
 ## Why it uses (almost) nothing
 

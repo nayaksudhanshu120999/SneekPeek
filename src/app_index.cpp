@@ -117,6 +117,67 @@ static const PROPERTYKEY kKeyAumid = {
     5
 };
 
+static bool ItemToStoreApp(IShellItem* it, AppEntry& out) {
+    LPWSTR name = NULL;
+    if (it->GetDisplayName(SIGDN_NORMALDISPLAY, &name) != S_OK || !name || !*name) {
+        if (name) CoTaskMemFree(name);
+        return false;
+    }
+    bool ok = false;
+    IShellItem2* i2 = NULL;
+    if (it->QueryInterface(IID_IShellItem2, (void**)&i2) == S_OK) {
+        LPWSTR aumid = NULL;
+        if (i2->GetString(kKeyAumid, &aumid) == S_OK && aumid && *aumid) {
+            out.name = name;
+            out.target = std::wstring(L"shell:AppsFolder\\") + aumid;
+            out.isStore = true;
+            ok = true;
+        }
+        if (aumid) CoTaskMemFree(aumid);
+        i2->Release();
+    }
+    CoTaskMemFree(name);
+    return ok;
+}
+
+// Fallback path via IShellFolder::EnumObjects: same apps, different COM
+// route, for machines where the ShellItem enumerator comes up empty.
+static void ScanStoreAppsFallback(std::vector<AppEntry>& out) {
+    PIDLIST_ABSOLUTE pidl = NULL;
+    if (SHGetKnownFolderIDList(FOLDERID_AppsFolder, KF_FLAG_DEFAULT, NULL, &pidl) != S_OK)
+        return;
+    IShellFolder* desktop = NULL;
+    if (SHGetDesktopFolder(&desktop) == S_OK) {
+        IShellFolder* appsF = NULL;
+        if (desktop->BindToObject(pidl, NULL, IID_PPV_ARGS(&appsF)) == S_OK) {
+            IEnumIDList* en = NULL;
+            if (appsF->EnumObjects(NULL, SHCONTF_NONFOLDERS | SHCONTF_INCLUDEHIDDEN,
+                                   &en) == S_OK) {
+                for (;;) {
+                    LPITEMIDLIST child = NULL;
+                    if (en->Next(1, &child, NULL) != S_OK || !child) break;
+                    LPITEMIDLIST full = ILCombine(pidl, child);
+                    if (full) {
+                        IShellItem* it = NULL;
+                        if (SHCreateItemFromIDList(full, IID_PPV_ARGS(&it)) == S_OK) {
+                            AppEntry e;
+                            if (ItemToStoreApp(it, e)) out.push_back(std::move(e));
+                            it->Release();
+                        }
+                        CoTaskMemFree(full);
+                    }
+                    CoTaskMemFree(child);
+                    if (out.size() >= 6000) break;
+                }
+                en->Release();
+            }
+            appsF->Release();
+        }
+        desktop->Release();
+    }
+    CoTaskMemFree(pidl);
+}
+
 // Microsoft Store (UWP) apps via shell:AppsFolder - the only complete,
 // launchable enumeration (Camera, Dolby Audio, ...).
 static void ScanStoreApps(std::vector<AppEntry>& out) {
@@ -131,25 +192,8 @@ static void ScanStoreApps(std::vector<AppEntry>& out) {
                 IShellItem* it = NULL;
                 ULONG n = 0;
                 if (en->Next(1, &it, &n) != S_OK || n != 1 || !it) break;
-                LPWSTR name = NULL;
-                if (it->GetDisplayName(SIGDN_NORMALDISPLAY, &name) == S_OK && name && *name) {
-                    IShellItem2* i2 = NULL;
-                    if (it->QueryInterface(IID_IShellItem2, (void**)&i2) == S_OK) {
-                        LPWSTR aumid = NULL;
-                        if (i2->GetString(kKeyAumid, &aumid) == S_OK && aumid && *aumid) {
-                            AppEntry e;
-                            e.name = name;
-                            e.target = std::wstring(L"shell:AppsFolder\\") + aumid;
-                            e.isStore = true;
-                            out.push_back(std::move(e));
-                        }
-                        if (aumid) CoTaskMemFree(aumid);
-                        i2->Release();
-                    }
-                    CoTaskMemFree(name);
-                } else if (name) {
-                    CoTaskMemFree(name);
-                }
+                AppEntry e;
+                if (ItemToStoreApp(it, e)) out.push_back(std::move(e));
                 it->Release();
                 if (out.size() >= 6000) break;
             }
@@ -209,6 +253,7 @@ void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes) {
     if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_COMMON_PROGRAMS, NULL, 0, buf)))
         ScanLnkDir(buf, out);
     ScanStoreApps(out);
+    ScanStoreAppsFallback(out); // second COM route; dedupe merges overlaps
     if (includePathExes)
         ScanPathExes(out);
 

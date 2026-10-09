@@ -31,6 +31,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <powrprof.h>
+#include <winhttp.h>
 #include <cwctype>
 #include <cmath>
 #include <cstdio>
@@ -56,6 +57,7 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "powrprof.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "winhttp.lib")
 
 // ---------------------------------------------------------------- constants
 static const wchar_t* kPaletteClass  = L"SneekPeekPalette";
@@ -66,6 +68,7 @@ static const wchar_t* kMutexName     = L"SneekPeek_SingleInstance_v1";
 static const UINT HOTKEY_ID = 1;
 static const UINT WM_TRAYICON = WM_APP + 10;
 static const UINT WM_APP_SHOW = WM_APP + 11;
+static const UINT WM_APP_ONLINE = WM_APP + 21; // background suggestions arrived
 static const UINT ID_TRAY_SETTINGS = 1001;
 static const UINT ID_TRAY_REFRESH  = 1002;
 static const UINT ID_TRAY_STARTUP   = 1003;
@@ -122,6 +125,11 @@ static COLORREF Darken(COLORREF c, int pct) {
     return RGB(GetRValue(c) * pct / 100,
                GetGValue(c) * pct / 100,
                GetBValue(c) * pct / 100);
+}
+// Solid chip fill with readable white text: bright colors get darkened.
+static COLORREF ChipFill(COLORREF c) {
+    int lum = (GetRValue(c) * 299 + GetGValue(c) * 587 + GetBValue(c) * 114) / 1000;
+    return lum > 170 ? Darken(c, 55) : c;
 }
 
 // ------------------------------------------------------------- calculator
@@ -187,6 +195,9 @@ static HWND        g_hwndEdit = NULL;
 static HWND        g_hwndList = NULL;
 static HWND        g_hwndChip = NULL;
 static HWND        g_hwndChipRow = NULL;
+static HWND        g_hwndEngineChip = NULL; // engine pill at the right of the box
+static int         g_bangChipW = 0;  // 0 = hidden
+static int         g_engineW = 0;    // 0 = hidden
 static HWND        g_hwndSettings = NULL;
 static int         g_settingsPage = 0;
 static HWND        g_hwndEngineCombo = NULL;
@@ -194,15 +205,11 @@ static HWND        g_hwndEngineUrl = NULL;
 static HWND        g_hwndBrowserCombo = NULL;
 static HWND        g_hwndAppsList = NULL;
 static HWND        g_hwndBangsList = NULL;
-static HWND        g_hwndBangAlias = NULL;
-static HWND        g_hwndBangName = NULL;
-static HWND        g_hwndBangUrl = NULL;
-static HWND        g_hwndBangColor = NULL;
 static HWND        g_hwndQuickList = NULL;
-static HWND        g_hwndQuickName = NULL;
-static HWND        g_hwndQuickUrl = NULL;
-static HWND        g_hwndChkPath = NULL;
-static HWND        g_hwndChkStartup = NULL;
+static HWND        g_hwndCellEdit = NULL; // in-place table cell editor
+static int         g_cellLv = 0;   // 1 = bangs table, 2 = quick table
+static int         g_cellRow = -1;
+static int         g_cellCol = 0;
 static std::vector<HWND> g_pageGeneral, g_pageApps, g_pageBangs, g_pageQuick;
 static bool        g_fillingSettings = false;
 static HFONT       g_fontInput = NULL;
@@ -258,7 +265,7 @@ static std::vector<RECT> g_chipRects;
 static int  g_chipSel = 0;
 static bool g_chipsFocus = false; // true = Enter runs the chip, list has no selection
 
-enum class ResultKind { App, Web, Bang, Calc, Hint };
+enum class ResultKind { App, Web, Bang, Calc, Hint, Header, Online };
 struct ResultItem {
     ResultKind kind;
     std::wstring title;   // main line (never a file path)
@@ -266,6 +273,8 @@ struct ResultItem {
     std::wstring action;  // lnk path | shell:AppsFolder target | url | calc text
     COLORREF color;       // category accent color
     bool isStore = false; // Store app: launch via explorer.exe
+    int bangIdx = -1;     // bang-preview rows: index into g_settings.bangs
+    bool preview = false; // bang-preview rows: Enter arms the chip
 };
 static std::vector<ResultItem> g_results;
 
@@ -298,6 +307,7 @@ static void RebuildHiddenSet();
 static bool IsHiddenApp(const std::wstring& name);
 static void ActivateBang(int idx, const std::wstring& query);
 static void DeactivateBang();
+static void CloseCellEdit(bool commit);
 static void ApplyRoundCorners();
 static void EnableRoundCorners(HWND hwnd);
 static void RunPower(PowerOp op);
@@ -421,6 +431,14 @@ static int ChipWidthFor(HDC dc, const std::wstring& text) {
     return (r.right - r.left) + 10 + 24 + 8;
 }
 
+// Single place that maps chip visibility -> edit text margins.
+static void ApplyEditMargins() {
+    if (!g_hwndEdit) return;
+    SendMessageW(g_hwndEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                 MAKELPARAM(g_bangChipW ? g_bangChipW + 8 : 10,
+                            g_engineW ? g_engineW + 10 : 10));
+}
+
 static void ActivateBang(int idx, const std::wstring& query) {
     if (idx < 0 || idx >= (int)g_settings.bangs.size()) return;
     g_activeBang = idx;
@@ -436,8 +454,11 @@ static void ActivateBang(int idx, const std::wstring& query) {
     SetWindowPos(g_hwndChip, HWND_TOP, 16, chipY, w, kChipH, SWP_SHOWWINDOW);
     InvalidateRect(g_hwndChip, NULL, TRUE);
     UpdateWindow(g_hwndChip);
-    SendMessageW(g_hwndEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
-                 MAKELPARAM(w + 8, 10));
+    g_bangChipW = w;
+    g_engineW = 0;
+    if (g_hwndEngineChip) ShowWindow(g_hwndEngineChip, SW_HIDE);
+    ApplyEditMargins();
+    InvalidateRect(g_hwndPalette, NULL, FALSE); // refresh the box outline
     SendMessageW(g_hwndEdit, EM_SETCUEBANNER, FALSE, (LPARAM)L""); // chip only
     g_changingEdit = true;
     SetWindowTextW(g_hwndEdit, query.c_str());
@@ -448,12 +469,146 @@ static void ActivateBang(int idx, const std::wstring& query) {
 
 static void DeactivateBang() {
     g_activeBang = -1;
+    g_bangChipW = 0;
+    g_engineW = 0;
     if (g_hwndChip) ShowWindow(g_hwndChip, SW_HIDE);
+    if (g_hwndEngineChip) ShowWindow(g_hwndEngineChip, SW_HIDE);
     if (g_hwndEdit) {
-        SendMessageW(g_hwndEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
-                     MAKELPARAM(10, 10));
+        ApplyEditMargins();
         SendMessageW(g_hwndEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search");
     }
+    InvalidateRect(g_hwndPalette, NULL, FALSE); // refresh the box outline
+}
+
+static COLORREF EngineColor() {
+    const std::wstring& n = g_settings.engineName;
+    if (n == L"Google") return RGB(66, 133, 244);
+    if (n == L"DuckDuckGo") return RGB(222, 88, 51);
+    if (n == L"Bing") return RGB(0, 128, 157);
+    if (n == L"Brave") return RGB(251, 84, 43);
+    return RGB(142, 142, 147);
+}
+
+// Right-side engine pill: visible while an online search is armed.
+static void UpdateEngineChip(const std::wstring& q, bool canShow) {
+    int w = 0;
+    if (canShow && !q.empty() && g_activeBang < 0 && g_hwndEngineChip) {
+        HDC dc = GetDC(g_hwndPalette);
+        HGDIOBJ old = SelectObject(dc, g_fontChip);
+        w = ChipWidthFor(dc, g_settings.engineName);
+        SelectObject(dc, old);
+        ReleaseDC(g_hwndPalette, dc);
+        RECT cr; GetClientRect(g_hwndPalette, &cr);
+        int chipY = 7 + (30 - kChipH) / 2;
+        SetWindowPos(g_hwndEngineChip, HWND_TOP, cr.right - 16 - w, chipY,
+                     w, kChipH, SWP_SHOWWINDOW);
+        InvalidateRect(g_hwndEngineChip, NULL, TRUE);
+    } else if (g_hwndEngineChip) {
+        ShowWindow(g_hwndEngineChip, SW_HIDE);
+    }
+    if (w != g_engineW) {
+        g_engineW = w;
+        ApplyEditMargins();
+    }
+}
+
+// ------------------------------------------------- online suggestions (async)
+static HANDLE g_onlineEvent = NULL;
+static std::atomic<int> g_onlineSeq{0};
+static std::wstring g_onlineRequested;
+static std::wstring g_onlineFor;
+static std::vector<std::wstring> g_online;
+static SRWLOCK g_onlineLock = SRWLOCK_INIT;
+
+static std::vector<std::wstring> FetchSuggestions(const std::wstring& q) {
+    std::vector<std::wstring> out;
+    std::wstring path = L"/ac/?q=" + UrlEncodeQuery(q) + L"&type=list";
+    HINTERNET hS = WinHttpOpen(L"SneekPeek/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                               WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hS) return out;
+    WinHttpSetTimeouts(hS, 3000, 3000, 3000, 5000);
+    HINTERNET hC = WinHttpConnect(hS, L"duckduckgo.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET hR = NULL;
+    if (hC) hR = WinHttpOpenRequest(hC, L"GET", path.c_str(), NULL, WINHTTP_NO_REFERER,
+                                   WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    std::string data;
+    if (hR && WinHttpSendRequest(hR, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(hR, NULL)) {
+        DWORD avail = 0;
+        char buf[4096];
+        while (WinHttpQueryDataAvailable(hR, &avail) && avail) {
+            DWORD chunk = avail > sizeof(buf) ? (DWORD)sizeof(buf) : avail;
+            DWORD rd = 0;
+            if (!WinHttpReadData(hR, buf, chunk, &rd) || !rd) break;
+            data.append(buf, rd);
+            if (data.size() > 16384) break;
+        }
+    }
+    if (hR) WinHttpCloseHandle(hR);
+    if (hC) WinHttpCloseHandle(hC);
+    WinHttpCloseHandle(hS);
+    // Collect "..." tokens; skip the echo + "phrase" keys; unescape basics.
+    bool first = true;
+    for (size_t i = 0; i < data.size() && out.size() < 5;) {
+        if (data[i] != '"') { i++; continue; }
+        std::string tok;
+        i++;
+        while (i < data.size() && data[i] != '"') {
+            if (data[i] == '\\' && i + 1 < data.size()) { i++; tok += data[i++]; }
+            else tok += data[i++];
+        }
+        if (i < data.size()) i++;
+        if (first) { first = false; continue; }
+        if (tok.empty() || tok == "phrase") continue;
+        int n = MultiByteToWideChar(CP_UTF8, 0, tok.c_str(), (int)tok.size(), NULL, 0);
+        if (n > 0) {
+            std::wstring w((size_t)n, L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, tok.c_str(), (int)tok.size(), w.data(), n);
+            out.push_back(std::move(w));
+        }
+    }
+    return out;
+}
+
+static DWORD WINAPI OnlineWorker(LPVOID) {
+    for (;;) {
+        WaitForSingleObject(g_onlineEvent, INFINITE);
+        int seq;
+        std::wstring q;
+        AcquireSRWLockExclusive(&g_onlineLock);
+        seq = g_onlineSeq.load();
+        q = g_onlineRequested;
+        ReleaseSRWLockExclusive(&g_onlineLock);
+        Sleep(220); // debounce: let typing settle before spending a request
+        AcquireSRWLockExclusive(&g_onlineLock);
+        bool stale = (seq != g_onlineSeq.load());
+        ReleaseSRWLockExclusive(&g_onlineLock);
+        if (stale || q.size() < 2) continue;
+        std::vector<std::wstring> out = FetchSuggestions(q);
+        AcquireSRWLockExclusive(&g_onlineLock);
+        bool current = (seq == g_onlineSeq.load());
+        if (current) {
+            g_online = std::move(out);
+            g_onlineFor = q;
+        }
+        ReleaseSRWLockExclusive(&g_onlineLock);
+        if (current) PostMessageW(g_hwndPalette, WM_APP_ONLINE, (WPARAM)seq, 0);
+    }
+    return 0;
+}
+
+// Ask the worker for fresh suggestions unless already requested.
+static void RequestOnline(const std::wstring& q) {
+    if (q.size() < 2 || !g_onlineEvent) return;
+    AcquireSRWLockExclusive(&g_onlineLock);
+    bool need = (q != g_onlineRequested);
+    if (need) {
+        g_onlineRequested = q;
+        g_onlineSeq++;
+    }
+    ReleaseSRWLockExclusive(&g_onlineLock);
+    if (need) SetEvent(g_onlineEvent);
 }
 
 // ------------------------------------------------------------- power actions
@@ -566,6 +721,7 @@ static void UpdateResults() {
         // Bar-only start: no rows, no list until the user types.
         g_chips.clear();
         g_chipsFocus = false;
+        UpdateEngineChip(q, false);
         RebuildListControl();
         return;
     }
@@ -583,6 +739,25 @@ static void UpdateResults() {
         ResultItem r{ResultKind::Calc, std::wstring(L"= ") + buf,
                      L"Calculator - Enter copies result", buf, kCalcCol};
         g_results.push_back(std::move(r));
+    }
+
+    // --- bang previews: typed "yt" shows YouTube etc., Enter arms the chip
+    {
+        std::wstring ql = BangLower(q);
+        int added = 0;
+        for (size_t i = 0; i < g_settings.bangs.size() && added < 3; i++) {
+            const Bang& b = g_settings.bangs[i];
+            bool hit = false;
+            for (const auto& a : b.aliases) {
+                if (!a.empty() && a.size() >= ql.size() &&
+                    a.compare(0, ql.size(), ql) == 0) { hit = true; break; }
+            }
+            if (!hit) continue;
+            ResultItem r{ResultKind::Bang, b.name, L"Bang - Enter to arm",
+                         L"", b.color, false, (int)i, true};
+            g_results.push_back(std::move(r));
+            added++;
+        }
     }
 
     // --- direct "!alias term" form (no chip)
@@ -607,13 +782,22 @@ static void UpdateResults() {
                 if (!IsHiddenApp(h.app->name)) PushAppRow(*h.app);
             }
         }
+        UpdateEngineChip(q, false);
         RebuildListControl();
         return;
     }
 
-    // --- normal: app matches + web fallback
+    // --- normal: app matches + online suggestions + web fallback
+    RequestOnline(q);
+    std::vector<std::wstring> online;
+    AcquireSRWLockShared(&g_onlineLock);
+    if (g_onlineFor == q) online = g_online;
+    ReleaseSRWLockShared(&g_onlineLock);
+    if (online.size() > 3) online.resize(3);
+
+    size_t appLimit = online.empty() ? (kMaxItems - 1) : 3;
     if (g_indexReady.load()) {
-        for (auto& h : SearchApps(g_apps, q, kMaxItems - 1)) {
+        for (auto& h : SearchApps(g_apps, q, appLimit)) {
             if (!IsHiddenApp(h.app->name)) PushAppRow(*h.app);
         }
     } else {
@@ -626,6 +810,22 @@ static void UpdateResults() {
                    ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q)), kWebCol};
     g_results.push_back(std::move(web));
 
+    // Categorized: Local section + live Online section.
+    if (!online.empty()) {
+        if (!g_results.empty()) {
+            ResultItem h{ResultKind::Header, L"Local", L"", L"", kHintCol};
+            g_results.insert(g_results.begin(), std::move(h));
+        }
+        ResultItem h2{ResultKind::Header, L"Online", L"", L"", kHintCol};
+        g_results.push_back(std::move(h2));
+        for (const auto& s : online) {
+            ResultItem r{ResultKind::Online, s,
+                         L"Search " + g_settings.engineName,
+                         ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(s)), kWebCol};
+            g_results.push_back(std::move(r));
+        }
+    }
+    UpdateEngineChip(q, true);
     RebuildListControl();
 }
 
@@ -703,6 +903,11 @@ static void ExecuteSelected(bool forceWeb) {
     }
     ResultItem r = g_results[(size_t)idx]; // copy: HidePalette clears the vector
     if (r.kind == ResultKind::Hint) return;
+    if (r.kind == ResultKind::Header) return; // section labels do nothing
+    if (r.kind == ResultKind::Bang && r.preview) {
+        if (r.bangIdx >= 0) ActivateBang(r.bangIdx, L""); // Enter arms the chip
+        return;
+    }
     HidePalette(); // hide first: never wait for the target app
     switch (r.kind) {
     case ResultKind::App:
@@ -714,14 +919,47 @@ static void ExecuteSelected(bool forceWeb) {
         break;
     case ResultKind::Web:
     case ResultKind::Bang:
+    case ResultKind::Online:
         OpenUrl(r.action, g_settings.browserPath);
         break;
     case ResultKind::Calc:
         CopyText(r.action);
         break;
     case ResultKind::Hint:
+    case ResultKind::Header:
         break;
     }
+}
+
+// ------------------------------------------------- list navigation helpers
+// Headers are visible but never selectable. Moving with arrows mirrors the
+// selected row's text into the box WITHOUT refiltering: the list stays
+// frozen until the user types or deletes a character.
+static bool IsSelectable(size_t i) {
+    return i < g_results.size() && g_results[i].kind != ResultKind::Header;
+}
+static int MoveSel(int from, int dir) {
+    int n = (int)g_results.size(); // listbox order == result order (no sort)
+    if (n <= 0) return -1;
+    int cur = from;
+    for (int k = 0; k < n; k++) {
+        cur = (cur + dir + n) % n;
+        if (IsSelectable((size_t)cur)) return cur;
+    }
+    return -1;
+}
+static void SyncSelToBox(int listSel) {
+    if (listSel < 0 || listSel >= (int)g_results.size()) return;
+    const ResultItem& r = g_results[(size_t)listSel];
+    std::wstring keep = GetEditText(g_hwndEdit);
+    std::wstring t = keep;
+    if (r.kind == ResultKind::App || r.kind == ResultKind::Online) t = r.title;
+    else if (r.kind == ResultKind::Bang && r.preview) t = r.title;
+    if (t == keep) return;
+    g_changingEdit = true; // programmatic: no refilter, list stays frozen
+    SetWindowTextW(g_hwndEdit, t.c_str());
+    SendMessageW(g_hwndEdit, EM_SETSEL, (WPARAM)t.size(), (LPARAM)t.size());
+    g_changingEdit = false;
 }
 
 // ------------------------------------------------------------- edit subclass
@@ -759,12 +997,17 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
         case VK_DOWN:
             if (g_chipsFocus && haveChips) {
                 g_chipsFocus = false;
-                if (count > 0) SendMessageW(g_hwndList, LB_SETCURSEL, 0, 0);
+                int to = MoveSel(-1, +1);
+                if (to >= 0) SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
                 InvalidateRect(g_hwndChipRow, NULL, FALSE);
                 InvalidateRect(g_hwndList, NULL, FALSE);
             } else if (count > 0) {
-                SendMessageW(g_hwndList, LB_SETCURSEL, (sel + 1) % count, 0);
-                InvalidateRect(g_hwndList, NULL, FALSE);
+                int to = MoveSel(sel, +1);
+                if (to >= 0) {
+                    SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
+                    SyncSelToBox(to);
+                    InvalidateRect(g_hwndList, NULL, FALSE);
+                }
             }
             return 0;
         case VK_UP:
@@ -774,9 +1017,12 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                 InvalidateRect(g_hwndChipRow, NULL, FALSE);
                 InvalidateRect(g_hwndList, NULL, FALSE);
             } else if (count > 0) {
-                SendMessageW(g_hwndList, LB_SETCURSEL,
-                             (sel <= 0 ? count - 1 : sel - 1), 0);
-                InvalidateRect(g_hwndList, NULL, FALSE);
+                int to = MoveSel(sel, -1);
+                if (to >= 0) {
+                    SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
+                    SyncSelToBox(to);
+                    InvalidateRect(g_hwndList, NULL, FALSE);
+                }
             }
             return 0;
         case VK_BACK:
@@ -801,33 +1047,40 @@ static LRESULT CALLBACK ChipProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT: {
-        const Bang* b = ActiveBang();
+        // Solid pill, white bold text, no outline. Mode 1 = bang chip (+x),
+        // mode 2 = engine chip (click = web search).
+        bool isEngine = GetWindowLongPtrW(hwnd, GWLP_USERDATA) == 2;
+        const Bang* b = isEngine ? NULL : ActiveBang();
+        std::wstring text = isEngine ? g_settings.engineName : (b ? b->name : L"");
+        COLORREF col = isEngine ? EngineColor() : (b ? b->color : kHintCol);
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
         RECT r; GetClientRect(hwnd, &r);
-        COLORREF col = b ? b->color : kHintCol;
-        HBRUSH bg = CreateSolidBrush(Darken(col, 32));
-        HPEN pen = CreatePen(PS_SOLID, 1, col);
+        HBRUSH bg = CreateSolidBrush(ChipFill(col));
         HGDIOBJ oldB = SelectObject(dc, bg);
-        HGDIOBJ oldP = SelectObject(dc, pen);
+        HGDIOBJ oldP = SelectObject(dc, GetStockObject(NULL_PEN));
         RoundRect(dc, 0, 0, r.right, r.bottom, 14, 14);
         SelectObject(dc, oldB); SelectObject(dc, oldP);
-        DeleteObject(bg); DeleteObject(pen);
+        DeleteObject(bg);
         SetBkMode(dc, TRANSPARENT);
         SelectObject(dc, g_fontChip);
-        RECT tr = r; tr.left += 10; tr.right -= 24;
-        if (b) {
-            SetTextColor(dc, kText);
-            DrawTextW(dc, b->name.c_str(), -1, &tr,
-                      DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        SetTextColor(dc, RGB(255, 255, 255));
+        RECT tr = r; tr.left += 10; tr.right -= (isEngine ? 10 : 24);
+        DrawTextW(dc, text.c_str(), -1, &tr,
+                  DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        if (!isEngine) {
+            RECT xr = r; xr.left = xr.right - 20;
+            DrawTextW(dc, L"x", -1, &xr, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
         }
-        RECT xr = r; xr.left = xr.right - 20;
-        SetTextColor(dc, RGB(170, 170, 175));
-        DrawTextW(dc, L"x", -1, &xr, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
         EndPaint(hwnd, &ps);
         return 0;
     }
     case WM_LBUTTONDOWN: {
+        bool isEngine = GetWindowLongPtrW(hwnd, GWLP_USERDATA) == 2;
+        if (isEngine) {
+            ExecuteSelected(true); // engine pill = run the web search
+            return 0;
+        }
         RECT r; GetClientRect(hwnd, &r);
         int x = GET_X_LPARAM(l);
         if (x >= r.right - 24) {
@@ -880,23 +1133,16 @@ static LRESULT CALLBACK ChipRowProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             const ChipItem& c = g_chips[i];
             const RECT& r = g_chipRects[i];
             bool sel = g_chipsFocus && (int)i == g_chipSel;
-            HBRUSH bg = CreateSolidBrush(sel ? c.color : Darken(c.color, 30));
+            COLORREF base = ChipFill(c.color);
+            // Solid pills, white bold text; selection = full brightness.
+            HBRUSH bg = CreateSolidBrush(sel ? base : Darken(base, 50));
             HGDIOBJ oldB = SelectObject(dc, bg);
-            if (!sel) {
-                HPEN pen = CreatePen(PS_SOLID, 1, c.color);
-                HGDIOBJ oldP = SelectObject(dc, pen);
-                RoundRect(dc, r.left, r.top, r.right, r.bottom, 14, 14);
-                SelectObject(dc, oldP);
-                DeleteObject(pen);
-            } else {
-                HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
-                HGDIOBJ oldP = SelectObject(dc, nullPen);
-                RoundRect(dc, r.left, r.top, r.right, r.bottom, 14, 14);
-                SelectObject(dc, oldP);
-            }
+            HGDIOBJ oldP = SelectObject(dc, GetStockObject(NULL_PEN));
+            RoundRect(dc, r.left, r.top, r.right, r.bottom, 14, 14);
             SelectObject(dc, oldB);
+            SelectObject(dc, oldP);
             DeleteObject(bg);
-            SetTextColor(dc, sel ? RGB(0, 0, 0) : kText);
+            SetTextColor(dc, RGB(255, 255, 255));
             RECT tr = r;
             DrawTextW(dc, c.title.c_str(), -1, &tr,
                       DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS);
@@ -946,6 +1192,13 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             WS_CHILD | WS_CLIPSIBLINGS,
             16, 9, 10, kChipH,
             hwnd, (HMENU)3, g_hInst, NULL);
+        SetWindowLongPtrW(g_hwndChip, GWLP_USERDATA, 1); // bang pill (+x)
+
+        g_hwndEngineChip = CreateWindowExW(0, kChipClass, L"",
+            WS_CHILD | WS_CLIPSIBLINGS,
+            16, 9, 10, kChipH,
+            hwnd, (HMENU)5, g_hInst, NULL);
+        SetWindowLongPtrW(g_hwndEngineChip, GWLP_USERDATA, 2); // engine pill
 
         g_hwndChipRow = CreateWindowExW(0, kChipRowClass, L"",
             WS_CHILD | WS_CLIPSIBLINGS,
@@ -964,6 +1217,22 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         RECT r; GetClientRect(hwnd, &r);
         FillRect(dc, &r, g_brBg);
         return 1;
+    }
+    case WM_PAINT: {
+        // Rounded outline around the text box (bang color when armed).
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT er; GetWindowRect(g_hwndEdit, &er);
+        MapWindowPoints(NULL, hwnd, (POINT*)&er, 2);
+        const Bang* ab = ActiveBang();
+        HPEN pen = CreatePen(PS_SOLID, 1, ab ? ab->color : RGB(64, 64, 70));
+        HGDIOBJ op = SelectObject(dc, pen);
+        SelectObject(dc, GetStockObject(NULL_BRUSH));
+        RoundRect(dc, er.left - 5, er.top - 4, er.right + 5, er.bottom + 4, 10, 10);
+        SelectObject(dc, op);
+        DeleteObject(pen);
+        EndPaint(hwnd, &ps);
+        return 0;
     }
     case WM_CTLCOLOREDIT: {
         HDC dc = (HDC)w;
@@ -1004,9 +1273,17 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             if (code == LBN_DBLCLK) {
                 g_chipsFocus = false;
                 ExecuteSelected(false);
-            } else if (code == LBN_SELCHANGE && g_chipsFocus) {
-                g_chipsFocus = false; // mouse took over the list
-                InvalidateRect(g_hwndChipRow, NULL, FALSE);
+            } else if (code == LBN_SELCHANGE) {
+                int s = (int)SendMessageW(g_hwndList, LB_GETCURSEL, 0, 0);
+                if (s >= 0 && s < (int)g_results.size() &&
+                    g_results[(size_t)s].kind == ResultKind::Header) {
+                    int to = MoveSel(s, +1); // clicked a header: jump past it
+                    SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
+                }
+                if (g_chipsFocus) {
+                    g_chipsFocus = false; // mouse took over the list
+                    InvalidateRect(g_hwndChipRow, NULL, FALSE);
+                }
             }
         } else if (id >= ID_TRAY_SETTINGS && id <= ID_TRAY_QUIT) {
             OnTrayCommand(id);
@@ -1024,9 +1301,20 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         bool sel = (d->itemState & ODS_SELECTED) != 0;
         HDC dc = d->hDC;
         size_t ri = (d->itemData < (UINT)g_results.size()) ? d->itemData : 9999;
-        FillRect(dc, &d->rcItem, sel ? g_brSel : g_brBg);
+        bool isHead = ((int)ri < (int)g_results.size()) &&
+                      g_results[ri].kind == ResultKind::Header;
+        FillRect(dc, &d->rcItem, (!isHead && sel) ? g_brSel : g_brBg);
         if ((int)ri < (int)g_results.size()) {
             const ResultItem& r = g_results[ri];
+            if (isHead) { // section label: small gray caps, never highlights
+                SetBkMode(dc, TRANSPARENT);
+                SelectObject(dc, g_fontSub);
+                SetTextColor(dc, kSub);
+                RECT tr = d->rcItem; tr.left += 14;
+                DrawTextW(dc, r.title.c_str(), -1, &tr,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                return TRUE;
+            }
             SetBkMode(dc, TRANSPARENT);
             // Category color bar: thin, brighter when selected.
             HBRUSH bar = CreateSolidBrush(sel ? r.color : Darken(r.color, 65));
@@ -1074,6 +1362,15 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         break;
     case WM_APP + 20: // index finished
         if (IsWindowVisible(hwnd)) UpdateResults();
+        break;
+    case WM_APP_ONLINE: // background suggestions arrived
+        if ((int)w == g_onlineSeq.load() && IsWindowVisible(hwnd)) {
+            std::wstring cur = Trim(GetEditText(g_hwndEdit));
+            AcquireSRWLockShared(&g_onlineLock);
+            bool match = (!g_online.empty() && g_onlineFor == cur && !ActiveBang());
+            ReleaseSRWLockShared(&g_onlineLock);
+            if (match) UpdateResults(); // merges rows; same query -> no refetch
+        }
         break;
     case WM_TRAYICON:
         if (LOWORD(l) == WM_RBUTTONUP || LOWORD(l) == WM_CONTEXTMENU)
@@ -1215,13 +1512,9 @@ static void FillBangsList() {
             if (i) aliases += L", ";
             aliases += b.aliases[i];
         }
-        wchar_t col[16];
-        swprintf_s(col, 16, L"#%02X%02X%02X",
-                   GetRValue(b.color), GetGValue(b.color), GetBValue(b.color));
         int row = LVAppendRow(g_hwndBangsList, aliases.c_str());
         LVSetCell(g_hwndBangsList, row, 1, b.name);
         LVSetCell(g_hwndBangsList, row, 2, b.url);
-        LVSetCell(g_hwndBangsList, row, 3, col);
     }
 }
 
@@ -1230,20 +1523,6 @@ static void FillQuickList() {
     for (const auto& q : g_settings.quicks) {
         int row = LVAppendRow(g_hwndQuickList, q.name.c_str());
         LVSetCell(g_hwndQuickList, row, 1, q.url);
-    }
-}
-
-static void LoadEditorFromSelection(HWND lv) {
-    int row = LVSelectedRow(lv);
-    if (row < 0) return;
-    if (lv == g_hwndBangsList) {
-        SetWindowTextW(g_hwndBangAlias, LVGetCell(lv, row, 0).c_str());
-        SetWindowTextW(g_hwndBangName, LVGetCell(lv, row, 1).c_str());
-        SetWindowTextW(g_hwndBangUrl, LVGetCell(lv, row, 2).c_str());
-        SetWindowTextW(g_hwndBangColor, LVGetCell(lv, row, 3).c_str());
-    } else if (lv == g_hwndQuickList) {
-        SetWindowTextW(g_hwndQuickName, LVGetCell(lv, row, 0).c_str());
-        SetWindowTextW(g_hwndQuickUrl, LVGetCell(lv, row, 1).c_str());
     }
 }
 
@@ -1297,6 +1576,7 @@ static void OpenSettings() {
     UpdateWindow(g_hwndSettings);
 }
 static void CloseSettings() {
+    CloseCellEdit(true); // commit any in-progress table edit first
     if (g_hwndSettings) { DestroyWindow(g_hwndSettings); g_hwndSettings = NULL; }
 }
 
@@ -1324,51 +1604,135 @@ static void ReadHiddenFromList() {
             g_settings.hiddenApps.push_back(LVGetCell(g_hwndAppsList, i, 0));
 }
 
-// Rebuild g_settings.bangs from the table. Returns false + message on empty.
-static bool ReadBangsFromList(HWND owner) {
-    std::vector<Bang> bangs;
-    int n = ListView_GetItemCount(g_hwndBangsList);
-    for (int i = 0; i < n; i++) {
-        std::wstring line = LVGetCell(g_hwndBangsList, i, 0) + L" | " +
-                            LVGetCell(g_hwndBangsList, i, 1) + L" | " +
-                            LVGetCell(g_hwndBangsList, i, 2) + L" | " +
-                            LVGetCell(g_hwndBangsList, i, 3);
+// Every change persists immediately: there is no Save button.
+static void SaveNow() {
+    SaveSettings(g_settings);
+    RebuildHiddenSet();
+}
+
+// Engine + browser combos / custom URL -> settings -> disk.
+static void SaveEngineBrowser(HWND owner) {
+    int esel = (int)SendMessageW(g_hwndEngineCombo, CB_GETCURSEL, 0, 0);
+    std::wstring eurl = GetWindowString(g_hwndEngineUrl);
+    const wchar_t* names[] = {L"DuckDuckGo", L"Google", L"Bing", L"Brave", L"Custom"};
+    const wchar_t* urls[] = {
+        L"https://duckduckgo.com/?q=%s",
+        L"https://www.google.com/search?q=%s",
+        L"https://www.bing.com/search?q=%s",
+        L"https://search.brave.com/search?q=%s", eurl.c_str()};
+    if (esel < 0 || esel > 4) esel = 0;
+    if (esel == 4 && eurl.find(L"%s") == std::wstring::npos) {
+        MessageBoxW(owner, L"Custom URL must contain %s as the query placeholder.",
+                    L"SneekPeek", MB_ICONWARNING | MB_OK);
+        SetWindowTextW(g_hwndEngineUrl, g_settings.engineUrl.c_str());
+        return;
+    }
+    g_settings.engineName = names[esel];
+    g_settings.engineUrl = urls[esel];
+    int bsel = (int)SendMessageW(g_hwndBrowserCombo, CB_GETCURSEL, 0, 0);
+    if (bsel <= 0) g_settings.browserPath.clear();
+    else if (bsel - 1 < (int)g_browsers.size())
+        g_settings.browserPath = g_browsers[(size_t)bsel - 1].path;
+    SaveNow();
+}
+
+static std::wstring JoinAliases(const std::vector<std::wstring>& v) {
+    std::wstring s;
+    for (size_t i = 0; i < v.size(); i++) {
+        if (i) s += L", ";
+        s += v[i];
+    }
+    return s;
+}
+
+// Floating editor over a table cell. Enter / focus-loss commits to the
+// settings vector + disk; Esc discards.
+static void CloseCellEdit(bool commit);
+static LRESULT CALLBACK CellEditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
+                                         UINT_PTR, DWORD_PTR) {
+    if (m == WM_CHAR && (w == 13 || w == 9)) {
+        CloseCellEdit(true);
+        SetFocus(g_hwndSettings);
+        return 0;
+    }
+    if (m == WM_KEYDOWN && w == VK_ESCAPE) {
+        CloseCellEdit(false);
+        SetFocus(g_hwndSettings);
+        return 0;
+    }
+    if (m == WM_KILLFOCUS) {
+        CloseCellEdit(true);
+    }
+    return DefSubclassProc(h, m, w, l);
+}
+
+static void StartCellEdit(HWND lv, int row, int col) {
+    CloseCellEdit(true); // commit anything pending first
+    if (!g_hwndSettings || row < 0 || col < 0) return;
+    if (!g_hwndCellEdit) {
+        g_hwndCellEdit = CreateWindowW(L"EDIT", L"",
+            WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
+            0, 0, 10, 10, g_hwndSettings, (HMENU)500, g_hInst, NULL);
+        SendMessageW(g_hwndCellEdit, WM_SETFONT, (WPARAM)g_fontUI, FALSE);
+        SetWindowSubclass(g_hwndCellEdit, CellEditSubclass, 20, 0);
+    }
+    RECT r;
+    if (!ListView_GetSubItemRect(lv, row, col, LVIR_BOUNDS, &r)) return;
+    MapWindowPoints(lv, g_hwndSettings, (POINT*)&r, 2);
+    g_cellLv = (lv == g_hwndBangsList) ? 1 : 2;
+    g_cellRow = row;
+    g_cellCol = col;
+    SetWindowTextW(g_hwndCellEdit, LVGetCell(lv, row, col).c_str());
+    SetWindowPos(g_hwndCellEdit, NULL, r.left, r.top,
+                 r.right - r.left, r.bottom - r.top, SWP_SHOWWINDOW);
+    SetFocus(g_hwndCellEdit);
+    SendMessageW(g_hwndCellEdit, EM_SETSEL, 0, -1);
+}
+
+static void CloseCellEdit(bool commit) {
+    if (!g_hwndCellEdit || !IsWindowVisible(g_hwndCellEdit)) return;
+    std::wstring t = Trim(GetWindowString(g_hwndCellEdit));
+    HWND lv = (g_cellLv == 1) ? g_hwndBangsList : g_hwndQuickList;
+    int row = g_cellRow, col = g_cellCol;
+    ShowWindow(g_hwndCellEdit, SW_HIDE);
+    if (!commit || !lv || row < 0 || col < 0) return;
+    if (g_cellLv == 1) { // bangs: rebuild the row, color stays as assigned
+        if (row >= (int)g_settings.bangs.size()) return;
+        std::wstring cells[3] = {LVGetCell(lv, row, 0),
+                                 LVGetCell(lv, row, 1),
+                                 LVGetCell(lv, row, 2)};
+        cells[col] = t;
         Bang b;
-        if (ParseBangLine(line, b)) bangs.push_back(std::move(b));
+        std::wstring line = cells[0] + L" | " + cells[1] + L" | " + cells[2] +
+                            L" | " + SerializeColor(g_settings.bangs[(size_t)row].color);
+        if (!ParseBangLine(line, b)) {
+            MessageBoxW(g_hwndSettings,
+                        L"Need: alias | Name | https://...%s - change reverted.",
+                        L"SneekPeek", MB_ICONWARNING | MB_OK);
+            return;
+        }
+        b.color = g_settings.bangs[(size_t)row].color;
+        g_settings.bangs[(size_t)row] = b;
+        LVSetCell(lv, row, 0, JoinAliases(b.aliases));
+        LVSetCell(lv, row, 1, b.name);
+        LVSetCell(lv, row, 2, b.url);
+        SaveNow();
+    } else if (g_cellLv == 2) { // quick links
+        if (row >= (int)g_settings.quicks.size()) return;
+        std::wstring name = (col == 0) ? t : LVGetCell(lv, row, 0);
+        std::wstring url = (col == 1) ? t : LVGetCell(lv, row, 1);
+        QuickLink q{name, url};
+        if (q.name.empty() || q.url.find(L"://") == std::wstring::npos) {
+            MessageBoxW(g_hwndSettings,
+                        L"Need a name and a full URL like https://... - change reverted.",
+                        L"SneekPeek", MB_ICONWARNING | MB_OK);
+            return;
+        }
+        g_settings.quicks[(size_t)row] = q;
+        LVSetCell(lv, row, 0, q.name);
+        LVSetCell(lv, row, 1, q.url);
+        SaveNow();
     }
-    if (bangs.empty()) {
-        MessageBoxW(owner, L"Bang table is empty. Add at least one row first.",
-                    L"SneekPeek", MB_ICONWARNING | MB_OK);
-        return false;
-    }
-    g_settings.bangs = std::move(bangs);
-    return true;
-}
-
-static void ReadQuickFromList() {
-    g_settings.quicks.clear();
-    int n = ListView_GetItemCount(g_hwndQuickList);
-    for (int i = 0; i < n; i++) {
-        QuickLink q{LVGetCell(g_hwndQuickList, i, 0), LVGetCell(g_hwndQuickList, i, 1)};
-        if (!q.name.empty() && q.url.find(L"://") != std::wstring::npos)
-            g_settings.quicks.push_back(std::move(q));
-    }
-}
-
-static bool BangEditorToBang(HWND owner, Bang& out) {
-    std::wstring aliases = Trim(GetWindowString(g_hwndBangAlias));
-    std::wstring name = Trim(GetWindowString(g_hwndBangName));
-    std::wstring url = Trim(GetWindowString(g_hwndBangUrl));
-    COLORREF col;
-    if (!ParseColor(GetWindowString(g_hwndBangColor), col))
-        col = RandomBangColor(); // empty/invalid -> tasteful random pick
-    std::wstring line = aliases + L" | " + name + L" | " + url + L" | " + SerializeColor(col);
-    if (!ParseBangLine(line, out)) {
-        MessageBoxW(owner, L"Need: alias | Name | https://...%s (color is auto-picked if empty)",
-                    L"SneekPeek", MB_ICONWARNING | MB_OK);
-        return false;
-    }
-    return true;
 }
 
 // Single-line settings edits: swallow beep-producing chars (Enter/Esc/Tab).
@@ -1413,22 +1777,12 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 24, 180, 360, 200, hwnd, IDC_BROWSER_COMBO));
             page(g_pageGeneral, NewCtrl(L"BUTTON", L"Browse...",
                 WS_VISIBLE, 394, 179, 122, 26, hwnd, IDC_BROWSER_BROWSE));
-            g_hwndChkPath = page(g_pageGeneral, NewCtrl(L"BUTTON",
-                L"Include PATH executables (more results, more RAM)",
-                WS_VISIBLE | BS_AUTOCHECKBOX, 24, 216, 536, 22, hwnd, IDC_CHK_PATH));
-            g_hwndChkStartup = page(g_pageGeneral, NewCtrl(L"BUTTON", L"Run at startup",
-                WS_VISIBLE | BS_AUTOCHECKBOX, 24, 242, 300, 22, hwnd, IDC_CHK_STARTUP));
             page(g_pageGeneral, NewCtrl(L"STATIC",
                 L"Web + bang + quick links open in the chosen browser.\r\n"
-                L"Hidden apps, bangs and quick links apply instantly on Save.\r\n"
-                L"PATH changes trigger a background rescan of the app index.",
-                WS_VISIBLE, 24, 276, 536, 60, hwnd, 0));
+                L"Every change saves automatically.",
+                WS_VISIBLE, 24, 216, 536, 44, hwnd, 0));
             FillEngineCombo();
             FillBrowserCombo();
-            SendMessageW(g_hwndChkPath, BM_SETCHECK,
-                         g_settings.includePathExes ? BST_CHECKED : BST_UNCHECKED, 0);
-            SendMessageW(g_hwndChkStartup, BM_SETCHECK,
-                         g_settings.runAtStartup ? BST_CHECKED : BST_UNCHECKED, 0);
         }
 
         // ---- Hidden apps page (checkbox list)
@@ -1447,53 +1801,36 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             FillAppsList();
         }
 
-        // ---- Bangs page (table + editor)
+        // ---- Bangs page (in-place table: Add appends, double-click edits,
+        // Del removes, colors auto-picked, everything saves instantly)
         {
-            page(g_pageBangs, NewCtrl(L"STATIC", L"Double-click a row to edit it:",
-                WS_VISIBLE, 24, 52, 400, 20, hwnd, 0));
+            page(g_pageBangs, NewCtrl(L"STATIC",
+                L"Add appends an editable row - double-click a cell to edit - Del removes:",
+                WS_VISIBLE, 24, 52, 536, 20, hwnd, 0));
             g_hwndBangsList = page(g_pageBangs, NewCtrl(WC_LISTVIEWW, L"",
                 WS_VISIBLE | WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL |
-                LVS_SHOWSELALWAYS, 24, 74, 536, 200, hwnd, IDC_BANGS_LIST));
+                LVS_SHOWSELALWAYS | LVS_EDITLABELS, 24, 74, 536, 366, hwnd, IDC_BANGS_LIST));
             ListView_SetExtendedListViewStyle(g_hwndBangsList,
                 LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-            LVAddColumn(g_hwndBangsList, 0, L"Aliases", 140);
-            LVAddColumn(g_hwndBangsList, 1, L"Name", 110);
-            LVAddColumn(g_hwndBangsList, 2, L"URL", 218);
-            LVAddColumn(g_hwndBangsList, 3, L"Color", 64);
+            LVAddColumn(g_hwndBangsList, 0, L"Aliases", 150);
+            LVAddColumn(g_hwndBangsList, 1, L"Name", 120);
+            LVAddColumn(g_hwndBangsList, 2, L"URL", 262);
             ListView_SetBkColor(g_hwndBangsList, kBg);
             ListView_SetTextColor(g_hwndBangsList, kText);
             ListView_SetTextBkColor(g_hwndBangsList, kBg);
             FillBangsList();
-            g_hwndBangAlias = page(g_pageBangs, NewCtrl(L"EDIT", L"",
-                WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 24, 284, 150, 24, hwnd, IDC_BANG_ALIAS));
-            g_hwndBangName = page(g_pageBangs, NewCtrl(L"EDIT", L"",
-                WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 180, 284, 110, 24, hwnd, IDC_BANG_NAME));
-            g_hwndBangUrl = page(g_pageBangs, NewCtrl(L"EDIT", L"",
-                WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 296, 284, 176, 24, hwnd, IDC_BANG_URL));
-            g_hwndBangColor = page(g_pageBangs, NewCtrl(L"EDIT", L"",
-                WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 478, 284, 82, 24, hwnd, IDC_BANG_COLOR));
-            SendMessageW(g_hwndBangAlias, EM_SETCUEBANNER, TRUE, (LPARAM)L"aliases");
-            SendMessageW(g_hwndBangName, EM_SETCUEBANNER, TRUE, (LPARAM)L"Name");
-            SendMessageW(g_hwndBangUrl, EM_SETCUEBANNER, TRUE, (LPARAM)L"url with %s");
-            SendMessageW(g_hwndBangColor, EM_SETCUEBANNER, TRUE, (LPARAM)L"auto color if empty");
             page(g_pageBangs, NewCtrl(L"BUTTON", L"Add",
-                WS_VISIBLE, 24, 316, 84, 26, hwnd, IDC_BANG_ADD));
-            page(g_pageBangs, NewCtrl(L"BUTTON", L"Update",
-                WS_VISIBLE, 114, 316, 84, 26, hwnd, IDC_BANG_UPDATE));
-            page(g_pageBangs, NewCtrl(L"BUTTON", L"Delete",
-                WS_VISIBLE, 204, 316, 84, 26, hwnd, IDC_BANG_DEL));
-            page(g_pageBangs, NewCtrl(L"BUTTON", L"Reset",
-                WS_VISIBLE, 294, 316, 84, 26, hwnd, IDC_BANG_RESET));
+                WS_VISIBLE, 24, 448, 100, 26, hwnd, IDC_BANG_ADD));
         }
 
-        // ---- Quick links page (table + editor)
+        // ---- Quick links page (same in-place pattern, no query)
         {
             page(g_pageQuick, NewCtrl(L"STATIC",
-                L"Quick links open a fixed URL on Enter (no query). Type the name in the palette:",
+                L"Type the name in the palette - Enter opens the fixed URL. Del removes:",
                 WS_VISIBLE, 24, 52, 536, 20, hwnd, 0));
             g_hwndQuickList = page(g_pageQuick, NewCtrl(WC_LISTVIEWW, L"",
                 WS_VISIBLE | WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL |
-                LVS_SHOWSELALWAYS, 24, 76, 536, 198, hwnd, IDC_QUICK_LIST));
+                LVS_SHOWSELALWAYS | LVS_EDITLABELS, 24, 74, 536, 366, hwnd, IDC_QUICK_LIST));
             ListView_SetExtendedListViewStyle(g_hwndQuickList,
                 LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
             LVAddColumn(g_hwndQuickList, 0, L"Name", 170);
@@ -1502,32 +1839,18 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             ListView_SetTextColor(g_hwndQuickList, kText);
             ListView_SetTextBkColor(g_hwndQuickList, kBg);
             FillQuickList();
-            g_hwndQuickName = page(g_pageQuick, NewCtrl(L"EDIT", L"",
-                WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 24, 284, 180, 24, hwnd, IDC_QUICK_NAME));
-            g_hwndQuickUrl = page(g_pageQuick, NewCtrl(L"EDIT", L"",
-                WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 210, 284, 350, 24, hwnd, IDC_QUICK_URL));
-            SendMessageW(g_hwndQuickName, EM_SETCUEBANNER, TRUE, (LPARAM)L"name");
-            SendMessageW(g_hwndQuickUrl, EM_SETCUEBANNER, TRUE, (LPARAM)L"https://...");
             page(g_pageQuick, NewCtrl(L"BUTTON", L"Add",
-                WS_VISIBLE, 24, 316, 84, 26, hwnd, IDC_QUICK_ADD));
-            page(g_pageQuick, NewCtrl(L"BUTTON", L"Update",
-                WS_VISIBLE, 114, 316, 84, 26, hwnd, IDC_QUICK_UPDATE));
-            page(g_pageQuick, NewCtrl(L"BUTTON", L"Delete",
-                WS_VISIBLE, 204, 316, 84, 26, hwnd, IDC_QUICK_DEL));
+                WS_VISIBLE, 24, 448, 100, 26, hwnd, IDC_QUICK_ADD));
         }
 
         // Shared bottom buttons (always visible).
-        NewCtrl(L"BUTTON", L"Save", WS_VISIBLE | BS_DEFPUSHBUTTON,
-                16, 512, 100, 30, hwnd, IDC_SAVE);
         NewCtrl(L"BUTTON", L"Rescan apps", WS_VISIBLE,
-                126, 512, 120, 30, hwnd, IDC_RESCAN);
+                16, 512, 120, 30, hwnd, IDC_RESCAN);
         NewCtrl(L"BUTTON", L"Close", WS_VISIBLE,
-                256, 512, 100, 30, hwnd, IDC_CLOSE);
+                146, 512, 100, 30, hwnd, IDC_CLOSE);
 
         // Silence the edit-control beep in settings (Enter/Esc/Tab chars).
-        HWND plainEdits[] = {g_hwndEngineUrl, g_hwndBangAlias, g_hwndBangName,
-                             g_hwndBangUrl, g_hwndBangColor,
-                             g_hwndQuickName, g_hwndQuickUrl};
+        HWND plainEdits[] = {g_hwndEngineUrl};
         for (size_t i = 0; i < sizeof(plainEdits) / sizeof(plainEdits[0]); i++)
             SetWindowSubclass(plainEdits[i], PlainEditSubclass, 10 + (UINT_PTR)i, 0);
 
@@ -1678,14 +2001,65 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 }
                 return CDRF_SKIPDEFAULT;
             }
-        } else if (!g_fillingSettings &&
-                   (nm->hwndFrom == g_hwndBangsList || nm->hwndFrom == g_hwndQuickList)) {
-            if (nm->code == LVN_ITEMCHANGED) {
-                NMLISTVIEW* v = (NMLISTVIEW*)l;
-                if ((v->uNewState & LVIS_SELECTED) && !(v->uOldState & LVIS_SELECTED))
-                    LoadEditorFromSelection(nm->hwndFrom);
-            } else if (nm->code == NM_DBLCLK) {
-                LoadEditorFromSelection(nm->hwndFrom);
+        } else if (nm->hwndFrom == g_hwndAppsList && nm->code == LVN_ITEMCHANGED &&
+                   !g_fillingSettings) {
+            // Checkbox toggled -> hide-list + instant save (no Save button).
+            NMLISTVIEW* v = (NMLISTVIEW*)l;
+            if ((v->uChanged & LVIF_STATE) &&
+                ((v->uNewState ^ v->uOldState) & LVIS_STATEIMAGEMASK)) {
+                ReadHiddenFromList();
+                SaveNow();
+            }
+        } else if (nm->hwndFrom == g_hwndBangsList || nm->hwndFrom == g_hwndQuickList) {
+            if (nm->code == NM_DBLCLK && !g_fillingSettings) {
+                NMITEMACTIVATE* ia = (NMITEMACTIVATE*)l;
+                if (ia->iItem >= 0 && ia->iSubItem >= 0)
+                    StartCellEdit(nm->hwndFrom, ia->iItem, ia->iSubItem);
+            } else if (nm->code == LVN_ENDLABELEDIT && !g_fillingSettings) {
+                // Built-in label edit covers column 0; validate + save.
+                NMLVDISPINFOW* di = (NMLVDISPINFOW*)l;
+                if (!di->pszText) return FALSE; // editing cancelled
+                std::wstring t = Trim(di->pszText);
+                if (nm->hwndFrom == g_hwndBangsList) {
+                    if (t.empty() || di->iItem >= (int)g_settings.bangs.size()) return FALSE;
+                    std::wstring line = t + L" | " +
+                        g_settings.bangs[di->iItem].name + L" | " +
+                        g_settings.bangs[di->iItem].url + L" | " +
+                        SerializeColor(g_settings.bangs[di->iItem].color);
+                    Bang b;
+                    if (!ParseBangLine(line, b)) {
+                        MessageBoxW(hwnd, L"Aliases cannot be empty - change reverted.",
+                                    L"SneekPeek", MB_ICONWARNING | MB_OK);
+                        return FALSE;
+                    }
+                    b.color = g_settings.bangs[di->iItem].color;
+                    g_settings.bangs[di->iItem] = b;
+                    LVSetCell(nm->hwndFrom, di->iItem, 0, JoinAliases(b.aliases));
+                    SaveNow();
+                } else {
+                    if (t.empty() || di->iItem >= (int)g_settings.quicks.size()) return FALSE;
+                    g_settings.quicks[di->iItem].name = t;
+                    LVSetCell(nm->hwndFrom, di->iItem, 0, t);
+                    SaveNow();
+                }
+                return TRUE;
+            } else if (nm->code == LVN_KEYDOWN && !g_fillingSettings) {
+                NMLVKEYDOWN* k = (NMLVKEYDOWN*)l;
+                if (k->wVKey == VK_DELETE) { // Del removes the selected row
+                    int row = LVSelectedRow(nm->hwndFrom);
+                    if (row >= 0) {
+                        if (nm->hwndFrom == g_hwndBangsList &&
+                            row < (int)g_settings.bangs.size())
+                            g_settings.bangs.erase(g_settings.bangs.begin() + row);
+                        else if (nm->hwndFrom == g_hwndQuickList &&
+                                 row < (int)g_settings.quicks.size())
+                            g_settings.quicks.erase(g_settings.quicks.begin() + row);
+                        else
+                            break;
+                        ListView_DeleteItem(nm->hwndFrom, row);
+                        SaveNow();
+                    }
+                }
             }
         }
         break;
@@ -1705,6 +2079,9 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             if (sel == 1) SetWindowTextW(g_hwndEngineUrl, L"https://www.google.com/search?q=%s");
             if (sel == 2) SetWindowTextW(g_hwndEngineUrl, L"https://www.bing.com/search?q=%s");
             if (sel == 3) SetWindowTextW(g_hwndEngineUrl, L"https://search.brave.com/search?q=%s");
+            SaveEngineBrowser(hwnd); // instant save, no Save button
+        } else if (id == IDC_ENGINE_URL && code == EN_KILLFOCUS) {
+            SaveEngineBrowser(hwnd);
         } else if (id == IDC_BROWSER_COMBO && code == CBN_SELCHANGE) {
             int sel = (int)SendMessageW(g_hwndBrowserCombo, CB_GETCURSEL, 0, 0);
             int count = (int)SendMessageW(g_hwndBrowserCombo, CB_GETCOUNT, 0, 0);
@@ -1719,6 +2096,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                     SendMessageW(g_hwndBrowserCombo, CB_SETCURSEL, 0, 0);
                 }
             }
+            SaveEngineBrowser(hwnd);
         } else if (id == IDC_BROWSER_BROWSE) {
             std::wstring picked;
             if (BrowseForBrowser(hwnd, picked)) {
@@ -1727,135 +2105,28 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 SendMessageW(g_hwndBrowserCombo, CB_INSERTSTRING, count - 1,
                              (LPARAM)g_browsers.back().name.c_str());
                 SendMessageW(g_hwndBrowserCombo, CB_SETCURSEL, count - 1, 0);
+                SaveEngineBrowser(hwnd);
             }
         } else if (id == IDC_BANG_ADD) {
-            Bang b;
-            if (!BangEditorToBang(hwnd, b)) break;
+            Bang b{{L"newsite"}, L"New site", L"https://example.com/?q=%s",
+                   RandomBangColor()};
+            g_settings.bangs.push_back(b);
             int row = LVAppendRow(g_hwndBangsList, b.aliases[0].c_str());
-            std::wstring aliases;
-            for (size_t i = 0; i < b.aliases.size(); i++) {
-                if (i) aliases += L", ";
-                aliases += b.aliases[i];
-            }
-            LVSetCell(g_hwndBangsList, row, 0, aliases);
             LVSetCell(g_hwndBangsList, row, 1, b.name);
             LVSetCell(g_hwndBangsList, row, 2, b.url);
-            wchar_t col[16];
-            swprintf_s(col, 16, L"#%02X%02X%02X",
-                       GetRValue(b.color), GetGValue(b.color), GetBValue(b.color));
-            LVSetCell(g_hwndBangsList, row, 3, col);
+            SaveNow();
             ListView_SetItemState(g_hwndBangsList, row, LVIS_SELECTED, LVIS_SELECTED);
             ListView_EnsureVisible(g_hwndBangsList, row, FALSE);
-        } else if (id == IDC_BANG_UPDATE) {
-            int row = LVSelectedRow(g_hwndBangsList);
-            if (row < 0) {
-                MessageBoxW(hwnd, L"Select a bang row first.", L"SneekPeek",
-                            MB_ICONWARNING | MB_OK);
-                break;
-            }
-            Bang b;
-            if (!BangEditorToBang(hwnd, b)) break;
-            std::wstring aliases;
-            for (size_t i = 0; i < b.aliases.size(); i++) {
-                if (i) aliases += L", ";
-                aliases += b.aliases[i];
-            }
-            LVSetCell(g_hwndBangsList, row, 0, aliases);
-            LVSetCell(g_hwndBangsList, row, 1, b.name);
-            LVSetCell(g_hwndBangsList, row, 2, b.url);
-            wchar_t col[16];
-            swprintf_s(col, 16, L"#%02X%02X%02X",
-                       GetRValue(b.color), GetGValue(b.color), GetBValue(b.color));
-            LVSetCell(g_hwndBangsList, row, 3, col);
-        } else if (id == IDC_BANG_DEL) {
-            int row = LVSelectedRow(g_hwndBangsList);
-            if (row >= 0) ListView_DeleteItem(g_hwndBangsList, row);
-        } else if (id == IDC_BANG_RESET) {
-            g_fillingSettings = true;
-            ListView_DeleteAllItems(g_hwndBangsList);
-            auto def = DefaultBangs();
-            for (const auto& b : def) {
-                std::wstring aliases;
-                for (size_t i = 0; i < b.aliases.size(); i++) {
-                    if (i) aliases += L", ";
-                    aliases += b.aliases[i];
-                }
-                int row = LVAppendRow(g_hwndBangsList, aliases.c_str());
-                LVSetCell(g_hwndBangsList, row, 1, b.name);
-                LVSetCell(g_hwndBangsList, row, 2, b.url);
-                wchar_t col[16];
-                swprintf_s(col, 16, L"#%02X%02X%02X",
-                           GetRValue(b.color), GetGValue(b.color), GetBValue(b.color));
-                LVSetCell(g_hwndBangsList, row, 3, col);
-            }
-            g_fillingSettings = false;
-        } else if (id == IDC_QUICK_ADD || id == IDC_QUICK_UPDATE) {
-            std::wstring name = Trim(GetWindowString(g_hwndQuickName));
-            std::wstring url = Trim(GetWindowString(g_hwndQuickUrl));
-            QuickLink q{name, url};
-            if (q.name.empty() || q.url.find(L"://") == std::wstring::npos) {
-                MessageBoxW(hwnd, L"Need a name and a full URL like https://...",
-                            L"SneekPeek", MB_ICONWARNING | MB_OK);
-                break;
-            }
-            if (id == IDC_QUICK_ADD) {
-                int row = LVAppendRow(g_hwndQuickList, q.name.c_str());
-                LVSetCell(g_hwndQuickList, row, 1, q.url);
-                ListView_SetItemState(g_hwndQuickList, row, LVIS_SELECTED, LVIS_SELECTED);
-                ListView_EnsureVisible(g_hwndQuickList, row, FALSE);
-            } else {
-                int row = LVSelectedRow(g_hwndQuickList);
-                if (row < 0) {
-                    MessageBoxW(hwnd, L"Select a quick-link row first.", L"SneekPeek",
-                                MB_ICONWARNING | MB_OK);
-                    break;
-                }
-                LVSetCell(g_hwndQuickList, row, 0, q.name);
-                LVSetCell(g_hwndQuickList, row, 1, q.url);
-            }
-        } else if (id == IDC_QUICK_DEL) {
-            int row = LVSelectedRow(g_hwndQuickList);
-            if (row >= 0) ListView_DeleteItem(g_hwndQuickList, row);
-        } else if (id == IDC_SAVE) {
-            bool pathBefore = g_settings.includePathExes;
-            int esel = (int)SendMessageW(g_hwndEngineCombo, CB_GETCURSEL, 0, 0);
-            std::wstring eurl = GetWindowString(g_hwndEngineUrl);
-            const wchar_t* names[] = {L"DuckDuckGo", L"Google", L"Bing", L"Brave", L"Custom"};
-            const wchar_t* urls[] = {
-                L"https://duckduckgo.com/?q=%s",
-                L"https://www.google.com/search?q=%s",
-                L"https://www.bing.com/search?q=%s",
-                L"https://search.brave.com/search?q=%s", eurl.c_str()};
-            if (esel < 0 || esel > 4) esel = 0;
-            if (esel == 4 && eurl.find(L"%s") == std::wstring::npos) {
-                MessageBoxW(hwnd, L"Custom URL must contain %s as the query placeholder.",
-                            L"SneekPeek", MB_ICONWARNING | MB_OK);
-                break;
-            }
-            g_settings.engineName = names[esel];
-            g_settings.engineUrl = urls[esel];
-
-            int bsel = (int)SendMessageW(g_hwndBrowserCombo, CB_GETCURSEL, 0, 0);
-            if (bsel <= 0) g_settings.browserPath.clear();
-            else if (bsel - 1 < (int)g_browsers.size())
-                g_settings.browserPath = g_browsers[(size_t)bsel - 1].path;
-
-            ReadHiddenFromList();
-            if (!ReadBangsFromList(hwnd)) break;
-            ReadQuickFromList();
-
-            g_settings.includePathExes =
-                SendMessageW(g_hwndChkPath, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            g_settings.runAtStartup =
-                SendMessageW(g_hwndChkStartup, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            SaveSettings(g_settings);
-            ApplyRunAtStartup(g_settings.runAtStartup);
-            RebuildHiddenSet();
-            if (g_settings.includePathExes != pathBefore) {
-                g_indexReady.store(false);
-                BuildIndexAsync();
-            }
-            MessageBoxW(hwnd, L"Saved.", L"SneekPeek", MB_OK | MB_ICONINFORMATION);
+            ListView_EditLabel(g_hwndBangsList, row); // type the alias in place
+        } else if (id == IDC_QUICK_ADD) {
+            QuickLink q{L"New link", L"https://example.com"};
+            g_settings.quicks.push_back(q);
+            int row = LVAppendRow(g_hwndQuickList, q.name.c_str());
+            LVSetCell(g_hwndQuickList, row, 1, q.url);
+            SaveNow();
+            ListView_SetItemState(g_hwndQuickList, row, LVIS_SELECTED, LVIS_SELECTED);
+            ListView_EnsureVisible(g_hwndQuickList, row, FALSE);
+            ListView_EditLabel(g_hwndQuickList, row);
         } else if (id == IDC_RESCAN) {
             g_indexReady.store(false);
             BuildIndexAsync();
@@ -1871,11 +2142,10 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         break;
     case WM_DESTROY:
         g_hwndSettings = NULL;
+        g_hwndCellEdit = NULL;
+        g_cellLv = 0; g_cellRow = -1; g_cellCol = 0;
         g_hwndEngineCombo = g_hwndEngineUrl = g_hwndBrowserCombo = NULL;
         g_hwndAppsList = g_hwndBangsList = g_hwndQuickList = NULL;
-        g_hwndBangAlias = g_hwndBangName = g_hwndBangUrl = g_hwndBangColor = NULL;
-        g_hwndQuickName = g_hwndQuickUrl = NULL;
-        g_hwndChkPath = g_hwndChkStartup = NULL;
         g_pageGeneral.clear(); g_pageApps.clear();
         g_pageBangs.clear(); g_pageQuick.clear();
         break;
@@ -1932,7 +2202,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     HDC screen = GetDC(NULL);
     int dpiY = GetDeviceCaps(screen, LOGPIXELSY);
     ReleaseDC(NULL, screen);
-    g_fontInput = CreateFontW(-MulDiv(15, dpiY, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    g_fontInput = CreateFontW(-MulDiv(15, dpiY, 72), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     g_fontTitle = CreateFontW(-MulDiv(11, dpiY, 72), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
@@ -2015,6 +2285,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     // Warm the index in the background so the first Ctrl+Space is instant.
     // Costs one short burst; afterwards the thread exits (0% CPU).
     BuildIndexAsync();
+
+    // Suggestion worker: one thread, event-driven, sleeps until typed to.
+    g_onlineEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (g_onlineEvent)
+        CloseHandle(CreateThread(NULL, 0, OnlineWorker, NULL, 0, NULL));
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
