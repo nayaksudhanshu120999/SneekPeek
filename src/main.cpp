@@ -82,7 +82,6 @@ static const int kMaxChips = 4;
 
 // Settings control IDs
 enum {
-    IDC_TAB = 100,
     IDC_ENGINE_COMBO = 101, IDC_ENGINE_URL = 102, IDC_CHK_PATH = 103,
     IDC_CHK_STARTUP = 104, IDC_BROWSER_COMBO = 105, IDC_BROWSER_BROWSE = 106,
     IDC_APPS_LIST = 110,
@@ -93,6 +92,7 @@ enum {
     IDC_QUICK_LIST = 120, IDC_QUICK_NAME = 121, IDC_QUICK_URL = 122,
     IDC_QUICK_ADD = 123, IDC_QUICK_UPDATE = 124, IDC_QUICK_DEL = 125,
     IDC_SAVE = 201, IDC_RESCAN = 202, IDC_CLOSE = 203,
+    IDC_PAGE_0 = 301, IDC_PAGE_1, IDC_PAGE_2, IDC_PAGE_3,
 };
 
 // ------------------------------------------------------------- small helpers
@@ -192,7 +192,7 @@ static HWND        g_hwndList = NULL;
 static HWND        g_hwndChip = NULL;
 static HWND        g_hwndChipRow = NULL;
 static HWND        g_hwndSettings = NULL;
-static HWND        g_hwndTab = NULL;
+static int         g_settingsPage = 0;
 static HWND        g_hwndEngineCombo = NULL;
 static HWND        g_hwndEngineUrl = NULL;
 static HWND        g_hwndBrowserCombo = NULL;
@@ -1257,6 +1257,7 @@ static void LoadEditorFromSelection(HWND lv) {
 }
 
 static void ShowSettingsPage(int page) {
+    g_settingsPage = page;
     const std::vector<HWND>* pages[4] = {&g_pageGeneral, &g_pageApps, &g_pageBangs, &g_pageQuick};
     for (int i = 0; i < 4; i++)
         for (HWND h : *pages[i])
@@ -1375,13 +1376,14 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         g_pageGeneral.clear(); g_pageApps.clear();
         g_pageBangs.clear(); g_pageQuick.clear();
 
-        g_hwndTab = NewCtrl(WC_TABCONTROLW, L"", WS_VISIBLE | WS_CLIPSIBLINGS,
-                            12, 12, 560, 488, hwnd, IDC_TAB);
+        // Page tabs: owner-drawn buttons matching the app theme (no tab
+        // control, so there is no light-themed rim anywhere in Settings).
         const wchar_t* tabs[] = {L"General", L"Hidden apps", L"Bangs", L"Quick links"};
-        for (int i = 0; i < 4; i++) {
-            TCITEMW tc{}; tc.mask = TCIF_TEXT; tc.pszText = (LPWSTR)tabs[i];
-            TabCtrl_InsertItem(g_hwndTab, i, &tc);
-        }
+        const int tabX[] = {16, 140, 280, 384};
+        const int tabW[] = {118, 134, 98, 120};
+        for (int i = 0; i < 4; i++)
+            NewCtrl(L"BUTTON", tabs[i], WS_VISIBLE | WS_TABSTOP,
+                    tabX[i], 12, tabW[i], 28, hwnd, IDC_PAGE_0 + i);
 
         auto page = [&](std::vector<HWND>& v, HWND h) { v.push_back(h); return h; };
 
@@ -1551,11 +1553,14 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         bool pressed = (d->itemState & ODS_SELECTED) != 0;
         bool focus = (d->itemState & ODS_FOCUS) != 0;
         bool isSave = d->CtlID == (UINT)IDC_SAVE;
+        bool isPage = d->CtlID >= (UINT)IDC_PAGE_0 && d->CtlID <= (UINT)IDC_PAGE_3;
+        bool pageSel = isPage && (int)(d->CtlID - (UINT)IDC_PAGE_0) == g_settingsPage;
+        bool accent = isSave || pageSel;
         HDC dc = d->hDC;
         FillRect(dc, &d->rcItem, g_brBg);
-        COLORREF fill = isSave ? (pressed ? RGB(38, 82, 140) : RGB(29, 65, 115))
+        COLORREF fill = accent ? (pressed ? RGB(38, 82, 140) : RGB(29, 65, 115))
                                : (pressed ? RGB(52, 52, 56) : RGB(26, 26, 28));
-        COLORREF edge = isSave ? kAppCol
+        COLORREF edge = accent ? kAppCol
                                : (focus ? RGB(130, 130, 140) : RGB(66, 66, 72));
         HBRUSH bg = CreateSolidBrush(fill);
         HPEN pen = CreatePen(PS_SOLID, 1, edge);
@@ -1576,8 +1581,30 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_NOTIFY: {
         NMHDR* nm = (NMHDR*)l;
-        if (nm->hwndFrom == g_hwndTab && nm->code == TCN_SELCHANGE) {
-            ShowSettingsPage(TabCtrl_GetCurSel(g_hwndTab));
+        if (nm->code == NM_CUSTOMDRAW &&
+            (nm->hwndFrom == ListView_GetHeader(g_hwndAppsList) ||
+             nm->hwndFrom == ListView_GetHeader(g_hwndBangsList) ||
+             nm->hwndFrom == ListView_GetHeader(g_hwndQuickList))) {
+            // Dark listview headers, painted manually.
+            LPNMCUSTOMDRAW cd = (LPNMCUSTOMDRAW)l;
+            if (cd->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+            if (cd->dwDrawStage == CDDS_ITEMPREPAINT) {
+                FillRect(cd->hdc, &cd->rc, g_brBg);
+                wchar_t buf[128] = {0};
+                HDITEMW hdi{};
+                hdi.mask = HDI_TEXT;
+                hdi.pszText = buf;
+                hdi.cchTextMax = 128;
+                if (Header_GetItem(nm->hwndFrom, (int)cd->dwItemSpec, &hdi)) {
+                    SetBkMode(cd->hdc, TRANSPARENT);
+                    SetTextColor(cd->hdc, kSub);
+                    SelectObject(cd->hdc, g_fontUI);
+                    RECT tr = cd->rc; tr.left += 8;
+                    DrawTextW(cd->hdc, buf, -1, &tr,
+                              DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
+                }
+                return CDRF_SKIPDEFAULT;
+            }
         } else if (!g_fillingSettings &&
                    (nm->hwndFrom == g_hwndBangsList || nm->hwndFrom == g_hwndQuickList)) {
             if (nm->code == LVN_ITEMCHANGED) {
@@ -1588,29 +1615,17 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 LoadEditorFromSelection(nm->hwndFrom);
             }
         }
-        if (nm->code == NM_CUSTOMDRAW) {
-            // Dark tab strip + dark listview headers (minimal theme).
-            bool isTab = (nm->hwndFrom == g_hwndTab);
-            bool isHeader = !isTab &&
-                (nm->hwndFrom == ListView_GetHeader(g_hwndAppsList) ||
-                 nm->hwndFrom == ListView_GetHeader(g_hwndBangsList) ||
-                 nm->hwndFrom == ListView_GetHeader(g_hwndQuickList));
-            if (isTab || isHeader) {
-                LPNMCUSTOMDRAW cd = (LPNMCUSTOMDRAW)l;
-                if (cd->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
-                if (cd->dwDrawStage == CDDS_ITEMPREPAINT) {
-                    cd->clrText = kText;
-                    cd->clrTextBk = kBg;
-                    SelectObject(cd->hdc, g_fontUI);
-                    return CDRF_NEWFONT;
-                }
-            }
-        }
         break;
     }
     case WM_COMMAND: {
         WORD id = LOWORD(w), code = HIWORD(w);
-        if (id == IDC_ENGINE_COMBO && code == CBN_SELCHANGE) {
+        if (id >= IDC_PAGE_0 && id <= IDC_PAGE_3) {
+            ShowSettingsPage(id - IDC_PAGE_0);
+            for (int i = IDC_PAGE_0; i <= IDC_PAGE_3; i++) {
+                HWND b = GetDlgItem(hwnd, i);
+                if (b) InvalidateRect(b, NULL, FALSE);
+            }
+        } else if (id == IDC_ENGINE_COMBO && code == CBN_SELCHANGE) {
             int sel = (int)SendMessageW(g_hwndEngineCombo, CB_GETCURSEL, 0, 0);
             EnableWindow(g_hwndEngineUrl, sel == 4);
             if (sel == 0) SetWindowTextW(g_hwndEngineUrl, L"https://duckduckgo.com/?q=%s");
@@ -1783,7 +1798,6 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         break;
     case WM_DESTROY:
         g_hwndSettings = NULL;
-        g_hwndTab = NULL;
         g_hwndEngineCombo = g_hwndEngineUrl = g_hwndBrowserCombo = NULL;
         g_hwndAppsList = g_hwndBangsList = g_hwndQuickList = NULL;
         g_hwndBangAlias = g_hwndBangName = g_hwndBangUrl = g_hwndBangColor = NULL;
