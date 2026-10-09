@@ -2018,28 +2018,29 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             } else if (nm->code == LVN_ENDLABELEDIT && !g_fillingSettings) {
                 // Built-in label edit covers column 0; validate + save.
                 NMLVDISPINFOW* di = (NMLVDISPINFOW*)l;
-                if (!di->pszText) return FALSE; // editing cancelled
-                std::wstring t = Trim(di->pszText);
+                if (!di->item.pszText) return FALSE; // editing cancelled
+                std::wstring t = Trim(di->item.pszText);
+                int diItem = di->item.iItem;
                 if (nm->hwndFrom == g_hwndBangsList) {
-                    if (t.empty() || di->iItem >= (int)g_settings.bangs.size()) return FALSE;
+                    if (t.empty() || diItem >= (int)g_settings.bangs.size()) return FALSE;
                     std::wstring line = t + L" | " +
-                        g_settings.bangs[di->iItem].name + L" | " +
-                        g_settings.bangs[di->iItem].url + L" | " +
-                        SerializeColor(g_settings.bangs[di->iItem].color);
+                        g_settings.bangs[diItem].name + L" | " +
+                        g_settings.bangs[diItem].url + L" | " +
+                        SerializeColor(g_settings.bangs[diItem].color);
                     Bang b;
                     if (!ParseBangLine(line, b)) {
                         MessageBoxW(hwnd, L"Aliases cannot be empty - change reverted.",
                                     L"SneekPeek", MB_ICONWARNING | MB_OK);
                         return FALSE;
                     }
-                    b.color = g_settings.bangs[di->iItem].color;
-                    g_settings.bangs[di->iItem] = b;
-                    LVSetCell(nm->hwndFrom, di->iItem, 0, JoinAliases(b.aliases));
+                    b.color = g_settings.bangs[diItem].color;
+                    g_settings.bangs[diItem] = b;
+                    LVSetCell(nm->hwndFrom, diItem, 0, JoinAliases(b.aliases));
                     SaveNow();
                 } else {
-                    if (t.empty() || di->iItem >= (int)g_settings.quicks.size()) return FALSE;
-                    g_settings.quicks[di->iItem].name = t;
-                    LVSetCell(nm->hwndFrom, di->iItem, 0, t);
+                    if (t.empty() || diItem >= (int)g_settings.quicks.size()) return FALSE;
+                    g_settings.quicks[diItem].name = t;
+                    LVSetCell(nm->hwndFrom, diItem, 0, t);
                     SaveNow();
                 }
                 return TRUE;
