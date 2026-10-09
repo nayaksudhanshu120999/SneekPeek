@@ -31,7 +31,6 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <powrprof.h>
-#include <winhttp.h>
 #include <cwctype>
 #include <cmath>
 #include <cstdio>
@@ -57,7 +56,6 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "powrprof.lib")
 #pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "winhttp.lib")
 
 // ---------------------------------------------------------------- constants
 static const wchar_t* kPaletteClass  = L"SneekPeekPalette";
@@ -68,7 +66,6 @@ static const wchar_t* kMutexName     = L"SneekPeek_SingleInstance_v1";
 static const UINT HOTKEY_ID = 1;
 static const UINT WM_TRAYICON = WM_APP + 10;
 static const UINT WM_APP_SHOW = WM_APP + 11;
-static const UINT WM_APP_ONLINE = WM_APP + 21; // background suggestions arrived
 static const UINT ID_TRAY_SETTINGS = 1001;
 static const UINT ID_TRAY_REFRESH  = 1002;
 static const UINT ID_TRAY_STARTUP   = 1003;
@@ -195,9 +192,7 @@ static HWND        g_hwndEdit = NULL;
 static HWND        g_hwndList = NULL;
 static HWND        g_hwndChip = NULL;
 static HWND        g_hwndChipRow = NULL;
-static HWND        g_hwndEngineChip = NULL; // engine pill at the right of the box
 static int         g_bangChipW = 0;  // 0 = hidden
-static int         g_engineW = 0;    // 0 = hidden
 static HWND        g_hwndSettings = NULL;
 static int         g_settingsPage = 0;
 static HWND        g_hwndEngineCombo = NULL;
@@ -253,19 +248,19 @@ static const PowerDef kPowers[] = {
 };
 static const COLORREF kQuickCol = RGB(192, 132, 252);
 
-enum class ChipKind { Power, Quick };
+enum class ChipKind { Power, Quick, Bang };
 struct ChipItem {
     ChipKind kind;
     std::wstring title;
     COLORREF color;
-    int data; // power index into kPowers, or quick index into g_settings.quicks
+    int data; // power/bang index, or quick index into g_settings.quicks
 };
 static std::vector<ChipItem> g_chips;
 static std::vector<RECT> g_chipRects;
 static int  g_chipSel = 0;
 static bool g_chipsFocus = false; // true = Enter runs the chip, list has no selection
 
-enum class ResultKind { App, Web, Bang, Calc, Hint, Header, Online };
+enum class ResultKind { App, Web, Bang, Calc };
 struct ResultItem {
     ResultKind kind;
     std::wstring title;   // main line (never a file path)
@@ -273,8 +268,6 @@ struct ResultItem {
     std::wstring action;  // lnk path | shell:AppsFolder target | url | calc text
     COLORREF color;       // category accent color
     bool isStore = false; // Store app: launch via explorer.exe
-    int bangIdx = -1;     // bang-preview rows: index into g_settings.bangs
-    bool preview = false; // bang-preview rows: Enter arms the chip
 };
 static std::vector<ResultItem> g_results;
 
@@ -379,12 +372,12 @@ static void PlacePalette() {
     int h = kInputH + kItemH;
     SetWindowPos(g_hwndPalette, HWND_TOPMOST, x, y, kWidth, h,
                  SWP_SHOWWINDOW | SWP_NOACTIVATE);
-    SetWindowPos(g_hwndEdit, NULL, 16, 7, kWidth - 32, 30, SWP_NOZORDER);
-    int chipY = 7 + (30 - kChipH) / 2;
+    SetWindowPos(g_hwndEdit, NULL, 16, 9, kWidth - 32, 30, SWP_NOZORDER);
+    int chipY = 9 + (30 - kChipH) / 2;
     SetWindowPos(g_hwndChip, NULL, 16, chipY, 10, kChipH, SWP_NOZORDER | SWP_HIDEWINDOW);
-    SetWindowPos(g_hwndChipRow, NULL, 10, kInputH, kWidth - 20, kChipRowH,
+    SetWindowPos(g_hwndChipRow, NULL, 16, kInputH, kWidth - 32, kChipRowH,
                  SWP_NOZORDER | SWP_HIDEWINDOW);
-    SetWindowPos(g_hwndList, NULL, 10, kInputH, kWidth - 20, kItemH, SWP_NOZORDER);
+    SetWindowPos(g_hwndList, NULL, 16, kInputH, kWidth - 32, kItemH, SWP_NOZORDER);
 }
 
 static void ShowPalette() {
@@ -435,8 +428,7 @@ static int ChipWidthFor(HDC dc, const std::wstring& text) {
 static void ApplyEditMargins() {
     if (!g_hwndEdit) return;
     SendMessageW(g_hwndEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
-                 MAKELPARAM(g_bangChipW ? g_bangChipW + 8 : 10,
-                            g_engineW ? g_engineW + 10 : 10));
+                 MAKELPARAM(g_bangChipW ? g_bangChipW + 8 : 10, 10));
 }
 
 static void ActivateBang(int idx, const std::wstring& query) {
@@ -448,15 +440,23 @@ static void ActivateBang(int idx, const std::wstring& query) {
     int w = ChipWidthFor(dc, b.name);
     SelectObject(dc, old);
     ReleaseDC(g_hwndPalette, dc);
-    int chipY = 7 + (30 - kChipH) / 2;
+    // Geometry derived from the live edit rect (single source of truth):
+    // the pill always stays inside the box with equal padding, never
+    // crossing the outline.
+    RECT er; GetWindowRect(g_hwndEdit, &er);
+    MapWindowPoints(NULL, g_hwndPalette, (POINT*)&er, 2);
+    int boxH = er.bottom - er.top;
+    int chH = boxH - 8;
+    if (chH > kChipH) chH = kChipH;
+    if (chH < 18) chH = 18;
+    int chipX = er.left + 2;
+    int chipY = er.top + (boxH - chH) / 2;
     // HWND_TOP: the chip must stay above the edit (which has WS_CLIPSIBLINGS
     // so it never paints over the chip). Synchronous paint: no blank flash.
-    SetWindowPos(g_hwndChip, HWND_TOP, 16, chipY, w, kChipH, SWP_SHOWWINDOW);
+    SetWindowPos(g_hwndChip, HWND_TOP, chipX, chipY, w, chH, SWP_SHOWWINDOW);
     InvalidateRect(g_hwndChip, NULL, TRUE);
     UpdateWindow(g_hwndChip);
     g_bangChipW = w;
-    g_engineW = 0;
-    if (g_hwndEngineChip) ShowWindow(g_hwndEngineChip, SW_HIDE);
     ApplyEditMargins();
     InvalidateRect(g_hwndPalette, NULL, FALSE); // refresh the box outline
     SendMessageW(g_hwndEdit, EM_SETCUEBANNER, FALSE, (LPARAM)L""); // chip only
@@ -470,145 +470,12 @@ static void ActivateBang(int idx, const std::wstring& query) {
 static void DeactivateBang() {
     g_activeBang = -1;
     g_bangChipW = 0;
-    g_engineW = 0;
     if (g_hwndChip) ShowWindow(g_hwndChip, SW_HIDE);
-    if (g_hwndEngineChip) ShowWindow(g_hwndEngineChip, SW_HIDE);
     if (g_hwndEdit) {
         ApplyEditMargins();
         SendMessageW(g_hwndEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search");
     }
     InvalidateRect(g_hwndPalette, NULL, FALSE); // refresh the box outline
-}
-
-static COLORREF EngineColor() {
-    const std::wstring& n = g_settings.engineName;
-    if (n == L"Google") return RGB(66, 133, 244);
-    if (n == L"DuckDuckGo") return RGB(222, 88, 51);
-    if (n == L"Bing") return RGB(0, 128, 157);
-    if (n == L"Brave") return RGB(251, 84, 43);
-    return RGB(142, 142, 147);
-}
-
-// Right-side engine pill: visible while an online search is armed.
-static void UpdateEngineChip(const std::wstring& q, bool canShow) {
-    int w = 0;
-    if (canShow && !q.empty() && g_activeBang < 0 && g_hwndEngineChip) {
-        HDC dc = GetDC(g_hwndPalette);
-        HGDIOBJ old = SelectObject(dc, g_fontChip);
-        w = ChipWidthFor(dc, g_settings.engineName);
-        SelectObject(dc, old);
-        ReleaseDC(g_hwndPalette, dc);
-        RECT cr; GetClientRect(g_hwndPalette, &cr);
-        int chipY = 7 + (30 - kChipH) / 2;
-        SetWindowPos(g_hwndEngineChip, HWND_TOP, cr.right - 16 - w, chipY,
-                     w, kChipH, SWP_SHOWWINDOW);
-        InvalidateRect(g_hwndEngineChip, NULL, TRUE);
-    } else if (g_hwndEngineChip) {
-        ShowWindow(g_hwndEngineChip, SW_HIDE);
-    }
-    if (w != g_engineW) {
-        g_engineW = w;
-        ApplyEditMargins();
-    }
-}
-
-// ------------------------------------------------- online suggestions (async)
-static HANDLE g_onlineEvent = NULL;
-static std::atomic<int> g_onlineSeq{0};
-static std::wstring g_onlineRequested;
-static std::wstring g_onlineFor;
-static std::vector<std::wstring> g_online;
-static SRWLOCK g_onlineLock = SRWLOCK_INIT;
-
-static std::vector<std::wstring> FetchSuggestions(const std::wstring& q) {
-    std::vector<std::wstring> out;
-    std::wstring path = L"/ac/?q=" + UrlEncodeQuery(q) + L"&type=list";
-    HINTERNET hS = WinHttpOpen(L"SneekPeek/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                               WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hS) return out;
-    WinHttpSetTimeouts(hS, 3000, 3000, 3000, 5000);
-    HINTERNET hC = WinHttpConnect(hS, L"duckduckgo.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
-    HINTERNET hR = NULL;
-    if (hC) hR = WinHttpOpenRequest(hC, L"GET", path.c_str(), NULL, WINHTTP_NO_REFERER,
-                                   WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    std::string data;
-    if (hR && WinHttpSendRequest(hR, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-        WinHttpReceiveResponse(hR, NULL)) {
-        DWORD avail = 0;
-        char buf[4096];
-        while (WinHttpQueryDataAvailable(hR, &avail) && avail) {
-            DWORD chunk = avail > sizeof(buf) ? (DWORD)sizeof(buf) : avail;
-            DWORD rd = 0;
-            if (!WinHttpReadData(hR, buf, chunk, &rd) || !rd) break;
-            data.append(buf, rd);
-            if (data.size() > 16384) break;
-        }
-    }
-    if (hR) WinHttpCloseHandle(hR);
-    if (hC) WinHttpCloseHandle(hC);
-    WinHttpCloseHandle(hS);
-    // Collect "..." tokens; skip the echo + "phrase" keys; unescape basics.
-    bool first = true;
-    for (size_t i = 0; i < data.size() && out.size() < 5;) {
-        if (data[i] != '"') { i++; continue; }
-        std::string tok;
-        i++;
-        while (i < data.size() && data[i] != '"') {
-            if (data[i] == '\\' && i + 1 < data.size()) { i++; tok += data[i++]; }
-            else tok += data[i++];
-        }
-        if (i < data.size()) i++;
-        if (first) { first = false; continue; }
-        if (tok.empty() || tok == "phrase") continue;
-        int n = MultiByteToWideChar(CP_UTF8, 0, tok.c_str(), (int)tok.size(), NULL, 0);
-        if (n > 0) {
-            std::wstring w((size_t)n, L'\0');
-            MultiByteToWideChar(CP_UTF8, 0, tok.c_str(), (int)tok.size(), w.data(), n);
-            out.push_back(std::move(w));
-        }
-    }
-    return out;
-}
-
-static DWORD WINAPI OnlineWorker(LPVOID) {
-    for (;;) {
-        WaitForSingleObject(g_onlineEvent, INFINITE);
-        int seq;
-        std::wstring q;
-        AcquireSRWLockExclusive(&g_onlineLock);
-        seq = g_onlineSeq.load();
-        q = g_onlineRequested;
-        ReleaseSRWLockExclusive(&g_onlineLock);
-        Sleep(220); // debounce: let typing settle before spending a request
-        AcquireSRWLockExclusive(&g_onlineLock);
-        bool stale = (seq != g_onlineSeq.load());
-        ReleaseSRWLockExclusive(&g_onlineLock);
-        if (stale || q.size() < 2) continue;
-        std::vector<std::wstring> out = FetchSuggestions(q);
-        AcquireSRWLockExclusive(&g_onlineLock);
-        bool current = (seq == g_onlineSeq.load());
-        if (current) {
-            g_online = std::move(out);
-            g_onlineFor = q;
-        }
-        ReleaseSRWLockExclusive(&g_onlineLock);
-        if (current) PostMessageW(g_hwndPalette, WM_APP_ONLINE, (WPARAM)seq, 0);
-    }
-    return 0;
-}
-
-// Ask the worker for fresh suggestions unless already requested.
-static void RequestOnline(const std::wstring& q) {
-    if (q.size() < 2 || !g_onlineEvent) return;
-    AcquireSRWLockExclusive(&g_onlineLock);
-    bool need = (q != g_onlineRequested);
-    if (need) {
-        g_onlineRequested = q;
-        g_onlineSeq++;
-    }
-    ReleaseSRWLockExclusive(&g_onlineLock);
-    if (need) SetEvent(g_onlineEvent);
 }
 
 // ------------------------------------------------------------- power actions
@@ -641,7 +508,7 @@ static void PushAppRow(const AppEntry& app) {
     g_results.push_back(std::move(r));
 }
 
-// Prefix-matched power + quick-link chips (separate row above the list).
+// Prefix-matched power + bang + quick-link chips (separate row above list).
 static void BuildChips(const std::wstring& qlower) {
     g_chips.clear();
     if (qlower.size() < 2 || qlower[0] == L'!') return;
@@ -650,6 +517,16 @@ static void BuildChips(const std::wstring& qlower) {
             std::wstring al = kPowers[i].aliases[a];
             if (al.size() >= qlower.size() && al.compare(0, qlower.size(), qlower) == 0) {
                 g_chips.push_back({ChipKind::Power, kPowers[i].title, kPowers[i].color, i});
+                break;
+            }
+        }
+    }
+    for (size_t i = 0; i < g_settings.bangs.size() && (int)g_chips.size() < kMaxChips; i++) {
+        const Bang& b = g_settings.bangs[i];
+        for (const auto& a : b.aliases) {
+            if (!a.empty() && a.size() >= qlower.size() &&
+                a.compare(0, qlower.size(), qlower) == 0) {
+                g_chips.push_back({ChipKind::Bang, b.name, b.color, (int)i});
                 break;
             }
         }
@@ -677,7 +554,7 @@ static void RebuildListControl() {
     bool showChips = !g_chips.empty();
     size_t rows = g_results.size() > kMaxItems ? kMaxItems : g_results.size();
     int listY = kInputH + (showChips ? kChipRowH : 0);
-    int h = listY + (int)rows * kItemH + 10;
+    int h = listY + (int)rows * kItemH + 4; // 4px bottom pad mirrors the top
 
     // Resize (window + region + children) only when the height changed:
     // this is what stops the per-keystroke blink.
@@ -688,14 +565,14 @@ static void RebuildListControl() {
         ApplyRoundCorners();
         RECT cr; GetClientRect(g_hwndPalette, &cr);
         if (showChips)
-            SetWindowPos(g_hwndChipRow, NULL, 10, kInputH, cr.right - 20, kChipRowH,
+            SetWindowPos(g_hwndChipRow, NULL, 16, kInputH, cr.right - 32, kChipRowH,
                          SWP_NOZORDER | SWP_SHOWWINDOW);
         else
             ShowWindow(g_hwndChipRow, SW_HIDE);
         if (rows == 0)
             ShowWindow(g_hwndList, SW_HIDE); // bar-only: no list at all
         else
-            SetWindowPos(g_hwndList, NULL, 10, listY, cr.right - 20,
+            SetWindowPos(g_hwndList, NULL, 16, listY, cr.right - 32,
                          (int)rows * kItemH, SWP_NOZORDER | SWP_SHOWWINDOW);
     }
     // No background erase (controls paint every pixel themselves).
@@ -721,7 +598,6 @@ static void UpdateResults() {
         // Bar-only start: no rows, no list until the user types.
         g_chips.clear();
         g_chipsFocus = false;
-        UpdateEngineChip(q, false);
         RebuildListControl();
         return;
     }
@@ -739,25 +615,6 @@ static void UpdateResults() {
         ResultItem r{ResultKind::Calc, std::wstring(L"= ") + buf,
                      L"Calculator - Enter copies result", buf, kCalcCol};
         g_results.push_back(std::move(r));
-    }
-
-    // --- bang previews: typed "yt" shows YouTube etc., Enter arms the chip
-    {
-        std::wstring ql = BangLower(q);
-        int added = 0;
-        for (size_t i = 0; i < g_settings.bangs.size() && added < 3; i++) {
-            const Bang& b = g_settings.bangs[i];
-            bool hit = false;
-            for (const auto& a : b.aliases) {
-                if (!a.empty() && a.size() >= ql.size() &&
-                    a.compare(0, ql.size(), ql) == 0) { hit = true; break; }
-            }
-            if (!hit) continue;
-            ResultItem r{ResultKind::Bang, b.name, L"Bang - Enter to arm",
-                         L"", b.color, false, (int)i, true};
-            g_results.push_back(std::move(r));
-            added++;
-        }
     }
 
     // --- direct "!alias term" form (no chip)
@@ -779,26 +636,17 @@ static void UpdateResults() {
         }
         if (!term.empty() && g_indexReady.load()) {
             for (auto& h : SearchApps(g_apps, term, 6)) {
-                if (!IsHiddenApp(h.app->name)) PushAppRow(*h.app);
+                if (g_hidden.count(h.app->lower) == 0) PushAppRow(*h.app);
             }
         }
-        UpdateEngineChip(q, false);
         RebuildListControl();
         return;
     }
 
-    // --- normal: app matches + online suggestions + web fallback
-    RequestOnline(q);
-    std::vector<std::wstring> online;
-    AcquireSRWLockShared(&g_onlineLock);
-    if (g_onlineFor == q) online = g_online;
-    ReleaseSRWLockShared(&g_onlineLock);
-    if (online.size() > 3) online.resize(3);
-
-    size_t appLimit = online.empty() ? (kMaxItems - 1) : 3;
+    // --- normal: app matches + web fallback
     if (g_indexReady.load()) {
-        for (auto& h : SearchApps(g_apps, q, appLimit)) {
-            if (!IsHiddenApp(h.app->name)) PushAppRow(*h.app);
+        for (auto& h : SearchApps(g_apps, q, kMaxItems - 1)) {
+            if (g_hidden.count(h.app->lower) == 0) PushAppRow(*h.app);
         }
     } else {
         ResultItem r{ResultKind::App, L"Indexing apps...",
@@ -810,22 +658,6 @@ static void UpdateResults() {
                    ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q)), kWebCol};
     g_results.push_back(std::move(web));
 
-    // Categorized: Local section + live Online section.
-    if (!online.empty()) {
-        if (!g_results.empty()) {
-            ResultItem h{ResultKind::Header, L"Local", L"", L"", kHintCol};
-            g_results.insert(g_results.begin(), std::move(h));
-        }
-        ResultItem h2{ResultKind::Header, L"Online", L"", L"", kHintCol};
-        g_results.push_back(std::move(h2));
-        for (const auto& s : online) {
-            ResultItem r{ResultKind::Online, s,
-                         L"Search " + g_settings.engineName,
-                         ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(s)), kWebCol};
-            g_results.push_back(std::move(r));
-        }
-    }
-    UpdateEngineChip(q, true);
     RebuildListControl();
 }
 
@@ -840,20 +672,23 @@ static int CurrentSelection() {
 static void ExecuteChip(int idx) {
     if (idx < 0 || idx >= (int)g_chips.size()) return;
     ChipItem c = g_chips[(size_t)idx]; // copy: HidePalette clears the vector
-    bool isPower = (c.kind == ChipKind::Power);
-    PowerOp op = PowerOp::Shutdown;
-    std::wstring url;
-    if (isPower) {
+    if (c.kind == ChipKind::Power) {
         int nPowers = (int)(sizeof(kPowers) / sizeof(kPowers[0]));
         if (c.data < 0 || c.data >= nPowers) return;
-        op = kPowers[c.data].op;
-    } else {
-        if (c.data < 0 || c.data >= (int)g_settings.quicks.size()) return;
-        url = g_settings.quicks[(size_t)c.data].url;
+        PowerOp op = kPowers[c.data].op;
+        HidePalette(); // hide first: instant, never wait for the action
+        RunPower(op);
+        return;
     }
+    if (c.kind == ChipKind::Bang) {
+        if (c.data < 0 || c.data >= (int)g_settings.bangs.size()) return;
+        ActivateBang(c.data, L""); // chip arms the site, like alias + Space
+        return;
+    }
+    if (c.data < 0 || c.data >= (int)g_settings.quicks.size()) return;
+    std::wstring url = g_settings.quicks[(size_t)c.data].url;
     HidePalette(); // hide first: instant, never wait for the action
-    if (isPower) RunPower(op);
-    else OpenUrl(url, g_settings.browserPath);
+    OpenUrl(url, g_settings.browserPath);
 }
 
 static void ExecuteSelected(bool forceWeb) {
@@ -902,12 +737,6 @@ static void ExecuteSelected(bool forceWeb) {
         return;
     }
     ResultItem r = g_results[(size_t)idx]; // copy: HidePalette clears the vector
-    if (r.kind == ResultKind::Hint) return;
-    if (r.kind == ResultKind::Header) return; // section labels do nothing
-    if (r.kind == ResultKind::Bang && r.preview) {
-        if (r.bangIdx >= 0) ActivateBang(r.bangIdx, L""); // Enter arms the chip
-        return;
-    }
     HidePalette(); // hide first: never wait for the target app
     switch (r.kind) {
     case ResultKind::App:
@@ -919,24 +748,19 @@ static void ExecuteSelected(bool forceWeb) {
         break;
     case ResultKind::Web:
     case ResultKind::Bang:
-    case ResultKind::Online:
         OpenUrl(r.action, g_settings.browserPath);
         break;
     case ResultKind::Calc:
         CopyText(r.action);
         break;
-    case ResultKind::Hint:
-    case ResultKind::Header:
-        break;
     }
 }
 
 // ------------------------------------------------- list navigation helpers
-// Headers are visible but never selectable. Moving with arrows mirrors the
-// selected row's text into the box WITHOUT refiltering: the list stays
-// frozen until the user types or deletes a character.
+// Moving with arrows mirrors the selected row's text into the box WITHOUT
+// refiltering: the list stays frozen until the user types or deletes.
 static bool IsSelectable(size_t i) {
-    return i < g_results.size() && g_results[i].kind != ResultKind::Header;
+    return i < g_results.size();
 }
 static int MoveSel(int from, int dir) {
     int n = (int)g_results.size(); // listbox order == result order (no sort)
@@ -953,8 +777,7 @@ static void SyncSelToBox(int listSel) {
     const ResultItem& r = g_results[(size_t)listSel];
     std::wstring keep = GetEditText(g_hwndEdit);
     std::wstring t = keep;
-    if (r.kind == ResultKind::App || r.kind == ResultKind::Online) t = r.title;
-    else if (r.kind == ResultKind::Bang && r.preview) t = r.title;
+    if (r.kind == ResultKind::App) t = r.title;
     if (t == keep) return;
     g_changingEdit = true; // programmatic: no refilter, list stays frozen
     SetWindowTextW(g_hwndEdit, t.c_str());
@@ -1047,12 +870,10 @@ static LRESULT CALLBACK ChipProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT: {
-        // Solid pill, white bold text, no outline. Mode 1 = bang chip (+x),
-        // mode 2 = engine chip (click = web search).
-        bool isEngine = GetWindowLongPtrW(hwnd, GWLP_USERDATA) == 2;
-        const Bang* b = isEngine ? NULL : ActiveBang();
-        std::wstring text = isEngine ? g_settings.engineName : (b ? b->name : L"");
-        COLORREF col = isEngine ? EngineColor() : (b ? b->color : kHintCol);
+        // Solid pill, white bold text, no outline. Click x exits bang mode.
+        const Bang* b = ActiveBang();
+        std::wstring text = b ? b->name : L"";
+        COLORREF col = b ? b->color : kHintCol;
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
         RECT r; GetClientRect(hwnd, &r);
@@ -1065,22 +886,15 @@ static LRESULT CALLBACK ChipProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         SetBkMode(dc, TRANSPARENT);
         SelectObject(dc, g_fontChip);
         SetTextColor(dc, RGB(255, 255, 255));
-        RECT tr = r; tr.left += 10; tr.right -= (isEngine ? 10 : 24);
+        RECT tr = r; tr.left += 10; tr.right -= 24;
         DrawTextW(dc, text.c_str(), -1, &tr,
                   DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-        if (!isEngine) {
-            RECT xr = r; xr.left = xr.right - 20;
-            DrawTextW(dc, L"x", -1, &xr, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
-        }
+        RECT xr = r; xr.left = xr.right - 20;
+        DrawTextW(dc, L"x", -1, &xr, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
         EndPaint(hwnd, &ps);
         return 0;
     }
     case WM_LBUTTONDOWN: {
-        bool isEngine = GetWindowLongPtrW(hwnd, GWLP_USERDATA) == 2;
-        if (isEngine) {
-            ExecuteSelected(true); // engine pill = run the web search
-            return 0;
-        }
         RECT r; GetClientRect(hwnd, &r);
         int x = GET_X_LPARAM(l);
         if (x >= r.right - 24) {
@@ -1180,7 +994,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         // WS_CLIPSIBLINGS everywhere: the edit must never paint over the chip.
         g_hwndEdit = CreateWindowExW(0, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | ES_LEFT | ES_AUTOHSCROLL,
-            16, 7, kWidth - 32, 30,
+            16, 9, kWidth - 32, 30,
             hwnd, (HMENU)1, g_hInst, NULL);
         SendMessageW(g_hwndEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search");
         SendMessageW(g_hwndEdit, WM_SETFONT, (WPARAM)g_fontInput, TRUE);
@@ -1192,23 +1006,16 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             WS_CHILD | WS_CLIPSIBLINGS,
             16, 9, 10, kChipH,
             hwnd, (HMENU)3, g_hInst, NULL);
-        SetWindowLongPtrW(g_hwndChip, GWLP_USERDATA, 1); // bang pill (+x)
-
-        g_hwndEngineChip = CreateWindowExW(0, kChipClass, L"",
-            WS_CHILD | WS_CLIPSIBLINGS,
-            16, 9, 10, kChipH,
-            hwnd, (HMENU)5, g_hInst, NULL);
-        SetWindowLongPtrW(g_hwndEngineChip, GWLP_USERDATA, 2); // engine pill
 
         g_hwndChipRow = CreateWindowExW(0, kChipRowClass, L"",
             WS_CHILD | WS_CLIPSIBLINGS,
-            10, kInputH, kWidth - 20, kChipRowH,
+            16, kInputH, kWidth - 32, kChipRowH,
             hwnd, (HMENU)4, g_hInst, NULL);
 
         g_hwndList = CreateWindowExW(0, L"LISTBOX", L"",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | LBS_NOTIFY | LBS_OWNERDRAWFIXED |
             LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT | WS_VSCROLL,
-            10, kInputH, kWidth - 20, kItemH,
+            16, kInputH, kWidth - 32, kItemH,
             hwnd, (HMENU)2, g_hInst, NULL);
         break;
     }
@@ -1228,7 +1035,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         HPEN pen = CreatePen(PS_SOLID, 1, ab ? ab->color : RGB(64, 64, 70));
         HGDIOBJ op = SelectObject(dc, pen);
         SelectObject(dc, GetStockObject(NULL_BRUSH));
-        RoundRect(dc, er.left - 5, er.top - 4, er.right + 5, er.bottom + 4, 10, 10);
+        RoundRect(dc, er.left - 5, er.top - 5, er.right + 5, er.bottom + 5, 10, 10);
         SelectObject(dc, op);
         DeleteObject(pen);
         EndPaint(hwnd, &ps);
@@ -1273,17 +1080,9 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             if (code == LBN_DBLCLK) {
                 g_chipsFocus = false;
                 ExecuteSelected(false);
-            } else if (code == LBN_SELCHANGE) {
-                int s = (int)SendMessageW(g_hwndList, LB_GETCURSEL, 0, 0);
-                if (s >= 0 && s < (int)g_results.size() &&
-                    g_results[(size_t)s].kind == ResultKind::Header) {
-                    int to = MoveSel(s, +1); // clicked a header: jump past it
-                    SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
-                }
-                if (g_chipsFocus) {
-                    g_chipsFocus = false; // mouse took over the list
-                    InvalidateRect(g_hwndChipRow, NULL, FALSE);
-                }
+            } else if (code == LBN_SELCHANGE && g_chipsFocus) {
+                g_chipsFocus = false; // mouse took over the list
+                InvalidateRect(g_hwndChipRow, NULL, FALSE);
             }
         } else if (id >= ID_TRAY_SETTINGS && id <= ID_TRAY_QUIT) {
             OnTrayCommand(id);
@@ -1301,20 +1100,9 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         bool sel = (d->itemState & ODS_SELECTED) != 0;
         HDC dc = d->hDC;
         size_t ri = (d->itemData < (UINT)g_results.size()) ? d->itemData : 9999;
-        bool isHead = ((int)ri < (int)g_results.size()) &&
-                      g_results[ri].kind == ResultKind::Header;
-        FillRect(dc, &d->rcItem, (!isHead && sel) ? g_brSel : g_brBg);
+        FillRect(dc, &d->rcItem, sel ? g_brSel : g_brBg);
         if ((int)ri < (int)g_results.size()) {
             const ResultItem& r = g_results[ri];
-            if (isHead) { // section label: small gray caps, never highlights
-                SetBkMode(dc, TRANSPARENT);
-                SelectObject(dc, g_fontSub);
-                SetTextColor(dc, kSub);
-                RECT tr = d->rcItem; tr.left += 14;
-                DrawTextW(dc, r.title.c_str(), -1, &tr,
-                          DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-                return TRUE;
-            }
             SetBkMode(dc, TRANSPARENT);
             // Category color bar: thin, brighter when selected.
             HBRUSH bar = CreateSolidBrush(sel ? r.color : Darken(r.color, 65));
@@ -1362,15 +1150,6 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         break;
     case WM_APP + 20: // index finished
         if (IsWindowVisible(hwnd)) UpdateResults();
-        break;
-    case WM_APP_ONLINE: // background suggestions arrived
-        if ((int)w == g_onlineSeq.load() && IsWindowVisible(hwnd)) {
-            std::wstring cur = Trim(GetEditText(g_hwndEdit));
-            AcquireSRWLockShared(&g_onlineLock);
-            bool match = (!g_online.empty() && g_onlineFor == cur && !ActiveBang());
-            ReleaseSRWLockShared(&g_onlineLock);
-            if (match) UpdateResults(); // merges rows; same query -> no refetch
-        }
         break;
     case WM_TRAYICON:
         if (LOWORD(l) == WM_RBUTTONUP || LOWORD(l) == WM_CONTEXTMENU)
@@ -2267,7 +2046,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     RegisterClassExW(&wcRow);
 
     g_hwndPalette = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW, // topmost + no taskbar button
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_COMPOSITED, // topmost, no taskbar, smooth
         kPaletteClass, L"SneekPeek",
         WS_POPUP | WS_CLIPCHILDREN, // borderless rounded region paints the shape
         0, 0, kWidth, kInputH + kItemH,
@@ -2286,11 +2065,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     // Warm the index in the background so the first Ctrl+Space is instant.
     // Costs one short burst; afterwards the thread exits (0% CPU).
     BuildIndexAsync();
-
-    // Suggestion worker: one thread, event-driven, sleeps until typed to.
-    g_onlineEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (g_onlineEvent)
-        CloseHandle(CreateThread(NULL, 0, OnlineWorker, NULL, 0, NULL));
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {

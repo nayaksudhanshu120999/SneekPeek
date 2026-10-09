@@ -101,6 +101,7 @@ static void ScanLnkDir(const std::wstring& root, std::vector<AppEntry>& out) {
             }
             AppEntry e;
             e.name = base;
+            e.lower = ToLower(base);
             e.target = full;
             e.isStore = false;
             out.push_back(std::move(e));
@@ -129,6 +130,7 @@ static bool ItemToStoreApp(IShellItem* it, AppEntry& out) {
         LPWSTR aumid = NULL;
         if (i2->GetString(kKeyAumid, &aumid) == S_OK && aumid && *aumid) {
             out.name = name;
+            out.lower = ToLower(name);
             out.target = std::wstring(L"shell:AppsFolder\\") + aumid;
             out.isStore = true;
             ok = true;
@@ -229,6 +231,7 @@ static void ScanPathExes(std::vector<AppEntry>& out) {
             std::wstring fn = fd.cFileName;
             auto dot = fn.rfind(L'.');
             e.name = (dot == std::wstring::npos) ? fn : fn.substr(0, dot);
+            e.lower = ToLower(e.name);
             e.isStore = false;
             out.push_back(std::move(e));
             if (++perDir > 150 || out.size() >= 6000) break;
@@ -236,6 +239,123 @@ static void ScanPathExes(std::vector<AppEntry>& out) {
         FindClose(h);
         dirsScanned++;
         if (out.size() >= 6000) return;
+    }
+}
+
+// Decode one "..." JSON string; *p must point at the opening quote.
+static bool DecodeJsonString(const char*& p, const char* end, std::wstring& out) {
+    std::string raw;
+    p++; // opening quote
+    while (p < end && *p != '"') {
+        if (*p == '\\' && p + 1 < end) {
+            p++;
+            char e = *p++;
+            if (e == 'u' && p + 4 <= end) {
+                unsigned v = 0;
+                for (int k = 0; k < 4; k++) {
+                    char h = *p++;
+                    v <<= 4;
+                    if (h >= '0' && h <= '9') v += (unsigned)(h - '0');
+                    else if (h >= 'a' && h <= 'f') v += (unsigned)(h - 'a' + 10);
+                    else if (h >= 'A' && h <= 'F') v += (unsigned)(h - 'A' + 10);
+                }
+                if (v < 0x80) raw += (char)v;
+                else if (v < 0x800) {
+                    raw += (char)(0xC0 | (v >> 6));
+                    raw += (char)(0x80 | (v & 63));
+                } else {
+                    raw += (char)(0xE0 | (v >> 12));
+                    raw += (char)(0x80 | ((v >> 6) & 63));
+                    raw += (char)(0x80 | (v & 63));
+                }
+            } else if (e == 'n') raw += '\n';
+            else if (e == 't') raw += '\t';
+            else if (e == 'r') raw += '\r';
+            else raw += e;
+        } else {
+            raw += *p++;
+        }
+    }
+    if (p < end) p++; // closing quote
+    int n = MultiByteToWideChar(CP_UTF8, 0, raw.c_str(), (int)raw.size(), NULL, 0);
+    if (n <= 0) return false;
+    out.assign((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, raw.c_str(), (int)raw.size(), out.data(), n);
+    return true;
+}
+
+// Tertiary source: Get-StartApps lists desktop + Store apps exactly like
+// Start Menu search does (Camera, ...). One hidden PowerShell run, one-time
+// cost on the background indexer thread; dedupe merges overlaps.
+static void ScanStartAppsPS(std::vector<AppEntry>& out) {
+    wchar_t tmp[MAX_PATH];
+    if (!GetTempPathW(MAX_PATH, tmp)) return;
+    std::wstring file = std::wstring(tmp) + L"SneekPeek_apps_" +
+        std::to_wstring(GetCurrentProcessId()) + L".json";
+    std::wstring cmd = L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress | Out-File -Encoding utf8 '" +
+        file + L"'\"";
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> cmdLine(cmd.begin(), cmd.end());
+    cmdLine.push_back(L'\0');
+    if (!CreateProcessW(NULL, cmdLine.data(), NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+        return;
+    bool done = WaitForSingleObject(pi.hProcess, 20000) == WAIT_OBJECT_0;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    if (!done) return;
+
+    HANDLE hf = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, 0, NULL);
+    std::string data;
+    if (hf != INVALID_HANDLE_VALUE) {
+        char buf[8192];
+        DWORD rd = 0;
+        while (ReadFile(hf, buf, sizeof(buf), &rd, NULL) && rd) {
+            data.append(buf, rd);
+            if (data.size() > 1048576) break;
+        }
+        CloseHandle(hf);
+    }
+    DeleteFileW(file.c_str());
+    if (data.size() > 3 && (unsigned char)data[0] == 0xEF &&
+        (unsigned char)data[1] == 0xBB && (unsigned char)data[2] == 0xBF)
+        data.erase(0, 3); // PS5.1 UTF-8 BOM
+
+    size_t pos = 0;
+    while (pos < data.size() && out.size() < 6000) {
+        size_t kn = data.find("\"Name\"", pos);
+        if (kn == std::string::npos) break;
+        size_t q1 = data.find('"', kn + 6);
+        if (q1 == std::string::npos) break;
+        const char* pp = data.c_str() + q1;
+        const char* end = data.c_str() + data.size();
+        std::wstring name;
+        if (!DecodeJsonString(pp, end, name)) { pos = q1 + 1; continue; }
+        size_t ka = data.find("\"AppID\"", (size_t)(pp - data.c_str()));
+        if (ka == std::string::npos) { pos = q1 + 1; continue; }
+        size_t q2 = data.find('"', ka + 7);
+        if (q2 == std::string::npos) break;
+        pp = data.c_str() + q2;
+        std::wstring appid;
+        if (!DecodeJsonString(pp, end, appid)) { pos = q2 + 1; continue; }
+        pos = (size_t)(pp - data.c_str());
+        if (name.empty() || appid.empty()) continue;
+        AppEntry e;
+        e.name = name;
+        e.lower = ToLower(name);
+        if (appid.find(L'!') != std::wstring::npos) {
+            e.target = L"shell:AppsFolder\\" + appid; // Store app
+            e.isStore = true;
+        } else {
+            e.target = appid; // classic app: full .lnk path
+            e.isStore = false;
+        }
+        out.push_back(std::move(e));
     }
 }
 
@@ -254,6 +374,7 @@ void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes) {
         ScanLnkDir(buf, out);
     ScanStoreApps(out);
     ScanStoreAppsFallback(out); // second COM route; dedupe merges overlaps
+    ScanStartAppsPS(out);       // PowerShell Start list; dedupe merges
     if (includePathExes)
         ScanPathExes(out);
 
@@ -261,8 +382,7 @@ void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes) {
 
     // Sort by name; .lnk wins ties over Store/PATH dupes. Then de-dupe.
     std::sort(out.begin(), out.end(), [](const AppEntry& a, const AppEntry& b) {
-        std::wstring x = ToLower(a.name), y = ToLower(b.name);
-        if (x != y) return x < y;
+        if (a.lower != b.lower) return a.lower < b.lower;
         return (a.isStore ? 1 : 0) < (b.isStore ? 1 : 0);
     });
     std::vector<AppEntry> uniq;
@@ -270,10 +390,9 @@ void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes) {
     std::wstring prev;
     bool first = true;
     for (auto& e : out) {
-        std::wstring k = ToLower(e.name);
-        if (!first && k == prev) continue;
+        if (!first && e.lower == prev) continue;
+        prev = e.lower;
         uniq.push_back(std::move(e));
-        prev = k;
         first = false;
     }
     out.swap(uniq);
@@ -342,7 +461,7 @@ std::vector<ScoredApp> SearchApps(const std::vector<AppEntry>& apps,
     std::vector<ScoredApp> hits;
     hits.reserve(32);
     for (const auto& app : apps) {
-        int s = FuzzyScore(ToLower(app.name), q);
+        int s = FuzzyScore(app.lower, q);
         if (s >= 0) hits.push_back({&app, s});
     }
     std::sort(hits.begin(), hits.end(),

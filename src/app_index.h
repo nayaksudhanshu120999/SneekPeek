@@ -8,6 +8,7 @@
 struct AppEntry {
     std::wstring name;    // display name ("Visual Studio Code", "Camera")
     std::wstring target;  // .lnk path, or "shell:AppsFolder\<AUMID>" for Store
+    std::wstring lower;   // cached lowercase name (hot-path searches, no allocs)
     bool isStore = false; // Store apps launch via explorer.exe + target
 };
 

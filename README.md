@@ -3,7 +3,7 @@
 One hotkey. One text box. Zero idle cost.
 
 - Press **Ctrl+Space** → only a search bar appears (nothing else until you type).
-- Type → fuzzy **app search** (Start Menu programs, exe-targets only, plus Microsoft Store apps), **power/quick chips**, **bang previews**, **web search** with live **online suggestions** (Local / Online sections), calculator.
+- Type → fuzzy **app search** (Start Menu programs, exe-targets only, plus Microsoft Store apps), **power/bang/quick chips**, **web search**, calculator.
 - **Enter** runs the top result — the palette hides instantly, before the app even opens. Click anywhere outside (or `Esc`) → it disappears.
 - Next **Ctrl+Space** → fresh empty bar.
 - Tray icon → **Settings… / Refresh apps / Run at startup / Quit**.
@@ -16,8 +16,8 @@ Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 | Input | Action |
 |---|---|
 | `code` | fuzzy-matches apps (`Visual Studio Code`), Enter launches |
-| `anything else` | Enter → web search with your engine (default DuckDuckGo) + live online suggestions below, grouped under Local / Online |
-| `yt` | matching site bangs appear as rows — Enter (or `yt` + `Space`) arms the chip: just the pill in the bar, no list — type the query, Enter searches (Backspace on empty query or click `x` exits) |
+| `anything else` | Enter → web search with your engine (default DuckDuckGo) |
+| `yt` | matching site bangs appear as chips above the list — Enter arms the chip (`yt` + `Space` does the same): just the pill in the bar, no list — type the query, Enter searches (Backspace on empty query or click `x` exits) |
 | `!g cats` | one-shot bang without the chip (Google for `cats`) |
 | `shu` | power chips appear above the list (Shut down, Restart, Sleep, Hibernate) — Enter runs the selected chip, Tab cycles, Down jumps to the list |
 | `gmail` | quick-link chips (fixed URLs, no query) work the same way — Enter opens |
@@ -85,7 +85,7 @@ Tray → **Settings…** (tabbed, dark, matches the app — every change saves i
 ## Why it uses (almost) nothing
 
 - One hidden `HWND` + blocking `GetMessage` loop → thread sleeps until an event. No timers, no polling → **0% CPU**.
-- App index is a single `vector<{name, path}>` built **once** on a background thread (Start Menu `.lnk` targets resolved to keep exe-tools only, Store apps enumerated via `shell:AppsFolder`), then the thread exits. No icon extraction, no file watchers → **~1–3 MB** total.
+- App index is a single `vector<{name, path}>` with cached lowercase names, built **once** on a background thread (Start Menu `.lnk` targets resolved to keep exe-tools only, Store apps via `shell:AppsFolder` ×2 COM routes plus `Get-StartApps`), then the thread exits. No icon extraction, no file watchers → **~1–3 MB** total.
 - Global hotkey via `RegisterHotKey` (OS-level, no low-level keyboard hook).
 - Dismiss-on-click-outside via `WM_ACTIVATE` + `WM_ACTIVATEAPP` (no mouse hook).
 - `WS_EX_TOOLWINDOW` → no taskbar button; single instance via mutex.
