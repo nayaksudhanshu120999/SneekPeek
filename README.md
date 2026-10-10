@@ -4,7 +4,7 @@ One hotkey. One text box. Zero idle cost.
 
 - Press **Ctrl+Space** → only a search bar appears (nothing else until you type).
 - Type → fuzzy **app search** (Start Menu, exe-only, plus Store apps), **system settings pages**, **power/awake/bang/quick chips**, **web search** with live **online suggestions** (<0.5s), calculator — grouped under one header per section.
-- **Enter** runs the top result — the palette hides instantly, before the app even opens. Click anywhere outside (or `Esc`) → it disappears.
+- **Enter** always runs the top *actionable* result (never a section heading — with nothing selected it searches the typed text) — the palette hides instantly, before the app even opens. Click anywhere outside (or `Esc`) → it disappears. Failed launches report a tray balloon; clicking it reopens the palette to retry.
 - Next **Ctrl+Space** → fresh empty bar.
 - Tray icon → **Settings… / Refresh apps / Run at startup / Quit**.
 - Background: a single blocking `GetMessage` loop — **0% CPU**, **~1–3 MB RAM**, no polling, no hooks, no services.
@@ -45,7 +45,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release
 ```
 
-The last line runs the unit tests (calculator incl. divide-by-zero and `-2^2` precedence, fuzzy ranking, bang parsing, URL detection).
+The last line runs the unit tests (calculator incl. divide-by-zero and `-2^2` precedence, fuzzy ranking, bang parsing, URL detection, JSON decoding, settings caps, Enter-key decision table).
 
 No compiler yet? One line (then reopen the terminal and re-run `build.bat`):
 
@@ -85,8 +85,9 @@ Tray → **Settings…** (tabbed, dark, matches the app — every change saves i
 
 - **General** — engine (DuckDuckGo / Google / Bing / Brave / Custom URL with `%s`), browser for web + bang + quick links (System default or picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe`), online suggestions on/off (sends typed text to DuckDuckGo; off = fully local)
 - **Hidden apps** — checkbox list of every indexed app; checked ones never appear in suggestions
-- **Bangs** — table (Aliases / Name / URL): Add appends an editable row, double-click any cell to edit in place, Del removes rows, colors auto-picked
+- **Bangs** — table (Aliases / Name / URL): Add appends an editable row, double-click any cell to edit in place, Del or Remove deletes rows, colors auto-picked
 - **Quick links** — table (Name / URL) with the same editing; typing the name in the palette shows a chip that opens the fixed URL on Enter (e.g. Gmail)
+- Every settings change saves instantly with a `Saved` timestamp; layout and fonts follow the monitor DPI, and Settings opens on the monitor you're using
 
 ## Why it uses (almost) nothing
 

@@ -263,12 +263,13 @@ inline std::vector<BrowserOpt> DetectBrowsers() {
 }
 
 // Open a URL in the chosen browser (empty path = system default handler).
-inline void OpenUrl(const std::wstring& url, const std::wstring& browserPath) {
-    if (url.empty()) return;
+// Returns the ShellExecute result (>32 = launched); empty URL is a no-op success.
+inline HINSTANCE OpenUrl(const std::wstring& url, const std::wstring& browserPath) {
+    if (url.empty()) return (HINSTANCE)33;
     if (browserPath.empty()) {
-        ShellExecuteW(NULL, L"open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        return ShellExecuteW(NULL, L"open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
     } else {
         std::wstring params = L"\"" + url + L"\"";
-        ShellExecuteW(NULL, L"open", browserPath.c_str(), params.c_str(), NULL, SW_SHOWNORMAL);
+        return ShellExecuteW(NULL, L"open", browserPath.c_str(), params.c_str(), NULL, SW_SHOWNORMAL);
     }
 }

@@ -51,6 +51,7 @@
 #include "calc.h"
 #include "settings.h"
 #include "syspages.h"
+#include "results.h"
 #include "resource.h"
 
 #pragma comment(lib, "user32.lib")
@@ -82,14 +83,21 @@ static const UINT ID_TRAY_STARTUP   = 1003;
 static const UINT ID_TRAY_QUIT      = 1004;
 static const UINT ID_TRAY_AWAKE     = 1005;
 
-static const int kWidth = 600;
-static const int kInputH = 44;
-static const int kItemH = 38; // single-line rows + slim headers
+static int g_dpi = 96; // refreshed on WM_DPICHANGED
+static int Dpx(int px) { return MulDiv(px, g_dpi, 96); }
+// Layout metrics scale with DPI (recomputed by UpdateLayoutMetrics).
+static int kWidth = 600;
+static int kInputH = 44;
+static int kItemH = 38; // single-line rows + slim headers
 static const int kMaxItems = 9;
-static const int kCornerR = 14;
-static const int kChipH = 28;
-static const int kChipRowH = 40;
+static int kCornerR = 14;
+static int kChipH = 28;
+static int kChipRowH = 40;
 static const int kMaxChips = 4;
+static void UpdateLayoutMetrics() {
+    kWidth = Dpx(600); kInputH = Dpx(44); kItemH = Dpx(38);
+    kCornerR = Dpx(14); kChipH = Dpx(28); kChipRowH = Dpx(40);
+}
 
 // Settings control IDs
 enum {
@@ -175,6 +183,7 @@ static HWND        g_hwndEngineCombo = NULL;
 static HWND        g_hwndEngineUrl = NULL;
 static HWND        g_hwndBrowserCombo = NULL;
 static HWND        g_hwndChkOnline = NULL;
+static HWND        g_hwndSavedLabel = NULL; // "Saved HH:MM:SS" indicator
 static HWND        g_hwndAppsList = NULL;
 static HWND        g_hwndBangsList = NULL;
 static HWND        g_hwndQuickList = NULL;
@@ -189,6 +198,31 @@ static HFONT       g_fontTitle = NULL;
 static HFONT       g_fontSub = NULL;
 static HFONT       g_fontChip = NULL;
 static HFONT       g_fontUI = NULL; // Segoe UI for all Settings controls
+static void DeleteAppFonts() {
+    HFONT fonts[] = {g_fontInput, g_fontTitle, g_fontSub, g_fontChip, g_fontUI};
+    for (size_t i = 0; i < 5; i++)
+        if (fonts[i]) DeleteObject(fonts[i]);
+    g_fontInput = g_fontTitle = g_fontSub = g_fontChip = g_fontUI = NULL;
+}
+static void CreateAppFonts() {
+    DeleteAppFonts();
+    int dpiY = g_dpi;
+    g_fontInput = CreateFontW(-MulDiv(15, dpiY, 72), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    g_fontTitle = CreateFontW(-MulDiv(11, dpiY, 72), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    g_fontSub = CreateFontW(-MulDiv(9, dpiY, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    g_fontChip = CreateFontW(-MulDiv(10, dpiY, 72), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    g_fontUI = CreateFontW(-MulDiv(9, dpiY, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+}
 static HBRUSH      g_brBg = NULL;
 static HBRUSH      g_brInput = NULL;
 static HBRUSH      g_brSel = NULL;
@@ -242,15 +276,7 @@ static int  g_chipSel = 0;
 static bool g_chipsFocus = false; // true = Enter runs the chip, list has no selection
 static int  g_confirmPower = -1;  // armed PowerOp awaiting a second Enter
 
-enum class ResultKind { App, Web, Bang, Calc, Setting, Header, Online };
-struct ResultItem {
-    ResultKind kind;
-    std::wstring title;   // single line (headers, names, queries)
-    std::wstring sub;     // reserved, currently unused
-    std::wstring action;  // lnk path | shell:AppsFolder target | url | ms-settings: | calc text
-    COLORREF color;       // category accent color
-    bool isStore = false; // Store app: launch via explorer.exe
-};
+// Result model lives in results.h (shared with the unit tests).
 static std::vector<ResultItem> g_results;
 
 // Minimal black palette. Category accents: App blue, Web green, Calc amber,
@@ -300,6 +326,9 @@ static void DeactivateBang();
 static void CloseCellEdit(bool commit);
 static void ApplyAwake();
 static void RequestOnline(const std::wstring& q);
+static void SaveNow();
+static void ApplyUIFont(HWND parent);
+static void NotifyLaunchFailed(const wchar_t* msg);
 static int MoveSelNoWrap(int from, int dir);
 static void FillAppsList();
 static std::wstring LVGetCell(HWND lv, int row, int col);
@@ -386,6 +415,28 @@ static void ApplyRoundCorners() {
 }
 
 // ------------------------------------------------------------- show / hide
+static void LayoutPaletteChildren() {
+    // Child geometry in current metrics (no move/show of the top-level).
+    RECT cr; GetClientRect(g_hwndPalette, &cr);
+    int W = cr.right;
+    int editH = kInputH - Dpx(14);
+    int editY = Dpx(9);
+    SetWindowPos(g_hwndEdit, NULL, Dpx(16), editY, W - Dpx(32), editH, SWP_NOZORDER);
+    int chipY = editY + (editH - kChipH) / 2;
+    UINT chipFlags = SWP_NOZORDER | SWP_NOSIZE |
+        (IsWindowVisible(g_hwndChip) ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
+    SetWindowPos(g_hwndChip, NULL, Dpx(16), chipY, 0, 0, chipFlags);
+    UINT rowFlags = SWP_NOZORDER | SWP_NOSIZE |
+        (IsWindowVisible(g_hwndChipRow) ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
+    SetWindowPos(g_hwndChipRow, NULL, Dpx(16), kInputH, 0, 0, rowFlags);
+    if (IsWindowVisible(g_hwndList)) {
+        RECT lr; GetWindowRect(g_hwndList, &lr);
+        MapWindowPoints(NULL, g_hwndPalette, (POINT*)&lr, 2);
+        SetWindowPos(g_hwndList, NULL, Dpx(16), lr.top, W - Dpx(32),
+                     lr.bottom - lr.top, SWP_NOZORDER);
+    }
+}
+
 static void PlacePalette() {
     POINT pt{}; GetCursorPos(&pt);
     HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
@@ -397,12 +448,10 @@ static void PlacePalette() {
     int h = kInputH + kItemH;
     SetWindowPos(g_hwndPalette, HWND_TOPMOST, x, y, kWidth, h,
                  SWP_SHOWWINDOW | SWP_NOACTIVATE);
-    SetWindowPos(g_hwndEdit, NULL, 16, 9, kWidth - 32, 30, SWP_NOZORDER);
-    int chipY = 9 + (30 - kChipH) / 2;
-    SetWindowPos(g_hwndChip, NULL, 16, chipY, 10, kChipH, SWP_NOZORDER | SWP_HIDEWINDOW);
-    SetWindowPos(g_hwndChipRow, NULL, 16, kInputH, kWidth - 32, kChipRowH,
-                 SWP_NOZORDER | SWP_HIDEWINDOW);
-    SetWindowPos(g_hwndList, NULL, 16, kInputH, kWidth - 32, kItemH, SWP_NOZORDER);
+    LayoutPaletteChildren();
+    // Chips row + list start hidden until results arrive.
+    ShowWindow(g_hwndChipRow, SW_HIDE);
+    ShowWindow(g_hwndChip, SW_HIDE);
 }
 
 static void ShowPalette() {
@@ -450,14 +499,14 @@ static const Bang* ActiveBang() {
 static int ChipWidthFor(HDC dc, const std::wstring& text) {
     RECT r{0, 0, 0, 0};
     DrawTextW(dc, text.c_str(), -1, &r, DT_SINGLELINE | DT_CALCRECT);
-    return (r.right - r.left) + 10 + 24 + 8;
+    return (r.right - r.left) + Dpx(10) + Dpx(24) + Dpx(8);
 }
 
 // Single place that maps chip visibility -> edit text margins.
 static void ApplyEditMargins() {
     if (!g_hwndEdit) return;
     SendMessageW(g_hwndEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
-                 MAKELPARAM(g_bangChipW ? g_bangChipW + 8 : 10, 10));
+                 MAKELPARAM(g_bangChipW ? g_bangChipW + Dpx(8) : Dpx(10), Dpx(10)));
 }
 
 static void ActivateBang(int idx, const std::wstring& query) {
@@ -479,7 +528,7 @@ static void ActivateBang(int idx, const std::wstring& query) {
     int chH = boxH - 4;
     if (chH > kChipH) chH = kChipH;
     if (chH < 18) chH = 18;
-    int chipX = er.left + 2;
+    int chipX = er.left + Dpx(2);
     int chipY = er.top + (boxH - chH) / 2;
     // HWND_TOP: the chip must stay above the edit (which has WS_CLIPSIBLINGS
     // so it never paints over the chip). Synchronous paint: no blank flash.
@@ -519,24 +568,28 @@ static void RunPower(PowerOp op) {
     switch (op) {
     case PowerOp::Shutdown: {
         std::wstring exe = SystemExe(L"shutdown.exe");
-        if (!exe.empty())
-            ShellExecuteW(NULL, L"open", exe.c_str(), L"/s /t 0", NULL, SW_HIDE);
+        if (!exe.empty() &&
+            (UINT_PTR)ShellExecuteW(NULL, L"open", exe.c_str(), L"/s /t 0", NULL, SW_HIDE) <= 32)
+            NotifyLaunchFailed(L"Shutdown command failed");
         break;
     }
     case PowerOp::Restart: {
         std::wstring exe = SystemExe(L"shutdown.exe");
-        if (!exe.empty())
-            ShellExecuteW(NULL, L"open", exe.c_str(), L"/r /t 0", NULL, SW_HIDE);
+        if (!exe.empty() &&
+            (UINT_PTR)ShellExecuteW(NULL, L"open", exe.c_str(), L"/r /t 0", NULL, SW_HIDE) <= 32)
+            NotifyLaunchFailed(L"Restart command failed");
         break;
     }
     case PowerOp::Hibernate: {
         std::wstring exe = SystemExe(L"shutdown.exe");
-        if (!exe.empty())
-            ShellExecuteW(NULL, L"open", exe.c_str(), L"/h", NULL, SW_HIDE);
+        if (!exe.empty() &&
+            (UINT_PTR)ShellExecuteW(NULL, L"open", exe.c_str(), L"/h", NULL, SW_HIDE) <= 32)
+            NotifyLaunchFailed(L"Hibernate command failed");
         break;
     }
     case PowerOp::Sleep:
-        SetSuspendState(FALSE, FALSE, FALSE);
+        if (!SetSuspendState(FALSE, FALSE, FALSE))
+            NotifyLaunchFailed(L"Sleep failed");
         break;
     }
 }
@@ -735,7 +788,7 @@ static void RebuildListControl() {
     if (g_chipsFocus && !g_chips.empty())
         SendMessageW(g_hwndList, LB_SETCURSEL, (WPARAM)-1, 0);
     else
-        SendMessageW(g_hwndList, LB_SETCURSEL, MoveSelNoWrap(-1, +1), 0);
+        SendMessageW(g_hwndList, LB_SETCURSEL, FirstSelectable(g_results), 0);
 
     bool showChips = !g_chips.empty();
     size_t rows = g_results.size() > kMaxItems ? kMaxItems : g_results.size();
@@ -751,14 +804,14 @@ static void RebuildListControl() {
         ApplyRoundCorners();
         RECT cr; GetClientRect(g_hwndPalette, &cr);
         if (showChips)
-            SetWindowPos(g_hwndChipRow, NULL, 16, kInputH, cr.right - 32, kChipRowH,
+            SetWindowPos(g_hwndChipRow, NULL, Dpx(16), kInputH, cr.right - Dpx(32), kChipRowH,
                          SWP_NOZORDER | SWP_SHOWWINDOW);
         else
             ShowWindow(g_hwndChipRow, SW_HIDE);
         if (rows == 0)
             ShowWindow(g_hwndList, SW_HIDE); // bar-only: no list at all
         else
-            SetWindowPos(g_hwndList, NULL, 16, listY, cr.right - 32,
+            SetWindowPos(g_hwndList, NULL, Dpx(16), listY, cr.right - Dpx(32),
                          (int)rows * kItemH, SWP_NOZORDER | SWP_SHOWWINDOW);
     }
     // No background erase (controls paint every pixel themselves).
@@ -873,8 +926,10 @@ static void UpdateResults() {
             if (g_hidden.count(h.app->lower) == 0) appRows.push_back(MakeAppRow(*h.app));
         }
     } else {
-        ResultItem r{ResultKind::App, L"Indexing apps...", L"",
-                     L"", kAppCol};
+        // Loading indicator: a header, never selectable, so Enter during
+        // indexing falls through to web search instead of swallowing input.
+        ResultItem r{ResultKind::Header, L"Indexing apps...", L"",
+                     L"", kHintCol};
         appRows.push_back(std::move(r));
     }
 
@@ -921,7 +976,7 @@ static void UpdateResults() {
 
 static int CurrentSelection() {
     int sel = (int)SendMessageW(g_hwndList, LB_GETCURSEL, 0, 0);
-    if (sel < 0) return g_results.empty() ? -1 : 0;
+    if (sel < 0) return -1; // nothing selected: caller runs the typed-query fallback
     LPARAM data = SendMessageW(g_hwndList, LB_GETITEMDATA, sel, 0);
     if (data < 0 || data >= (LPARAM)g_results.size()) return -1;
     return (int)data;
@@ -964,7 +1019,8 @@ static void ExecuteChip(int idx) {
     if (c.data < 0 || c.data >= (int)g_settings.quicks.size()) return;
     std::wstring url = g_settings.quicks[(size_t)c.data].url;
     HidePalette(); // hide first: instant, never wait for the action
-    OpenUrl(url, g_settings.browserPath);
+    if ((UINT_PTR)OpenUrl(url, g_settings.browserPath) <= 32)
+        NotifyLaunchFailed(L"Browser launch failed");
 }
 
 static void ExecuteSelected(bool forceWeb) {
@@ -984,7 +1040,8 @@ static void ExecuteSelected(bool forceWeb) {
         std::wstring url = forceWeb ? ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q))
             : (q.empty() ? BangHome(b->url) : ExpandUrl(b->url, UrlEncodeQuery(q)));
         HidePalette(); // hide first: never wait for the browser
-        OpenUrl(url, g_settings.browserPath);
+        if ((UINT_PTR)OpenUrl(url, g_settings.browserPath) <= 32)
+            NotifyLaunchFailed(L"Browser launch failed");
         return;
     }
 
@@ -1001,41 +1058,49 @@ static void ExecuteSelected(bool forceWeb) {
             url = ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q));
         }
         HidePalette(); // hide first: never wait for the browser
-        OpenUrl(url, g_settings.browserPath);
+        if ((UINT_PTR)OpenUrl(url, g_settings.browserPath) <= 32)
+            NotifyLaunchFailed(L"Browser launch failed");
         return;
     }
 
-    int idx = CurrentSelection();
+    int idx = EffectiveSelection(CurrentSelection(), g_results);
     if (idx < 0) {
+        // No actionable selection (none, or a section heading): normal
+        // fallback runs the typed query as a web search.
         std::wstring url = ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q));
         HidePalette();
-        OpenUrl(url, g_settings.browserPath);
+        if ((UINT_PTR)OpenUrl(url, g_settings.browserPath) <= 32)
+            NotifyLaunchFailed(L"Browser launch failed");
         return;
     }
     ResultItem r = g_results[(size_t)idx]; // copy: HidePalette clears the vector
-    if (r.kind == ResultKind::Header) return; // section labels do nothing
     HidePalette(); // hide first: never wait for the target app
     switch (r.kind) {
     case ResultKind::App:
         if (r.action.empty()) break;
         if (r.isStore) {
             wchar_t winDir[MAX_PATH];
+            HINSTANCE ok = NULL;
             if (GetWindowsDirectoryW(winDir, MAX_PATH)) {
                 std::wstring exe = std::wstring(winDir) + L"\\explorer.exe";
-                ShellExecuteW(NULL, L"open", exe.c_str(), r.action.c_str(), NULL, SW_SHOWNORMAL);
+                ok = ShellExecuteW(NULL, L"open", exe.c_str(), r.action.c_str(), NULL, SW_SHOWNORMAL);
             }
+            if ((UINT_PTR)ok <= 32) NotifyLaunchFailed(L"Couldn't open this app");
         } else {
-            ShellExecuteW(NULL, L"open", r.action.c_str(), NULL, NULL, SW_SHOWNORMAL);
+            if ((UINT_PTR)ShellExecuteW(NULL, L"open", r.action.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
+                NotifyLaunchFailed(L"Couldn't open this app");
         }
         break;
     case ResultKind::Web:
     case ResultKind::Bang:
     case ResultKind::Online:
-        OpenUrl(r.action, g_settings.browserPath);
+        if ((UINT_PTR)OpenUrl(r.action, g_settings.browserPath) <= 32)
+            NotifyLaunchFailed(L"Browser launch failed");
         break;
     case ResultKind::Setting:
-        if (!r.action.empty())
-            ShellExecuteW(NULL, L"open", r.action.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        if (!r.action.empty() &&
+            (UINT_PTR)ShellExecuteW(NULL, L"open", r.action.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
+            NotifyLaunchFailed(L"Couldn't open this settings page");
         break;
     case ResultKind::Calc:
         CopyText(r.action);
@@ -1204,10 +1269,10 @@ static LRESULT CALLBACK ChipProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         SetBkMode(dc, TRANSPARENT);
         SelectObject(dc, g_fontChip);
         SetTextColor(dc, RGB(255, 255, 255));
-        RECT tr = r; tr.left += 10; tr.right -= 24;
+        RECT tr = r; tr.left += Dpx(10); tr.right -= Dpx(24);
         DrawTextW(dc, text.c_str(), -1, &tr,
                   DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-        RECT xr = r; xr.left = xr.right - 20;
+        RECT xr = r; xr.left = xr.right - Dpx(20);
         DrawTextW(dc, L"x", -1, &xr, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
         EndPaint(hwnd, &ps);
         return 0;
@@ -1215,7 +1280,7 @@ static LRESULT CALLBACK ChipProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     case WM_LBUTTONDOWN: {
         RECT r; GetClientRect(hwnd, &r);
         int x = GET_X_LPARAM(l);
-        if (x >= r.right - 24) {
+        if (x >= r.right - Dpx(24)) {
             DeactivateBang(); // clicked the x
             UpdateResults();
         }
@@ -1231,11 +1296,11 @@ static LRESULT CALLBACK ChipProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
 static int ChipTextW(HDC dc, const std::wstring& text) {
     RECT r{0, 0, 0, 0};
     DrawTextW(dc, text.c_str(), -1, &r, DT_SINGLELINE | DT_CALCRECT);
-    return (r.right - r.left) + 32;
+    return (r.right - r.left) + Dpx(32);
 }
 static void LayoutChipRects(const RECT& client) {
     g_chipRects.clear();
-    int x = 12;
+    int x = Dpx(12);
     int h = 28;
     int y = (client.bottom - client.top - h) / 2;
     HDC dc = GetDC(g_hwndChipRow);
@@ -1244,7 +1309,7 @@ static void LayoutChipRects(const RECT& client) {
         int w = ChipTextW(dc, c.title);
         RECT r{x, y, x + w, y + h};
         g_chipRects.push_back(r);
-        x += w + 8;
+        x += w + Dpx(8);
     }
     SelectObject(dc, old);
     ReleaseDC(g_hwndChipRow, dc);
@@ -1273,14 +1338,19 @@ static LRESULT CALLBACK ChipRowProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             DrawTextW(dc, c.title.c_str(), -1, &tr,
                       DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS);
         }
-        // Tiny hint at the right end (only when it does not overlap chips).
-        if (!g_chipRects.empty() &&
-            g_chipRects.back().right < cl.right - 190) {
+        // Low-contrast key guide at the right end (only when it fits).
+        if (!g_chipRects.empty()) {
+            const wchar_t* hint = L"\u2191\u2193 move \u00B7 Enter open \u00B7 Shift+Enter web \u00B7 Esc close";
             SelectObject(dc, g_fontSub);
-            SetTextColor(dc, kSub);
-            RECT hr = cl; hr.left = hr.right - 190;
-            DrawTextW(dc, L"Enter runs - Tab switch", -1, &hr,
-                      DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
+            RECT hr{0, 0, 0, 0};
+            DrawTextW(dc, hint, -1, &hr, DT_SINGLELINE | DT_CALCRECT);
+            int hw = hr.right - hr.left;
+            if (g_chipRects.back().right + Dpx(12) + hw < cl.right - Dpx(8)) {
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, kSub);
+                RECT rr = cl; rr.left = rr.right - Dpx(8) - hw;
+                DrawTextW(dc, hint, -1, &rr, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
+            }
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -1311,7 +1381,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         SendMessageW(g_hwndEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search");
         SendMessageW(g_hwndEdit, WM_SETFONT, (WPARAM)g_fontInput, TRUE);
         SendMessageW(g_hwndEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
-                     MAKELPARAM(10, 10));
+                     MAKELPARAM(Dpx(10), Dpx(10)));
         SetWindowSubclass(g_hwndEdit, EditSubclass, 1, 0);
 
         g_hwndChip = CreateWindowExW(0, kChipClass, L"",
@@ -1447,6 +1517,27 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         if (!w && IsWindowVisible(hwnd))
             HidePalette();
         break;
+    case WM_DPICHANGED: {
+        g_dpi = HIWORD(w);
+        UpdateLayoutMetrics();
+        CreateAppFonts();
+        RECT* pr = (RECT*)l; // system-suggested rect for the new DPI
+        SetWindowPos(hwnd, HWND_TOPMOST, pr->left, pr->top,
+                     pr->right - pr->left, pr->bottom - pr->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        SendMessageW(g_hwndEdit, WM_SETFONT, (WPARAM)g_fontInput, TRUE);
+        if (g_hwndSettings) {
+            ApplyUIFont(g_hwndSettings);
+            InvalidateRect(g_hwndSettings, NULL, TRUE);
+        }
+        LayoutPaletteChildren();
+        ApplyRoundCorners();
+        if (g_activeBang >= 0) // re-measure the armed chip, keep the query
+            ActivateBang(g_activeBang, GetEditText(g_hwndEdit));
+        else
+            UpdateResults();
+        break;
+    }
     case WM_HOTKEY:
         if (w == HOTKEY_ID) {
             if (IsWindowVisible(hwnd)) HidePalette();
@@ -1484,6 +1575,8 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             ShowTrayMenu(hwnd);
         else if (LOWORD(l) == WM_LBUTTONDBLCLK)
             ShowPalette();
+        else if (LOWORD(l) == NIN_BALLOONUSERCLICK)
+            ShowPalette(); // retry after a launch-failure balloon
         break;
     case WM_DESTROY:
         RemoveTrayIcon(hwnd);
@@ -1494,6 +1587,20 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
 }
 
 // ------------------------------------------------------------- tray
+// Failure balloon: palette stays hidden (fast), the error surfaces here.
+// Clicking the balloon reopens the palette for a retry.
+static void NotifyLaunchFailed(const wchar_t* msg) {
+    if (!g_hwndPalette) return;
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = g_hwndPalette;
+    nid.uID = 1;
+    nid.uFlags = NIF_INFO;
+    wcsncpy_s(nid.szInfo, msg, _TRUNCATE);
+    wcsncpy_s(nid.szInfoTitle, L"SneekPeek", _TRUNCATE);
+    nid.dwInfoFlags = NIIF_WARNING;
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
 static void AddTrayIcon(HWND hwnd) {
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
@@ -1561,6 +1668,18 @@ static std::wstring LVGetCell(HWND lv, int row, int col) {
 }
 static int LVSelectedRow(HWND lv) {
     return ListView_GetNextItem(lv, -1, LVNI_SELECTED);
+}
+// Delete the selected table row (vector + listview) and persist.
+static void DeleteSelectedTableRow(HWND lv) {
+    int row = LVSelectedRow(lv);
+    if (row < 0) return;
+    if (lv == g_hwndBangsList && row < (int)g_settings.bangs.size())
+        g_settings.bangs.erase(g_settings.bangs.begin() + row);
+    else if (lv == g_hwndQuickList && row < (int)g_settings.quicks.size())
+        g_settings.quicks.erase(g_settings.quicks.begin() + row);
+    else return;
+    ListView_DeleteItem(lv, row);
+    SaveNow();
 }
 
 static void FillEngineCombo() {
@@ -1675,8 +1794,15 @@ static void DarkTitleBar(HWND hwnd) {
 static void OpenSettings() {
     if (g_hwndSettings) { ShowWindow(g_hwndSettings, SW_SHOW); SetForegroundWindow(g_hwndSettings); return; }
     int W = 600, H = 590;
-    int x = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
-    int y = (GetSystemMetrics(SM_CYSCREEN) - H) / 2;
+    POINT pt{}; GetCursorPos(&pt); // open on the monitor being used
+    HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi{ sizeof(mi) };
+    GetMonitorInfoW(mon, &mi);
+    int mw = mi.rcWork.right - mi.rcWork.left;
+    int mh = mi.rcWork.bottom - mi.rcWork.top;
+    int x = mi.rcWork.left + (mw - W) / 2;
+    int y = mi.rcWork.top + (mh - H) / 2;
+    if (y < mi.rcWork.top) y = mi.rcWork.top;
     g_hwndSettings = CreateWindowExW(0, kSettingsClass, L"SneekPeek Settings",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
         x, y, W, H, g_hwndPalette, NULL, g_hInst, NULL);
@@ -1717,6 +1843,13 @@ static void ReadHiddenFromList() {
 static void SaveNow() {
     SaveSettings(g_settings);
     RebuildHiddenSet();
+    if (g_hwndSavedLabel) {
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        wchar_t t[64];
+        swprintf_s(t, 64, L"Saved %02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+        SetWindowTextW(g_hwndSavedLabel, t);
+    }
 }
 
 // Engine + browser combos / custom URL -> settings -> disk.
@@ -1919,7 +2052,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         // Del removes, colors auto-picked, everything saves instantly)
         {
             page(g_pageBangs, NewCtrl(L"STATIC",
-                L"Add appends an editable row - double-click a cell to edit - Del removes:",
+                L"Add appends an editable row - double-click a cell to edit - Del/Remove deletes:",
                 WS_VISIBLE, 24, 52, 536, 20, hwnd, 0));
             g_hwndBangsList = page(g_pageBangs, NewCtrl(WC_LISTVIEWW, L"",
                 WS_VISIBLE | WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL |
@@ -1935,12 +2068,14 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             FillBangsList();
             page(g_pageBangs, NewCtrl(L"BUTTON", L"Add",
                 WS_VISIBLE, 24, 448, 100, 26, hwnd, IDC_BANG_ADD));
+            page(g_pageBangs, NewCtrl(L"BUTTON", L"Remove",
+                WS_VISIBLE, 134, 448, 100, 26, hwnd, IDC_BANG_DEL));
         }
 
         // ---- Quick links page (same in-place pattern, no query)
         {
             page(g_pageQuick, NewCtrl(L"STATIC",
-                L"Type the name in the palette - Enter opens the fixed URL. Del removes:",
+                L"Type the name in the palette - Enter opens the fixed URL - Del/Remove deletes:",
                 WS_VISIBLE, 24, 52, 536, 20, hwnd, 0));
             g_hwndQuickList = page(g_pageQuick, NewCtrl(WC_LISTVIEWW, L"",
                 WS_VISIBLE | WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL |
@@ -1955,6 +2090,8 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             FillQuickList();
             page(g_pageQuick, NewCtrl(L"BUTTON", L"Add",
                 WS_VISIBLE, 24, 448, 100, 26, hwnd, IDC_QUICK_ADD));
+            page(g_pageQuick, NewCtrl(L"BUTTON", L"Remove",
+                WS_VISIBLE, 134, 448, 100, 26, hwnd, IDC_QUICK_DEL));
         }
 
         // Shared bottom buttons (always visible).
@@ -1962,6 +2099,8 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 16, 512, 120, 30, hwnd, IDC_RESCAN);
         NewCtrl(L"BUTTON", L"Close", WS_VISIBLE,
                 146, 512, 100, 30, hwnd, IDC_CLOSE);
+        g_hwndSavedLabel = NewCtrl(L"STATIC", L"", WS_VISIBLE | SS_RIGHT,
+                380, 518, 188, 20, hwnd, 0);
 
         // Silence the edit-control beep in settings (Enter/Esc/Tab chars).
         HWND plainEdits[] = {g_hwndEngineUrl};
@@ -2235,6 +2374,10 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 SendMessageW(g_hwndBrowserCombo, CB_SETCURSEL, count - 1, 0);
                 SaveEngineBrowser(hwnd);
             }
+        } else if (id == IDC_BANG_DEL) {
+            DeleteSelectedTableRow(g_hwndBangsList);
+        } else if (id == IDC_QUICK_DEL) {
+            DeleteSelectedTableRow(g_hwndQuickList);
         } else if (id == IDC_BANG_ADD) {
             if ((int)g_settings.bangs.size() >= kMaxCustomEntries) {
                 MessageBoxW(hwnd, L"Bang list is full (200 entries).",
@@ -2282,6 +2425,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         g_hwndSettings = NULL;
         g_hwndCellEdit = NULL;
         g_hwndChkOnline = NULL;
+        g_hwndSavedLabel = NULL;
         g_cellLv = 0; g_cellRow = -1; g_cellCol = 0;
         g_hwndEngineCombo = g_hwndEngineUrl = g_hwndBrowserCombo = NULL;
         g_hwndAppsList = g_hwndBangsList = g_hwndQuickList = NULL;
@@ -2347,25 +2491,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     g_awakeOn = g_settings.awakeOn;
     if (g_awakeOn) ApplyAwake(); // restore the held-awake state silently
 
-    // Fonts + brushes (created once, tiny GDI footprint).
-    HDC screen = GetDC(NULL);
-    int dpiY = GetDeviceCaps(screen, LOGPIXELSY);
-    ReleaseDC(NULL, screen);
-    g_fontInput = CreateFontW(-MulDiv(15, dpiY, 72), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    g_fontTitle = CreateFontW(-MulDiv(11, dpiY, 72), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    g_fontSub = CreateFontW(-MulDiv(9, dpiY, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    g_fontChip = CreateFontW(-MulDiv(10, dpiY, 72), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    g_fontUI = CreateFontW(-MulDiv(9, dpiY, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    // Fonts scale with the monitor DPI (rebuilt on WM_DPICHANGED); brushes
+    // are solid colors, DPI-independent.
+    {
+        HDC screen = GetDC(NULL);
+        g_dpi = GetDeviceCaps(screen, LOGPIXELSY);
+        ReleaseDC(NULL, screen);
+    }
+    UpdateLayoutMetrics();
+    CreateAppFonts();
     g_brBg = CreateSolidBrush(kBg);
     g_brInput = CreateSolidBrush(kInput);
     g_brSel = CreateSolidBrush(kSel);

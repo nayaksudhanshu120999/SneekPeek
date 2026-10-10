@@ -10,6 +10,7 @@
 #include "bangs.h"
 #include "minjson.h"
 #include "settings.h"
+#include "results.h"
 #include "app_index.h"
 
 static int g_fail = 0;
@@ -92,6 +93,37 @@ int main() {
         CHECK(ParseColor(L"#FF0033", c) && c == RGB(255, 0, 51));
         CHECK(!ParseColor(L"notacolor", c));
         CHECK(SerializeColor(RGB(255, 0, 51)) == L"#FF0033");
+    }
+    // Enter-key decision table: headers are never actionable.
+    {
+        auto row = [](ResultKind k, const wchar_t* t) {
+            ResultItem r;
+            r.kind = k;
+            r.title = t;
+            r.color = RGB(0, 0, 0);
+            return r;
+        };
+        std::vector<ResultItem> list = {
+            row(ResultKind::Header, L"Apps"),
+            row(ResultKind::App, L"Notepad"),
+            row(ResultKind::Header, L"Web"),
+            row(ResultKind::Web, L"notepad"),
+        };
+        CHECK(EffectiveSelection(1, list) == 1);   // app row launches
+        CHECK(EffectiveSelection(3, list) == 3);   // web row searches
+        CHECK(EffectiveSelection(0, list) == -1);  // heading -> fallback
+        CHECK(EffectiveSelection(2, list) == -1);  // heading -> fallback
+        CHECK(EffectiveSelection(-1, list) == -1); // nothing -> fallback
+        CHECK(EffectiveSelection(99, list) == -1); // out of range -> fallback
+        CHECK(FirstSelectable(list) == 1);         // skips the heading
+        std::vector<ResultItem> headsOnly = {
+            row(ResultKind::Header, L"Apps"),
+            row(ResultKind::Header, L"Web"),
+        };
+        CHECK(FirstSelectable(headsOnly) == -1);
+        std::vector<ResultItem> empty;
+        CHECK(FirstSelectable(empty) == -1);
+        CHECK(EffectiveSelection(0, empty) == -1);
     }
     // JSON string decoding incl. UTF-16 surrogate pairs
     {
