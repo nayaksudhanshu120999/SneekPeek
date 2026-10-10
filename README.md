@@ -85,8 +85,8 @@ Tray → **Settings…** (tabbed, dark, matches the app — every change saves i
 
 - **General** — engine (DuckDuckGo / Google / Bing / Brave / Custom URL with `%s`), browser for web + bang + quick links (System default or picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe`), online suggestions on/off (sends typed text to DuckDuckGo; off = fully local)
 - **Hidden apps** — checkbox list of every indexed app; checked ones never appear in suggestions
-- **Bangs** — table (Aliases / Name / URL): Add appends an editable row, double-click any cell to edit in place, Del or Remove deletes rows, colors auto-picked
-- **Quick links** — table (Name / URL) with the same editing; typing the name in the palette shows a chip that opens the fixed URL on Enter (e.g. Gmail)
+- **Bangs** — table (Aliases / Name / URL, `https://` or `http://` only): Add appends an editable row, double-click any cell to edit in place, Del or Remove deletes rows, colors auto-picked
+- **Quick links** — table (Name / URL, `https://` or `http://` only) with the same editing; typing the name in the palette shows a chip that opens the fixed URL on Enter (e.g. Gmail)
 - Every settings change saves instantly with a `Saved` timestamp; layout and fonts follow the monitor DPI, and Settings opens on the monitor you're using
 
 ## Why it uses (almost) nothing

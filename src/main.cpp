@@ -340,24 +340,32 @@ static void RunPower(PowerOp op);
 // Publish pattern: the worker builds into a fresh vector, swaps it into an
 // atomic slot, and the UI thread adopts it on WM_APP_INDEX. The UI never
 // touches g_apps while the worker runs, so no lock is needed. Options are
-// captured on the UI thread before the worker starts.
+// captured on the UI thread before the worker starts. The worker thread is
+// joinable (never detached): shutdown sets the stop flag and joins it.
 static std::atomic<std::vector<AppEntry>*> g_pendingIndex{nullptr};
+static std::atomic<bool> g_indexStop{false};
+static std::thread g_indexThread; // guarded by g_indexing: join before reuse
 static const UINT WM_APP_INDEX = WM_APP + 22; // background index published
 static void BuildIndexAsync() {
     bool expected = false;
     if (!g_indexing.compare_exchange_strong(expected, true)) return; // already running
+    if (g_indexThread.joinable()) g_indexThread.join(); // reap finished worker
+    g_indexStop.store(false);
     bool pathExes = g_settings.includePathExes; // captured on the UI thread
-    std::thread([pathExes]{
+    g_indexThread = std::thread([pathExes]{
         SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
         std::vector<AppEntry> fresh;
-        BuildAppIndex(fresh, pathExes);
-        auto* old = g_pendingIndex.exchange(
-            new std::vector<AppEntry>(std::move(fresh)));
-        delete old; // drop a superseded pending index, if any
+        BuildAppIndex(fresh, pathExes, &g_indexStop);
+        if (!g_indexStop.load()) {
+            auto* old = g_pendingIndex.exchange(
+                new std::vector<AppEntry>(std::move(fresh)));
+            delete old; // drop a superseded pending index, if any
+            if (g_hwndPalette) PostMessageW(g_hwndPalette, WM_APP_INDEX, 0, 0);
+        }
+        // Stopped: drop results silently instead of publishing mid-shutdown.
         g_indexing.store(false);
         SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
-        if (g_hwndPalette) PostMessageW(g_hwndPalette, WM_APP_INDEX, 0, 0);
-    }).detach();
+    });
 }
 
 static void RebuildHiddenSet() {
@@ -1869,6 +1877,17 @@ static void SaveEngineBrowser(HWND owner) {
         SetWindowTextW(g_hwndEngineUrl, g_settings.engineUrl.c_str());
         return;
     }
+    if (esel == 4) {
+        std::wstring probe = eurl;
+        size_t pp = probe.find(L"%s");
+        if (pp != std::wstring::npos) probe.replace(pp, 2, L"test");
+        if (!IsSafeWebUrl(probe)) {
+            MessageBoxW(owner, L"Custom URL must be an https:// (or http://) address.",
+                        L"SneekPeek", MB_ICONWARNING | MB_OK);
+            SetWindowTextW(g_hwndEngineUrl, g_settings.engineUrl.c_str());
+            return;
+        }
+    }
     g_settings.engineName = names[esel];
     g_settings.engineUrl = urls[esel];
     int bsel = (int)SendMessageW(g_hwndBrowserCombo, CB_GETCURSEL, 0, 0);
@@ -1953,6 +1972,17 @@ static void CloseCellEdit(bool commit) {
                         L"SneekPeek", MB_ICONWARNING | MB_OK);
             return;
         }
+        {
+            std::wstring probe = b.url;
+            size_t pp = probe.find(L"%s");
+            if (pp != std::wstring::npos) probe.replace(pp, 2, L"test");
+            if (!IsSafeWebUrl(probe)) {
+                MessageBoxW(g_hwndSettings,
+                            L"Bang URL must be https:// (or http://) - change reverted.",
+                            L"SneekPeek", MB_ICONWARNING | MB_OK);
+                return;
+            }
+        }
         b.color = g_settings.bangs[(size_t)row].color;
         g_settings.bangs[(size_t)row] = b;
         LVSetCell(lv, row, 0, JoinAliases(b.aliases));
@@ -1964,9 +1994,9 @@ static void CloseCellEdit(bool commit) {
         std::wstring name = (col == 0) ? t : LVGetCell(lv, row, 0);
         std::wstring url = (col == 1) ? t : LVGetCell(lv, row, 1);
         QuickLink q{name, url};
-        if (q.name.empty() || q.url.find(L"://") == std::wstring::npos) {
+        if (q.name.empty() || !IsSafeWebUrl(q.url)) {
             MessageBoxW(g_hwndSettings,
-                        L"Need a name and a full URL like https://... - change reverted.",
+                        L"Need a name and an https:// (or http://) URL - change reverted.",
                         L"SneekPeek", MB_ICONWARNING | MB_OK);
             return;
         }
@@ -2584,10 +2614,21 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
         DispatchMessageW(&msg);
     }
 
+    g_indexStop.store(true); // stop the indexer, then join it (bounded: ~2s)
+    if (g_indexThread.joinable()) g_indexThread.join();
+    delete g_pendingIndex.exchange(nullptr); // published but never consumed
     if (g_onlineStop) SetEvent(g_onlineStop); // stop the suggestion worker
     if (g_onlineThread) {
-        WaitForSingleObject(g_onlineThread, 5000);
+        if (WaitForSingleObject(g_onlineThread, 5000) != WAIT_OBJECT_0) {
+            // Stuck inside WinHTTP: closing the session/connect from here
+            // aborts the pending call; the worker then exits promptly.
+            // Worst case a transient handle leaks in a dying process.
+            if (g_whSession) { WinHttpCloseHandle(g_whSession); g_whSession = NULL; }
+            if (g_whConnect) { WinHttpCloseHandle(g_whConnect); g_whConnect = NULL; }
+            WaitForSingleObject(g_onlineThread, 2000);
+        }
         CloseHandle(g_onlineThread);
+        g_onlineThread = NULL;
     }
     if (g_onlineEvent) CloseHandle(g_onlineEvent);
     if (g_onlineStop) CloseHandle(g_onlineStop);

@@ -266,6 +266,7 @@ inline std::vector<BrowserOpt> DetectBrowsers() {
 // Returns the ShellExecute result (>32 = launched); empty URL is a no-op success.
 inline HINSTANCE OpenUrl(const std::wstring& url, const std::wstring& browserPath) {
     if (url.empty()) return (HINSTANCE)33;
+    if (!IsSafeWebUrl(url)) return (HINSTANCE)0; // blocked scheme: caller balloons
     if (browserPath.empty()) {
         return ShellExecuteW(NULL, L"open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
     } else {

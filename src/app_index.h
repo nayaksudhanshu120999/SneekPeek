@@ -2,6 +2,7 @@
 // SneekPeek - app index: Start Menu (.lnk, exe-targets only) + Microsoft Store
 // (UWP) apps + optional PATH scan. Lazy one-time scan, ~100KB RAM, 0% idle CPU.
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -19,7 +20,14 @@ struct ScoredApp {
 
 // Scan Start Menu + Store apps + optional PATH exes. Runs once, on first hotkey.
 // Initializes COM on the calling thread (needed for .lnk resolve + Store enum).
-void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes);
+// `stop`, when set mid-scan, abandons remaining phases promptly.
+void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes,
+                   const std::atomic<bool>* stop = nullptr);
+
+// Build a double-null-terminated Unicode child environment block: the parent
+// block plus name=value (replacing any same-named entry), sorted
+// case-insensitively as CreateProcessW documents. Pure logic, unit-tested.
+std::wstring BuildChildEnv(const std::wstring& name, const std::wstring& value);
 
 // Fuzzy score: exact > prefix > word-boundary > substring > subsequence
 // (with consecutive / boundary bonuses). Returns -1 = no match.

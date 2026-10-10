@@ -212,6 +212,22 @@ inline bool IsUrlLike(const std::wstring& q, std::wstring& outUrl) {
     return true;
 }
 
+// Only plain web schemes survive: no file://, javascript:, data:, and no
+// quote/control characters that could break out of browser arguments.
+// Enforced at launch (OpenUrl) and at settings input; unit-tested.
+inline bool IsSafeWebUrl(const std::wstring& url) {
+    if (url.empty()) return false;
+    std::wstring low = BangLower(url);
+    bool okScheme = low.compare(0, 8, L"https://") == 0 ||
+                    low.compare(0, 7, L"http://") == 0;
+    if (!okScheme) return false;
+    for (wchar_t c : url) {
+        if (c < 0x20 || c == 0x7F) return false;
+        if (c == L'"') return false;
+    }
+    return true;
+}
+
 // Homepage fallback for empty bang queries: template minus %s and dangling ? & = /.
 inline std::wstring BangHome(const std::wstring& tmpl) {
     std::wstring u = tmpl;

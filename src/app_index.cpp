@@ -247,10 +247,34 @@ static void ScanPathExes(std::vector<AppEntry>& out) {
 
 // JSON string decoding lives in minjson.h (shared with the unit tests).
 
+std::wstring BuildChildEnv(const std::wstring& name, const std::wstring& value) {
+    std::vector<std::wstring> vars;
+    if (LPWCH parent = GetEnvironmentStringsW()) {
+        for (LPWCH p = parent; *p; p += wcslen(p) + 1)
+            vars.emplace_back(p);
+        FreeEnvironmentStringsW(parent);
+    }
+    std::wstring prefix = name + L"=";
+    vars.erase(std::remove_if(vars.begin(), vars.end(),
+        [&](const std::wstring& v) {
+            return v.size() >= prefix.size() &&
+                   _wcsnicmp(v.c_str(), prefix.c_str(), prefix.size()) == 0;
+        }), vars.end());
+    vars.push_back(prefix + value);
+    std::sort(vars.begin(), vars.end(), [](const std::wstring& a, const std::wstring& b) {
+        return _wcsicmp(a.c_str(), b.c_str()) < 0;
+    });
+    std::wstring block;
+    for (const auto& v : vars)
+        block.append(v.c_str(), v.size() + 1);
+    block.push_back(L'\0');
+    return block;
+}
+
 // Tertiary source: Get-StartApps lists desktop + Store apps exactly like
 // Start Menu search does (Camera, ...). One hidden PowerShell run, one-time
 // cost on the background indexer thread; dedupe merges overlaps.
-static void ScanStartAppsPS(std::vector<AppEntry>& out) {
+static void ScanStartAppsPS(std::vector<AppEntry>& out, const std::atomic<bool>* stop) {
     wchar_t tmp[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, tmp)) return;
     std::wstring file = std::wstring(tmp) + L"SneekPeek_apps_" +
@@ -262,17 +286,9 @@ static void ScanStartAppsPS(std::vector<AppEntry>& out) {
     if (GetSystemDirectoryW(sysDir, MAX_PATH))
         psExe = std::wstring(sysDir) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
     // Fixed script text: the output path travels in a private environment
-    // block, never interpolated into script (quote-proof by construction).
+    // block (sorted, deduplicated), never interpolated into script.
     std::wstring cmd = L"\"" + psExe + L"\" -NoProfile -NonInteractive -Command \"Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress | Out-File -Encoding utf8 $env:SNEEKPEEK_APPS_JSON\"";
-    std::wstring envBlock;
-    if (LPWCH parent = GetEnvironmentStringsW()) {
-        for (LPWCH p = parent; *p; p += wcslen(p) + 1)
-            envBlock.append(p, wcslen(p) + 1);
-        FreeEnvironmentStringsW(parent);
-    }
-    std::wstring var = L"SNEEKPEEK_APPS_JSON=" + file;
-    envBlock.append(var.c_str(), var.size() + 1);
-    envBlock.push_back(L'\0');
+    std::wstring envBlock = BuildChildEnv(L"SNEEKPEEK_APPS_JSON", file);
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
@@ -284,8 +300,15 @@ static void ScanStartAppsPS(std::vector<AppEntry>& out) {
                         CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
                         (LPVOID)envBlock.data(), NULL, &si, &pi))
         return;
-    bool done = WaitForSingleObject(pi.hProcess, 20000) == WAIT_OBJECT_0;
-    if (!done) TerminateProcess(pi.hProcess, 1); // stuck helper: kill, don't leak
+    bool done = false;
+    for (int i = 0; i < 20; i++) {
+        if (WaitForSingleObject(pi.hProcess, 1000) == WAIT_OBJECT_0) { done = true; break; }
+        if (stop && stop->load()) break; // shutting down: abandon the helper
+    }
+    if (!done) {
+        TerminateProcess(pi.hProcess, 1); // stuck helper: kill, don't leak
+        WaitForSingleObject(pi.hProcess, 5000); // let termination complete
+    }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
@@ -304,7 +327,13 @@ static void ScanStartAppsPS(std::vector<AppEntry>& out) {
         }
     }
     DeleteFileW(file.c_str()); // every exit path cleans the temp file
-    if (!done) return;
+    if (!done) {
+        // Best effort already made above (wait + terminate + wait); TEMP
+        // self-cleans anything left behind. One retry for slow filesystems:
+        Sleep(100);
+        DeleteFileW(file.c_str());
+        return;
+    }
     if (data.size() > 3 && (unsigned char)data[0] == 0xEF &&
         (unsigned char)data[1] == 0xBB && (unsigned char)data[2] == 0xBF)
         data.erase(0, 3); // PS5.1 UTF-8 BOM
@@ -342,7 +371,8 @@ static void ScanStartAppsPS(std::vector<AppEntry>& out) {
     }
 }
 
-void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes) {
+void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes,
+                   const std::atomic<bool>* stop) {
     out.clear();
     out.reserve(900);
 
@@ -356,8 +386,11 @@ void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes) {
     if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_COMMON_PROGRAMS, NULL, 0, buf)))
         ScanLnkDir(buf, out);
     ScanStoreApps(out);
+    if (stop && stop->load()) { if (com) CoUninitialize(); return; }
     ScanStoreAppsFallback(out); // second COM route; dedupe merges overlaps
-    ScanStartAppsPS(out);       // PowerShell Start list; dedupe merges
+    if (stop && stop->load()) { if (com) CoUninitialize(); return; }
+    ScanStartAppsPS(out, stop); // PowerShell Start list; dedupe merges
+    if (stop && stop->load()) { if (com) CoUninitialize(); return; }
     if (includePathExes)
         ScanPathExes(out);
 

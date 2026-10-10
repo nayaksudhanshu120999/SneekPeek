@@ -159,6 +159,39 @@ int main() {
         CHECK(!IsUrlLike(L"", u));
         CHECK(!IsUrlLike(L".com", u));
     }
+    // safe web schemes only (launch gate)
+    {
+        CHECK(IsSafeWebUrl(L"https://example.com/?q=x"));
+        CHECK(IsSafeWebUrl(L"http://example.com/"));
+        CHECK(IsSafeWebUrl(L"HTTPS://EXAMPLE.COM/"));
+        CHECK(!IsSafeWebUrl(L""));
+        CHECK(!IsSafeWebUrl(L"notaurl"));
+        CHECK(!IsSafeWebUrl(L"file:///C:/secret.txt"));
+        CHECK(!IsSafeWebUrl(L"FILE:///C:/secret.txt"));
+        CHECK(!IsSafeWebUrl(L"javascript:alert(1)"));
+        CHECK(!IsSafeWebUrl(L"data:text/html,hi"));
+        CHECK(!IsSafeWebUrl(L"https://example.com/\"quoted\""));
+        CHECK(!IsSafeWebUrl(L"https://example.com/a\tb"));
+    }
+    // child environment blocks: sorted, deduplicated, double-terminated
+    {
+        std::wstring block = BuildChildEnv(L"SNEEKPEEK_APPS_JSON", L"C:\\t\\o.json");
+        std::vector<std::wstring> vars;
+        for (const wchar_t* p = block.c_str(); *p; p += wcslen(p) + 1)
+            vars.push_back(p);
+        CHECK(block.size() >= 2 && block[block.size() - 1] == L'\0' &&
+              block[block.size() - 2] == L'\0');
+        int ours = 0;
+        for (const auto& v : vars) {
+            if (v.compare(0, 20, L"SNEEKPEEK_APPS_JSON=") == 0) {
+                ours++;
+                CHECK(v == L"SNEEKPEEK_APPS_JSON=C:\\t\\o.json");
+            }
+        }
+        CHECK(ours == 1); // exactly one, even if the parent already had one
+        for (size_t i = 1; i < vars.size(); i++)
+            CHECK(_wcsicmp(vars[i - 1].c_str(), vars[i].c_str()) <= 0);
+    }
     if (g_fail == 0) printf("ALL TESTS PASSED\n");
     return g_fail ? 1 : 0;
 }
