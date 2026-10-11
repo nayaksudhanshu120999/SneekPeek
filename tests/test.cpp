@@ -215,11 +215,13 @@ int main() {
         };
         std::vector<ResultItem> fl = {
             frow(ResultKind::Header, L"C:\\ - 2 items"),
+            frow(ResultKind::Explorer, L"Open in Explorer"),
             frow(ResultKind::Folder, L"docs"),
             frow(ResultKind::File, L"a.txt"),
         };
         CHECK(EffectiveSelection(1, fl) == 1);
         CHECK(EffectiveSelection(2, fl) == 2);
+        CHECK(EffectiveSelection(3, fl) == 3);
         CHECK(FirstSelectable(fl) == 1);
     }
     // single-level dir scan on a temp folder (no recursion, names only)
@@ -239,22 +241,31 @@ int main() {
         hf = CreateFileW(nested.c_str(), GENERIC_WRITE, 0, NULL,
                          CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+        // hidden entries stay out of the list (and the count)
+        std::wstring hidden = root + L"hidden.txt";
+        hf = CreateFileW(hidden.c_str(), GENERIC_WRITE, 0, NULL,
+                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+        SetFileAttributesW(hidden.c_str(), FILE_ATTRIBUTE_HIDDEN);
         std::vector<FileEntry> out;
         size_t total = 0;
         bool trunc = false;
         CHECK(ListDirOneLevel(root, out, total, trunc));
         CHECK(total == 2 && !trunc);
-        bool sawSub = false, sawFile = false, sawNested = false;
+        bool sawSub = false, sawFile = false, sawNested = false, sawHidden = false;
         for (const auto& e : out) {
             if (e.name == L"sub" && e.isDir) sawSub = true;
             if (e.name == L"a.txt" && !e.isDir) sawFile = true;
             if (e.name == L"nested.txt") sawNested = true;
+            if (e.name == L"hidden.txt") sawHidden = true;
         }
-        CHECK(sawSub && sawFile && !sawNested);
+        CHECK(sawSub && sawFile && !sawNested && !sawHidden);
         size_t badTotal = 0;
         bool badTrunc = false;
         CHECK(!ListDirOneLevel(L"Z:\\no\\such\\dir\\", out, badTotal, badTrunc));
+        SetFileAttributesW(hidden.c_str(), FILE_ATTRIBUTE_NORMAL);
         DeleteFileW(nested.c_str());
+        DeleteFileW(hidden.c_str());
         DeleteFileW(f1.c_str());
         RemoveDirectoryW(sub.c_str());
         RemoveDirectoryW(root.c_str());

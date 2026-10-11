@@ -9,13 +9,14 @@
 //   setting row  -> open the page
 //   folder row   -> drill into that path (file mode, stays open)
 //   file row     -> open the file directly
+//   explorer row -> open the path in Explorer (file mode)
 //   header/none  -> typed-query fallback (web search, or hide if empty;
 //                   file mode instead stays open with no fallback)
 #include <windows.h> // COLORREF
 #include <string>
 #include <vector>
 
-enum class ResultKind { App, Web, Bang, Calc, Setting, Header, Online, Folder, File };
+enum class ResultKind { App, Web, Bang, Calc, Setting, Header, Online, Folder, File, Explorer };
 
 struct ResultItem {
     ResultKind kind;

@@ -335,7 +335,8 @@ static bool InFileMode();
 static void ActivateFileMode(const std::wstring& dir);
 static void DeactivateFileMode();
 static void UpdateFileResults(const std::wstring& filter);
-static void ExecuteFileSelected();
+static void ExecuteFileSelected(bool inExplorer);
+static std::wstring SystemExe(const wchar_t* name);
 static void RebuildListControl();
 static int CurrentSelection();
 static void CloseCellEdit(bool commit);
@@ -716,6 +717,10 @@ static void UpdateFileResults(const std::wstring& filter) {
     ResultItem hh{ResultKind::Header, head, L"", L"", kHintCol};
     g_results.push_back(std::move(hh));
     if (filter.empty()) {
+        // Pinned quick action: no shortcut to remember, taught in place.
+        ResultItem ex{ResultKind::Explorer, L"Open in Explorer  (Shift+Enter)",
+                      L"", g_fileDir, kFolderCol};
+        g_results.push_back(std::move(ex));
         // Up entry: back to parent, or to drive list from a drive root.
         std::wstring parent = ParentDirOf(g_fileDir);
         ResultItem up{ResultKind::Folder, L"..", L"", parent, kFolderCol};
@@ -735,10 +740,43 @@ static void UpdateFileResults(const std::wstring& filter) {
     RebuildListControl();
 }
 
-// Enter in file mode: folders drill (stay open, rescan new path only),
-// files open directly. Headers / empty matches stay open (never web-search).
-static void ExecuteFileSelected() {
+// Enter/Space in file mode: folders drill (stay open, rescan new path only),
+// files open directly, Explorer rows open in Explorer. Headers / empty
+// matches stay open (never web-search). Shift+Enter opens the relevant path
+// in Explorer instead: selected folder/drive, reveal-selected file, or the
+// current folder as fallback.
+static void ExecuteFileSelected(bool inExplorer) {
     int idx = EffectiveSelection(CurrentSelection(), g_results);
+    if (inExplorer) {
+        std::wstring target; // folder to open
+        std::wstring params; // or explorer /select args for a file
+        std::wstring exe = SystemExe(L"explorer.exe");
+        if (exe.empty()) exe = L"explorer.exe";
+        if (idx >= 0) {
+            const ResultItem& r = g_results[(size_t)idx];
+            if (r.kind == ResultKind::Folder && !r.action.empty()) {
+                target = r.action; // selected folder/drive itself
+            } else if (r.kind == ResultKind::File && !r.action.empty()) {
+                params = L"/select,\"" + r.action + L"\""; // reveal the file
+            } else if (r.kind == ResultKind::Explorer && !r.action.empty()) {
+                target = r.action; // the pinned row: current folder
+            }
+        }
+        if (params.empty() && target.empty() && !g_fileDir.empty())
+            target = g_fileDir; // current folder fallback (dir level)
+        if (params.empty() && target.empty()) return; // drive list, nothing picked
+        HidePalette(); // hide first: never wait for Explorer
+        if (!params.empty()) {
+            if ((UINT_PTR)ShellExecuteW(NULL, L"open", exe.c_str(), params.c_str(),
+                                        NULL, SW_SHOWNORMAL) <= 32)
+                NotifyLaunchFailed(L"Couldn't open Explorer");
+        } else {
+            if ((UINT_PTR)ShellExecuteW(NULL, L"open", target.c_str(), NULL, NULL,
+                                        SW_SHOWNORMAL) <= 32)
+                NotifyLaunchFailed(L"Couldn't open this folder");
+        }
+        return;
+    }
     if (idx < 0) return; // header or nothing: stay open
     ResultItem r = g_results[(size_t)idx]; // copy: HidePalette clears state
     if (r.kind == ResultKind::Folder) {
@@ -761,6 +799,14 @@ static void ExecuteFileSelected() {
         HidePalette(); // hide first: never wait for the target
         if ((UINT_PTR)ShellExecuteW(NULL, L"open", full.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
             NotifyLaunchFailed(L"Couldn't open this file");
+        return;
+    }
+    if (r.kind == ResultKind::Explorer) {
+        if (r.action.empty()) return;
+        std::wstring dir = r.action; // copy: HidePalette clears file state
+        HidePalette(); // hide first: never wait for Explorer
+        if ((UINT_PTR)ShellExecuteW(NULL, L"open", dir.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
+            NotifyLaunchFailed(L"Couldn't open this folder");
         return;
     }
 }
@@ -1265,8 +1311,9 @@ static void ExecuteSelected(bool forceWeb) {
     }
 
     // File-browse mode: folders drill (stay open), files open. Never web-search.
+    // Shift+Enter opens the relevant path in Explorer instead.
     if (InFileMode()) {
-        ExecuteFileSelected();
+        ExecuteFileSelected(forceWeb);
         return;
     }
 
@@ -1340,6 +1387,12 @@ static void ExecuteSelected(bool forceWeb) {
         if (!r.action.empty() &&
             (UINT_PTR)ShellExecuteW(NULL, L"open", r.action.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
             NotifyLaunchFailed(L"Couldn't open this file");
+        break;
+    case ResultKind::Explorer:
+        // Reached only outside file mode (should not happen): open in Explorer.
+        if (!r.action.empty() &&
+            (UINT_PTR)ShellExecuteW(NULL, L"open", r.action.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
+            NotifyLaunchFailed(L"Couldn't open this folder");
         break;
     }
 }

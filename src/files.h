@@ -128,7 +128,8 @@ inline std::vector<std::wstring> GetLogicalDrivesWin32() {
     return out;
 }
 
-// Single-level scan of `dir` only. Skips "." / "..". Never recurses.
+// Single-level scan of `dir` only. Skips "." / ".." and hidden entries.
+// Never recurses.
 // out holds up to kMaxFileScan names; total is the true count (capped flag via
 // truncated=true when the dir holds more than the cap). False = dir unreadable.
 inline bool ListDirOneLevel(const std::wstring& dir, std::vector<FileEntry>& out,
@@ -146,6 +147,8 @@ inline bool ListDirOneLevel(const std::wstring& dir, std::vector<FileEntry>& out
             (fd.cFileName[1] == L'\0' ||
              (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0')))
             continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN)
+            continue; // hidden files/folders stay out of the list (and count)
         total++;
         if (out.size() < kMaxFileScan) {
             FileEntry e;
