@@ -2673,9 +2673,11 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             return TRUE;
         }
         if (d->CtlType != ODT_BUTTON) break;
-        DWORD bs = (DWORD)GetWindowLongW(d->hwndItem, GWL_STYLE);
-        bool isCheck = (bs & BS_TYPEMASK) == BS_CHECKBOX ||
-                       (bs & BS_TYPEMASK) == BS_AUTOCHECKBOX;
+        // The online-suggestions box is the only checkbox: detect by handle.
+        // Style-bit detection cannot work because NewCtrl ORs BS_OWNERDRAW
+        // onto buttons, which masks the AUTOCHECKBOX type bits. Owner-drawn
+        // buttons also never auto-toggle, so WM_COMMAND flips it manually.
+        bool isCheck = (d->hwndItem == g_hwndChkOnline);
         SetBkMode(dc, TRANSPARENT);
         SelectObject(dc, g_fontUI);
         if (isCheck) {
@@ -2851,6 +2853,15 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         } else if (id == IDC_ENGINE_URL && code == EN_KILLFOCUS) {
             SaveEngineBrowser(hwnd);
         } else if (id == IDC_CHK_ONLINE) {
+            // Owner-drawn buttons never auto-toggle: flip the state ourselves
+            // (programmatic BM_SETCHECK during setup sends no notification,
+            // so this only runs on real clicks).
+            if (code == BN_CLICKED && !g_fillingSettings) {
+                bool on = SendMessageW(g_hwndChkOnline, BM_GETCHECK, 0, 0) != BST_CHECKED;
+                SendMessageW(g_hwndChkOnline, BM_SETCHECK,
+                             on ? BST_CHECKED : BST_UNCHECKED, 0);
+                InvalidateRect(g_hwndChkOnline, NULL, FALSE);
+            }
             g_settings.onlineOn =
                 SendMessageW(g_hwndChkOnline, BM_GETCHECK, 0, 0) == BST_CHECKED;
             SaveSettings(g_settings);
