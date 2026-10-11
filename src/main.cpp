@@ -1198,13 +1198,15 @@ static void UpdateResults() {
 
     RequestOnline(q);
     std::vector<std::wstring> online;
-    AcquireSRWLockShared(&g_onlineLock);
-    if (g_onlineFor == q) online = g_online;
-    else {
-        auto cit = g_sugCache.find(q);
-        if (cit != g_sugCache.end()) online = cit->second;
-    }
-    ReleaseSRWLockShared(&g_onlineLock);
+    if (g_settings.onlineOn) {
+        AcquireSRWLockShared(&g_onlineLock);
+        if (g_onlineFor == q) online = g_online;
+        else {
+            auto cit = g_sugCache.find(q);
+            if (cit != g_sugCache.end()) online = cit->second;
+        }
+        ReleaseSRWLockShared(&g_onlineLock);
+    } // off = no online rows at all (cached ones stay stored, just hidden)
     if (online.size() > 3) online.resize(3);
 
     std::vector<ResultItem> appRows;
@@ -2677,30 +2679,40 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         SetBkMode(dc, TRANSPARENT);
         SelectObject(dc, g_fontUI);
         if (isCheck) {
-            // Toggle switch: track + sliding knob + explicit On/Off word.
-            // Position, color, and text all agree, so the state is unmistakable.
+            // Simple checkbox: square box + check mark, plain label beside it.
+            // State still comes from the button itself (BS_AUTOCHECKBOX
+            // toggles on click; ODS_CHECKED mirrors it), so only the
+            // painting changes here — the save path is untouched.
             FillRect(dc, &d->rcItem, g_brBg);
             bool on = (d->itemState & ODS_CHECKED) != 0;
-            int th = 22, tw = 46; // track size
-            int ty = d->rcItem.top + ((d->rcItem.bottom - d->rcItem.top) - th) / 2;
-            RECT track{d->rcItem.left + 2, ty, d->rcItem.left + 2 + tw, ty + th};
-            FillPill(dc, track, on ? Darken(kAppCol, 75) : RGB(38, 38, 42));
-            int kd = th - 6; // knob diameter
-            int kx = on ? track.right - 3 - kd : track.left + 3;
-            int ky = ty + 3;
-            {
-                Gdiplus::Graphics g(dc);
-                g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-                Gdiplus::SolidBrush br(on ? Gdiplus::Color(255, 255, 255, 255)
-                                           : Gdiplus::Color(255, 160, 160, 166));
-                g.FillEllipse(&br, kx, ky, kd, kd);
+            bool disabled = (d->itemState & ODS_DISABLED) != 0;
+            int bs = 16; // box size
+            int by = d->rcItem.top + ((d->rcItem.bottom - d->rcItem.top) - bs) / 2;
+            RECT box{d->rcItem.left + 2, by, d->rcItem.left + 2 + bs, by + bs};
+            HBRUSH bg = CreateSolidBrush(on ? RGB(29, 65, 115) : RGB(26, 26, 28));
+            HPEN pen = CreatePen(PS_SOLID, 1, disabled ? RGB(80, 80, 86)
+                                : ((d->itemState & ODS_FOCUS) ? RGB(130, 130, 140)
+                                                             : RGB(110, 110, 118)));
+            HGDIOBJ oldB = SelectObject(dc, bg);
+            HGDIOBJ oldP = SelectObject(dc, pen);
+            Rectangle(dc, box.left, box.top, box.right, box.bottom);
+            SelectObject(dc, oldB); SelectObject(dc, oldP);
+            DeleteObject(bg); DeleteObject(pen);
+            if (on) {
+                HPEN cp = CreatePen(PS_SOLID, 2,
+                                    disabled ? RGB(120, 120, 126) : RGB(255, 255, 255));
+                HGDIOBJ ocp = SelectObject(dc, cp);
+                MoveToEx(dc, box.left + 4, box.top + 8, NULL);
+                LineTo(dc, box.left + 7, box.top + 11);
+                LineTo(dc, box.left + 12, box.top + 5);
+                SelectObject(dc, ocp);
+                DeleteObject(cp);
             }
             wchar_t text[128] = {0};
             GetWindowTextW(d->hwndItem, text, 128);
-            std::wstring label = std::wstring(text) + (on ? L"  On" : L"  Off");
-            SetTextColor(dc, on ? kText : kSub);
-            RECT tr = d->rcItem; tr.left = track.right + 10;
-            DrawTextW(dc, label.c_str(), -1, &tr,
+            SetTextColor(dc, disabled ? kSub : kText);
+            RECT tr = d->rcItem; tr.left = box.right + 8;
+            DrawTextW(dc, text, -1, &tr,
                       DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
             return TRUE;
         }
