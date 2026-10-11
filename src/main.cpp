@@ -343,6 +343,7 @@ static void ExecuteFileSelected(bool inExplorer);
 static std::wstring SystemExe(const wchar_t* name);
 static void RebuildListControl();
 static int CurrentSelection();
+static void EnsureVisible(int sel);
 static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                                      UINT_PTR id, DWORD_PTR ref);
 static void CloseCellEdit(bool commit);
