@@ -202,6 +202,9 @@ int main() {
         CHECK(FormatFileCount(0) == L"0 items");
         CHECK(FormatFileCount(1) == L"1 item");
         CHECK(FormatFileCount(42) == L"42 items");
+        CHECK(DriveTitle(L"C:\\", L"Win 10") == L"Win 10 (C:)");
+        CHECK(DriveTitle(L"M:\\", L"Music") == L"Music (M:)");
+        CHECK(DriveTitle(L"D:\\", L"") == L"D:\\");
         // file rows are actionable like app rows (headers never are)
         auto frow = [](ResultKind k, const wchar_t* t) {
             ResultItem r;

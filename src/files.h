@@ -87,6 +87,31 @@ inline std::wstring FormatFileCount(size_t n) {
     return b;
 }
 
+// ------------------------------------------------------- drive labels
+// Volume name for one drive root ("C:\\" -> "Win 10", "" when unreadable).
+// Called only on file-mode entry / return-to-drives, never per keystroke,
+// so slow volumes (empty DVD, offline network) can't stall filtering.
+struct DriveInfo {
+    std::wstring root;  // "C:\\" (navigation target)
+    std::wstring label; // "Win 10" (may be empty)
+    std::wstring title; // "Win 10 (C:)" or "C:\\" (row text)
+};
+
+// Explorer-style row text. Pure, unit-tested.
+inline std::wstring DriveTitle(const std::wstring& root, const std::wstring& label) {
+    if (label.empty()) return root;
+    std::wstring letter = root.size() >= 2 ? root.substr(0, 2) : root; // "C:"
+    return label + L" (" + letter + L")";
+}
+
+inline std::wstring GetDriveLabel(const std::wstring& root) {
+    wchar_t vol[MAX_PATH + 1] = {0};
+    if (GetVolumeInformationW(root.c_str(), vol, MAX_PATH + 1,
+                              NULL, NULL, NULL, NULL, 0))
+        return vol;
+    return L"";
+}
+
 // ------------------------------------------------------- Win32 enumeration
 // Drive letters only ("C:\\"), no volume labels (those block on I/O).
 inline std::vector<std::wstring> GetLogicalDrivesWin32() {

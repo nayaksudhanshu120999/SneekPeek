@@ -25,7 +25,7 @@ Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 | `bluetooth` | matching Windows Settings pages under their own header — Enter opens the page |
 | `gmail` | quick-link chips (fixed URLs, no query) work the same way — Enter opens |
 | `12*8` | calculator (Enter copies result; undefined math like `1/0` shows nothing) |
-| `file` + `Space` | names-only file browser: drives appear, type to filter, `Enter` on a folder drills in (stays open), `Enter` on a file opens it; `..` / empty-box `Backspace` goes up, `x` or drive-level `Backspace` exits — one folder scanned at a time, no sizes/icons/recursion |
+| `file` + `Space` | names-only file browser: drives show as `Name (C:)` — type to filter, `Space`/`Enter` on a folder drills in (stays open), `Space`/`Enter` on a file opens it; long lists scroll with `↑` `↓` or mouse wheel (no scrollbar); `..` / empty-box `Backspace` goes up, `x` or drive-level `Backspace` exits — one folder scanned at a time, no sizes/icons/recursion |
 | `↑` `↓` | move selection (mirrors into the box without refiltering; wraps past either end back to your typed text; Up from the first row jumps back to the chips), `Enter` open, `Shift+Enter` force web search, `Esc` dismiss, `F5` rescan apps |
 
 Bang aliases are editable in Settings (default: `yt`/`youtube`, `gh`/`github`, `w`/`wiki`, `r`, `m`, `t`, `a`, `x`, `so`, `d`, `g` — each with its own color).

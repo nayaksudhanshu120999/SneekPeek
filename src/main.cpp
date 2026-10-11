@@ -588,6 +588,20 @@ static void DeactivateBang() {
 // listing. Only g_fileDir is ever scanned (one FindFirstFileW per refresh).
 static bool InFileMode() { return g_fileActive; }
 
+// Drive list cache: labels are read once per file-mode entry (and on return
+// to the drive list), never per keystroke, so volume I/O can't stall typing.
+static std::vector<DriveInfo> g_drives;
+static void RefreshDriveCache() {
+    g_drives.clear();
+    for (const auto& root : GetLogicalDrivesWin32()) {
+        DriveInfo d;
+        d.root = root;
+        d.label = GetDriveLabel(root);
+        d.title = DriveTitle(root, d.label);
+        g_drives.push_back(std::move(d));
+    }
+}
+
 static void PositionFileChip() {
     if (!g_hwndChip || !g_hwndEdit || !g_hwndPalette) return;
     HDC dc = GetDC(g_hwndPalette);
@@ -617,6 +631,7 @@ static void ActivateFileMode(const std::wstring& dir) {
     g_fileDir = dir.empty() ? L"" : EnsureTrailingSlash(dir);
     g_navigating = false;
     g_confirmPower = -1;
+    RefreshDriveCache(); // labels once per entry, not per keystroke
     PositionFileChip();
     g_changingEdit = true;
     SetWindowTextW(g_hwndEdit, L"");
@@ -646,24 +661,26 @@ static void UpdateFileResults(const std::wstring& filter) {
     g_results.reserve(9);
     std::wstring fl = FileLower(filter);
     if (g_fileDir.empty()) {
-        std::vector<std::wstring> drives = GetLogicalDrivesWin32();
+        if (g_drives.empty()) RefreshDriveCache(); // safety: labels ready
+        const size_t totalDrives = g_drives.size();
         std::vector<ResultItem> rows;
-        for (const auto& d : drives) {
-            if (!FileMatchesFilter(FileLower(d), fl)) continue;
-            ResultItem r{ResultKind::Folder, d, L"", d, kFolderCol};
+        for (const auto& d : g_drives) {
+            if (!FileMatchesFilter(FileLower(d.title), fl)) continue;
+            ResultItem r{ResultKind::Folder, d.title, L"", d.root, kFolderCol};
             rows.push_back(std::move(r));
         }
         wchar_t head[64];
         if (filter.empty())
-            swprintf_s(head, 64, L"Drives - %u %s", (unsigned)drives.size(),
-                       drives.size() == 1 ? L"drive" : L"drives");
+            swprintf_s(head, 64, L"Drives - %u %s", (unsigned)totalDrives,
+                       totalDrives == 1 ? L"drive" : L"drives");
         else
             swprintf_s(head, 64, L"Drives - %u of %u", (unsigned)rows.size(),
-                       (unsigned)drives.size());
+                       (unsigned)totalDrives);
         ResultItem hh{ResultKind::Header, head, L"", L"", kHintCol};
         g_results.push_back(std::move(hh));
-        size_t take = rows.size() < kMaxFileRows ? rows.size() : kMaxFileRows;
-        for (size_t i = 0; i < take; i++) g_results.push_back(std::move(rows[i]));
+        // All matches go in: the window stays 9 rows tall and the list
+        // scrolls internally (scrollbar hidden, arrows + wheel work).
+        for (size_t i = 0; i < rows.size(); i++) g_results.push_back(std::move(rows[i]));
         RebuildListControl();
         return;
     }
@@ -698,16 +715,15 @@ static void UpdateFileResults(const std::wstring& filter) {
     }
     ResultItem hh{ResultKind::Header, head, L"", L"", kHintCol};
     g_results.push_back(std::move(hh));
-    size_t room = kMaxFileRows;
     if (filter.empty()) {
         // Up entry: back to parent, or to drive list from a drive root.
         std::wstring parent = ParentDirOf(g_fileDir);
         ResultItem up{ResultKind::Folder, L"..", L"", parent, kFolderCol};
         g_results.push_back(std::move(up));
-        room--;
     }
-    size_t take = kept.size() < room ? kept.size() : room;
-    for (size_t i = 0; i < take; i++) {
+    // All matches go in: the window stays 9 rows tall and the list scrolls
+    // internally (scrollbar hidden, arrows + wheel work).
+    for (size_t i = 0; i < kept.size(); i++) {
         ResultItem r;
         r.kind = kept[i].isDir ? ResultKind::Folder : ResultKind::File;
         r.title = kept[i].name;
@@ -727,6 +743,7 @@ static void ExecuteFileSelected() {
     ResultItem r = g_results[(size_t)idx]; // copy: HidePalette clears state
     if (r.kind == ResultKind::Folder) {
         g_fileDir = r.action.empty() ? L"" : EnsureTrailingSlash(r.action);
+        if (g_fileDir.empty()) RefreshDriveCache(); // back at drives: re-read labels
         g_navigating = false;
         if (g_hwndEdit) {
             g_changingEdit = true;
@@ -1008,6 +1025,9 @@ static void RebuildListControl() {
     // No background erase (controls paint every pixel themselves).
     InvalidateRect(g_hwndList, NULL, FALSE);
     if (showChips) InvalidateRect(g_hwndChipRow, NULL, FALSE);
+    // Vertical scroll without a visible bar: the window stays compact (max 9
+    // rows) while longer file lists scroll via arrows + mouse wheel.
+    ShowScrollBar(g_hwndList, SB_VERT, FALSE);
 }
 
 // Domain-shaped input lives in bangs.h now (shared with the unit tests).
@@ -1410,6 +1430,14 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
             }
             return 0; // never let Tab move focus out of the box
         }
+        case VK_SPACE:
+            // File mode: Space opens the top match like Enter (no separate
+            // confirm keypress). Filters stay single-token by design.
+            if (InFileMode()) {
+                ExecuteSelected(false);
+                return 0;
+            }
+            break;
         case VK_DOWN:
             g_confirmPower = -1; // navigating disarms a pending confirm
             if (g_chipsFocus && haveChips) {
@@ -1458,9 +1486,10 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
             // Empty query + Backspace exits file/bang mode (file mode goes up first).
             if (GetWindowTextLengthW(h) == 0) {
                 if (InFileMode()) {
-                    if (!g_fileDir.empty())
+                    if (!g_fileDir.empty()) {
                         g_fileDir = ParentDirOf(g_fileDir); // up one, drives at root
-                    else
+                        if (g_fileDir.empty()) RefreshDriveCache();
+                    } else
                         DeactivateFileMode(); // drive list -> exit file mode
                     g_navigating = false;
                     UpdateResults();
