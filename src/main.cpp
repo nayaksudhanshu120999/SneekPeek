@@ -49,6 +49,7 @@
 #include "app_index.h"
 #include "bangs.h"
 #include "calc.h"
+#include "files.h"
 #include "settings.h"
 #include "syspages.h"
 #include "results.h"
@@ -238,6 +239,11 @@ static std::atomic<bool> g_indexing{false};
 // Bang-chip mode: -1 = off, else index into g_settings.bangs.
 static int  g_activeBang = -1;
 static bool g_changingEdit = false;
+// File-browse mode: single-level names-only listing. g_fileDir empty =
+// drive list level, else a trailing-backslash dir. Only the open path is
+// ever scanned (no parent/child prefetch, no cache).
+static bool g_fileActive = false;
+static std::wstring g_fileDir;
 // Arrow navigation: original typed text, restored when wrapping past the ends.
 static std::wstring g_origQuery;
 static bool g_navigating = false;
@@ -292,6 +298,8 @@ static const COLORREF kCalcCol= RGB(251, 191, 36);
 static const COLORREF kHintCol= RGB(110, 110, 115);
 static const COLORREF kSetCol = RGB(45, 212, 191);  // system settings pages
 static const COLORREF kAwakeCol = RGB(45, 212, 191);
+static const COLORREF kFileCol = RGB(96, 165, 250);   // files: blue
+static const COLORREF kFolderCol = RGB(251, 191, 36); // folders/drives: amber
 
 // Awake state + online worker state (see below).
 static bool g_awakeOn = false;
@@ -323,6 +331,13 @@ static void RebuildHiddenSet();
 static bool IsHiddenApp(const std::wstring& name);
 static void ActivateBang(int idx, const std::wstring& query);
 static void DeactivateBang();
+static bool InFileMode();
+static void ActivateFileMode(const std::wstring& dir);
+static void DeactivateFileMode();
+static void UpdateFileResults(const std::wstring& filter);
+static void ExecuteFileSelected();
+static void RebuildListControl();
+static int CurrentSelection();
 static void CloseCellEdit(bool commit);
 static void ApplyAwake();
 static void RequestOnline(const std::wstring& q);
@@ -467,6 +482,7 @@ static void ShowPalette() {
     if (!g_indexReady.load() && !g_indexing.load())
         BuildIndexAsync();
     DeactivateBang();
+    DeactivateFileMode();
     g_chips.clear();
     g_chipsFocus = false;
     PlacePalette();
@@ -486,6 +502,7 @@ static void ShowPalette() {
 
 static void HidePalette() {
     DeactivateBang();
+    DeactivateFileMode();
     g_chips.clear();
     g_chipsFocus = false;
     if (g_hwndChipRow) ShowWindow(g_hwndChipRow, SW_HIDE);
@@ -563,6 +580,171 @@ static void DeactivateBang() {
     if (g_hwndEdit) {
         ApplyEditMargins();
         SendMessageW(g_hwndEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search");
+    }
+}
+
+// ------------------------------------------------------------- file-browse mode
+// "file" + Space enters a names-only browser: drives -> single-level dir
+// listing. Only g_fileDir is ever scanned (one FindFirstFileW per refresh).
+static bool InFileMode() { return g_fileActive; }
+
+static void PositionFileChip() {
+    if (!g_hwndChip || !g_hwndEdit || !g_hwndPalette) return;
+    HDC dc = GetDC(g_hwndPalette);
+    HGDIOBJ old = SelectObject(dc, g_fontChip);
+    int w = ChipWidthFor(dc, L"Files");
+    SelectObject(dc, old);
+    ReleaseDC(g_hwndPalette, dc);
+    RECT er; GetWindowRect(g_hwndEdit, &er);
+    MapWindowPoints(NULL, g_hwndPalette, (POINT*)&er, 2);
+    int boxH = er.bottom - er.top;
+    int chH = boxH - 4;
+    if (chH > kChipH) chH = kChipH;
+    if (chH < 18) chH = 18;
+    int chipX = er.left + Dpx(2);
+    int chipY = er.top + (boxH - chH) / 2;
+    SetWindowPos(g_hwndChip, HWND_TOP, chipX, chipY, w, chH, SWP_SHOWWINDOW);
+    InvalidateRect(g_hwndChip, NULL, TRUE);
+    UpdateWindow(g_hwndChip);
+    g_bangChipW = w;
+    ApplyEditMargins();
+    SendMessageW(g_hwndEdit, EM_SETCUEBANNER, FALSE, (LPARAM)L"");
+}
+
+static void ActivateFileMode(const std::wstring& dir) {
+    DeactivateBang(); // mutually exclusive with bang-chip mode
+    g_fileActive = true;
+    g_fileDir = dir.empty() ? L"" : EnsureTrailingSlash(dir);
+    g_navigating = false;
+    g_confirmPower = -1;
+    PositionFileChip();
+    g_changingEdit = true;
+    SetWindowTextW(g_hwndEdit, L"");
+    SendMessageW(g_hwndEdit, EM_SETSEL, 0, 0);
+    g_changingEdit = false;
+    UpdateResults();
+}
+
+static void DeactivateFileMode() {
+    if (!g_fileActive) return; // don't hide an armed bang chip
+    g_fileActive = false;
+    g_fileDir.clear();
+    g_navigating = false;
+    g_bangChipW = 0;
+    if (g_hwndChip) ShowWindow(g_hwndChip, SW_HIDE);
+    if (g_hwndEdit) {
+        ApplyEditMargins();
+        SendMessageW(g_hwndEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search");
+    }
+}
+
+// File-mode list: header carries "<path> - N items" (count + names only),
+// rows carry names only. Current path alone is scanned; filter narrows it.
+// ".." returns only when the filter is empty (Backspace also goes up).
+static void UpdateFileResults(const std::wstring& filter) {
+    g_results.clear();
+    g_results.reserve(9);
+    std::wstring fl = FileLower(filter);
+    if (g_fileDir.empty()) {
+        std::vector<std::wstring> drives = GetLogicalDrivesWin32();
+        std::vector<ResultItem> rows;
+        for (const auto& d : drives) {
+            if (!FileMatchesFilter(FileLower(d), fl)) continue;
+            ResultItem r{ResultKind::Folder, d, L"", d, kFolderCol};
+            rows.push_back(std::move(r));
+        }
+        wchar_t head[64];
+        if (filter.empty())
+            swprintf_s(head, 64, L"Drives - %u %s", (unsigned)drives.size(),
+                       drives.size() == 1 ? L"drive" : L"drives");
+        else
+            swprintf_s(head, 64, L"Drives - %u of %u", (unsigned)rows.size(),
+                       (unsigned)drives.size());
+        ResultItem hh{ResultKind::Header, head, L"", L"", kHintCol};
+        g_results.push_back(std::move(hh));
+        size_t take = rows.size() < kMaxFileRows ? rows.size() : kMaxFileRows;
+        for (size_t i = 0; i < take; i++) g_results.push_back(std::move(rows[i]));
+        RebuildListControl();
+        return;
+    }
+    std::vector<FileEntry> entries;
+    size_t total = 0;
+    bool truncated = false;
+    if (!ListDirOneLevel(g_fileDir, entries, total, truncated)) {
+        std::wstring head = g_fileDir + L" - Access denied";
+        ResultItem hh{ResultKind::Header, head, L"", L"", kHintCol};
+        g_results.push_back(std::move(hh));
+        RebuildListControl();
+        return;
+    }
+    std::vector<FileEntry> kept;
+    kept.reserve(entries.size());
+    for (const auto& e : entries) {
+        if (FileMatchesFilter(FileLower(e.name), fl)) kept.push_back(e);
+    }
+    SortFileEntries(kept);
+    std::wstring head;
+    if (truncated) {
+        wchar_t b[512];
+        swprintf_s(b, 512, L"%s - %u+ items", g_fileDir.c_str(), (unsigned)total);
+        head = b;
+    } else if (filter.empty()) {
+        head = g_fileDir + L" - " + FormatFileCount(total);
+    } else {
+        wchar_t b[512];
+        swprintf_s(b, 512, L"%s - %u of %u", g_fileDir.c_str(),
+                   (unsigned)kept.size(), (unsigned)total);
+        head = b;
+    }
+    ResultItem hh{ResultKind::Header, head, L"", L"", kHintCol};
+    g_results.push_back(std::move(hh));
+    size_t room = kMaxFileRows;
+    if (filter.empty()) {
+        // Up entry: back to parent, or to drive list from a drive root.
+        std::wstring parent = ParentDirOf(g_fileDir);
+        ResultItem up{ResultKind::Folder, L"..", L"", parent, kFolderCol};
+        g_results.push_back(std::move(up));
+        room--;
+    }
+    size_t take = kept.size() < room ? kept.size() : room;
+    for (size_t i = 0; i < take; i++) {
+        ResultItem r;
+        r.kind = kept[i].isDir ? ResultKind::Folder : ResultKind::File;
+        r.title = kept[i].name;
+        r.sub = L"";
+        r.action = JoinFilePath(g_fileDir, kept[i].name);
+        r.color = kept[i].isDir ? kFolderCol : kFileCol;
+        g_results.push_back(std::move(r));
+    }
+    RebuildListControl();
+}
+
+// Enter in file mode: folders drill (stay open, rescan new path only),
+// files open directly. Headers / empty matches stay open (never web-search).
+static void ExecuteFileSelected() {
+    int idx = EffectiveSelection(CurrentSelection(), g_results);
+    if (idx < 0) return; // header or nothing: stay open
+    ResultItem r = g_results[(size_t)idx]; // copy: HidePalette clears state
+    if (r.kind == ResultKind::Folder) {
+        g_fileDir = r.action.empty() ? L"" : EnsureTrailingSlash(r.action);
+        g_navigating = false;
+        if (g_hwndEdit) {
+            g_changingEdit = true;
+            SetWindowTextW(g_hwndEdit, L"");
+            SendMessageW(g_hwndEdit, EM_SETSEL, 0, 0);
+            g_changingEdit = false;
+        }
+        UpdateResults(); // scans the new path only
+        if (g_hwndEdit) SetFocus(g_hwndEdit);
+        return;
+    }
+    if (r.kind == ResultKind::File) {
+        if (r.action.empty()) return;
+        std::wstring full = r.action; // copy: HidePalette clears file state
+        HidePalette(); // hide first: never wait for the target
+        if ((UINT_PTR)ShellExecuteW(NULL, L"open", full.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
+            NotifyLaunchFailed(L"Couldn't open this file");
+        return;
     }
 }
 
@@ -857,6 +1039,14 @@ static void UpdateResults() {
     std::wstring raw = GetEditText(g_hwndEdit);
     std::wstring q = Trim(raw);
 
+    // --- file-browse mode: drives / single-level dir only, no web fallback.
+    if (InFileMode()) {
+        g_chips.clear();
+        g_chipsFocus = false;
+        UpdateFileResults(q);
+        return;
+    }
+
     // --- bang-chip mode: chip only, no rows, no list.
     if (ActiveBang()) {
         g_chips.clear();
@@ -1054,6 +1244,12 @@ static void ExecuteSelected(bool forceWeb) {
         return;
     }
 
+    // File-browse mode: folders drill (stay open), files open. Never web-search.
+    if (InFileMode()) {
+        ExecuteFileSelected();
+        return;
+    }
+
     if (q.empty()) { HidePalette(); return; }
 
     // Shift+Enter forces a web search with the raw text.
@@ -1114,6 +1310,17 @@ static void ExecuteSelected(bool forceWeb) {
     case ResultKind::Calc:
         CopyText(r.action);
         break;
+    case ResultKind::Folder:
+        // Reached only outside file mode (should not happen): open in Explorer.
+        if (!r.action.empty() &&
+            (UINT_PTR)ShellExecuteW(NULL, L"open", r.action.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
+            NotifyLaunchFailed(L"Couldn't open this folder");
+        break;
+    case ResultKind::File:
+        if (!r.action.empty() &&
+            (UINT_PTR)ShellExecuteW(NULL, L"open", r.action.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
+            NotifyLaunchFailed(L"Couldn't open this file");
+        break;
     }
 }
 
@@ -1160,6 +1367,9 @@ static void SyncSelToBox(int listSel) {
     if (r.kind == ResultKind::App || r.kind == ResultKind::Setting ||
         r.kind == ResultKind::Online)
         t = r.title;
+    else if ((r.kind == ResultKind::Folder || r.kind == ResultKind::File) &&
+             r.title != L"..")
+        t = r.title; // file mode: mirror the name as the filter, list stays frozen
     if (t == keep) return;
     g_changingEdit = true; // programmatic: no refilter, list stays frozen
     SetWindowTextW(g_hwndEdit, t.c_str());
@@ -1245,11 +1455,22 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
             }
             return 0;
         case VK_BACK:
-            // Empty query + Backspace exits bang-chip mode.
-            if (g_activeBang >= 0 && GetWindowTextLengthW(h) == 0) {
-                DeactivateBang();
-                UpdateResults();
-                return 0;
+            // Empty query + Backspace exits file/bang mode (file mode goes up first).
+            if (GetWindowTextLengthW(h) == 0) {
+                if (InFileMode()) {
+                    if (!g_fileDir.empty())
+                        g_fileDir = ParentDirOf(g_fileDir); // up one, drives at root
+                    else
+                        DeactivateFileMode(); // drive list -> exit file mode
+                    g_navigating = false;
+                    UpdateResults();
+                    return 0;
+                }
+                if (g_activeBang >= 0) {
+                    DeactivateBang();
+                    UpdateResults();
+                    return 0;
+                }
             }
             break;
         case VK_F5:
@@ -1266,10 +1487,12 @@ static LRESULT CALLBACK ChipProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT: {
-        // Solid pill, white bold text, no outline. Click x exits bang mode.
+        // Solid pill, white bold text, no outline. Click x exits bang/file mode.
         const Bang* b = ActiveBang();
-        std::wstring text = b ? b->name : L"";
-        COLORREF col = b ? b->color : kHintCol;
+        std::wstring text;
+        COLORREF col = kHintCol;
+        if (InFileMode()) { text = L"Files"; col = kFileCol; }
+        else if (b) { text = b->name; col = b->color; }
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
         RECT r; GetClientRect(hwnd, &r);
@@ -1290,7 +1513,8 @@ static LRESULT CALLBACK ChipProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         RECT r; GetClientRect(hwnd, &r);
         int x = GET_X_LPARAM(l);
         if (x >= r.right - Dpx(24)) {
-            DeactivateBang(); // clicked the x
+            if (InFileMode()) DeactivateFileMode(); // clicked the x
+            else DeactivateBang();
             UpdateResults();
         }
         SetFocus(g_hwndEdit);
@@ -1435,7 +1659,8 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             g_navigating = false; // real typing restarts arrow cycling
             g_confirmPower = -1; // and disarms any pending power confirm
             // Bang-chip trigger: "alias<space>" with nothing else typed.
-            if (g_activeBang < 0) {
+            // File trigger ("file<space>") is reserved and wins over bangs.
+            if (g_activeBang < 0 && !InFileMode()) {
                 std::wstring editRaw = GetEditText(g_hwndEdit);
                 size_t sp = editRaw.find(L' ');
                 size_t tb = editRaw.find(L'\t');
@@ -1444,6 +1669,19 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 if (p != std::wstring::npos) {
                     std::wstring token = editRaw.substr(0, p);
                     if (!token.empty() && token[0] != L'!') {
+                        if (BangLower(token) == L"file") {
+                            std::wstring rest = Trim(editRaw.substr(p + 1));
+                            ActivateFileMode(L""); // drive list; keeps any pasted filter
+                            if (!rest.empty()) {
+                                g_changingEdit = true;
+                                SetWindowTextW(g_hwndEdit, rest.c_str());
+                                SendMessageW(g_hwndEdit, EM_SETSEL,
+                                             (WPARAM)rest.size(), (LPARAM)rest.size());
+                                g_changingEdit = false;
+                                UpdateResults();
+                            }
+                            break;
+                        }
                         int bi = FindBangByAlias(g_settings.bangs, BangLower(token));
                         if (bi >= 0) {
                             ActivateBang(bi, L""); // armed: empty box, chip only
@@ -1543,7 +1781,15 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         ApplyRoundCorners();
         if (g_activeBang >= 0) // re-measure the armed chip, keep the query
             ActivateBang(g_activeBang, GetEditText(g_hwndEdit));
-        else
+        else if (InFileMode()) { // re-measure the Files chip, keep dir + filter
+            std::wstring keep = GetEditText(g_hwndEdit);
+            PositionFileChip();
+            g_changingEdit = true;
+            SetWindowTextW(g_hwndEdit, keep.c_str());
+            SendMessageW(g_hwndEdit, EM_SETSEL, (WPARAM)keep.size(), (LPARAM)keep.size());
+            g_changingEdit = false;
+            UpdateResults();
+        } else
             UpdateResults();
         break;
     }
@@ -1575,7 +1821,8 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         if ((int)w == g_onlineSeq.load() && IsWindowVisible(hwnd)) {
             std::wstring cur = Trim(GetEditText(g_hwndEdit));
             AcquireSRWLockShared(&g_onlineLock);
-            bool match = (!g_online.empty() && g_onlineFor == cur && !ActiveBang());
+            bool match = (!g_online.empty() && g_onlineFor == cur && !ActiveBang() &&
+                          !InFileMode());
             ReleaseSRWLockShared(&g_onlineLock);
             if (match) UpdateResults(); // same query -> merges, no refetch loop
         }

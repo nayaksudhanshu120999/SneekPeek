@@ -8,6 +8,7 @@
 #include <cmath>
 #include "calc.h"
 #include "bangs.h"
+#include "files.h"
 #include "minjson.h"
 #include "settings.h"
 #include "results.h"
@@ -172,6 +173,88 @@ int main() {
         CHECK(!IsSafeWebUrl(L"data:text/html,hi"));
         CHECK(!IsSafeWebUrl(L"https://example.com/\"quoted\""));
         CHECK(!IsSafeWebUrl(L"https://example.com/a\tb"));
+    }
+    // file-browse helpers: names + count only, folders first, current path only
+    {
+        CHECK(FileLower(L"C:\\Foo") == L"c:\\foo");
+        CHECK(FileMatchesFilter(L"notepad.exe", L""));
+        CHECK(FileMatchesFilter(L"notepad.exe", L"note"));
+        CHECK(FileMatchesFilter(L"notepad.exe", L"pad"));
+        CHECK(!FileMatchesFilter(L"note", L"notepad.exe"));
+        CHECK(!FileMatchesFilter(L"readme.txt", L"zzz"));
+        std::vector<FileEntry> v = {
+            {L"b.txt", false}, {L"A", true}, {L"a.txt", false}, {L"B", true},
+        };
+        SortFileEntries(v);
+        CHECK(v.size() == 4 && v[0].name == L"A" && v[0].isDir);
+        CHECK(v[1].name == L"B" && v[1].isDir);
+        CHECK(v[2].name == L"a.txt" && !v[2].isDir);
+        CHECK(v[3].name == L"b.txt" && !v[3].isDir);
+        CHECK(EnsureTrailingSlash(L"C:\\a") == L"C:\\a\\");
+        CHECK(EnsureTrailingSlash(L"C:\\a\\") == L"C:\\a\\");
+        CHECK(EnsureTrailingSlash(L"") == L"");
+        CHECK(JoinFilePath(L"C:\\a\\", L"b.txt") == L"C:\\a\\b.txt");
+        CHECK(JoinFilePath(L"C:\\a", L"b.txt") == L"C:\\a\\b.txt");
+        CHECK(ParentDirOf(L"C:\\") == L"");
+        CHECK(ParentDirOf(L"C:\\a\\") == L"C:\\");
+        CHECK(ParentDirOf(L"C:\\a\\b\\") == L"C:\\a\\");
+        CHECK(ParentDirOf(L"") == L"");
+        CHECK(FormatFileCount(0) == L"0 items");
+        CHECK(FormatFileCount(1) == L"1 item");
+        CHECK(FormatFileCount(42) == L"42 items");
+        // file rows are actionable like app rows (headers never are)
+        auto frow = [](ResultKind k, const wchar_t* t) {
+            ResultItem r;
+            r.kind = k;
+            r.title = t;
+            r.color = RGB(0, 0, 0);
+            return r;
+        };
+        std::vector<ResultItem> fl = {
+            frow(ResultKind::Header, L"C:\\ - 2 items"),
+            frow(ResultKind::Folder, L"docs"),
+            frow(ResultKind::File, L"a.txt"),
+        };
+        CHECK(EffectiveSelection(1, fl) == 1);
+        CHECK(EffectiveSelection(2, fl) == 2);
+        CHECK(FirstSelectable(fl) == 1);
+    }
+    // single-level dir scan on a temp folder (no recursion, names only)
+    {
+        wchar_t tmp[MAX_PATH];
+        CHECK(GetTempPathW(MAX_PATH, tmp) != 0);
+        std::wstring root = EnsureTrailingSlash(tmp) + L"sneekpeek_filetest\\";
+        CreateDirectoryW(root.c_str(), NULL);
+        std::wstring sub = root + L"sub\\";
+        CreateDirectoryW(sub.c_str(), NULL);
+        std::wstring f1 = root + L"a.txt";
+        HANDLE hf = CreateFileW(f1.c_str(), GENERIC_WRITE, 0, NULL,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+        // nested file must NOT leak into the top-level scan
+        std::wstring nested = sub + L"nested.txt";
+        hf = CreateFileW(nested.c_str(), GENERIC_WRITE, 0, NULL,
+                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+        std::vector<FileEntry> out;
+        size_t total = 0;
+        bool trunc = false;
+        CHECK(ListDirOneLevel(root, out, total, trunc));
+        CHECK(total == 2 && !trunc);
+        bool sawSub = false, sawFile = false, sawNested = false;
+        for (const auto& e : out) {
+            if (e.name == L"sub" && e.isDir) sawSub = true;
+            if (e.name == L"a.txt" && !e.isDir) sawFile = true;
+            if (e.name == L"nested.txt") sawNested = true;
+        }
+        CHECK(sawSub && sawFile && !sawNested);
+        size_t badTotal = 0;
+        bool badTrunc = false;
+        CHECK(!ListDirOneLevel(L"Z:\\no\\such\\dir\\", out, badTotal, badTrunc));
+        DeleteFileW(nested.c_str());
+        DeleteFileW(f1.c_str());
+        RemoveDirectoryW(sub.c_str());
+        RemoveDirectoryW(root.c_str());
     }
     // child environment blocks: sorted, deduplicated, double-terminated
     {

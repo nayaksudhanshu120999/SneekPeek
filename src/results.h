@@ -7,18 +7,21 @@
 //   URL row      -> open it
 //   web row      -> engine search
 //   setting row  -> open the page
-//   header/none  -> typed-query fallback (web search, or hide if empty)
+//   folder row   -> drill into that path (file mode, stays open)
+//   file row     -> open the file directly
+//   header/none  -> typed-query fallback (web search, or hide if empty;
+//                   file mode instead stays open with no fallback)
 #include <windows.h> // COLORREF
 #include <string>
 #include <vector>
 
-enum class ResultKind { App, Web, Bang, Calc, Setting, Header, Online };
+enum class ResultKind { App, Web, Bang, Calc, Setting, Header, Online, Folder, File };
 
 struct ResultItem {
     ResultKind kind;
     std::wstring title;   // single line (headers, names, queries)
     std::wstring sub;     // reserved, currently unused
-    std::wstring action;  // lnk path | shell:AppsFolder target | url | ms-settings: | calc text
+    std::wstring action;  // lnk path | shell:AppsFolder target | url | ms-settings: | calc text | full file path
     COLORREF color;       // category accent color
     bool isStore = false; // Store app: launch via explorer.exe
 };

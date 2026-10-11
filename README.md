@@ -25,6 +25,7 @@ Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 | `bluetooth` | matching Windows Settings pages under their own header — Enter opens the page |
 | `gmail` | quick-link chips (fixed URLs, no query) work the same way — Enter opens |
 | `12*8` | calculator (Enter copies result; undefined math like `1/0` shows nothing) |
+| `file` + `Space` | names-only file browser: drives appear, type to filter, `Enter` on a folder drills in (stays open), `Enter` on a file opens it; `..` / empty-box `Backspace` goes up, `x` or drive-level `Backspace` exits — one folder scanned at a time, no sizes/icons/recursion |
 | `↑` `↓` | move selection (mirrors into the box without refiltering; wraps past either end back to your typed text; Up from the first row jumps back to the chips), `Enter` open, `Shift+Enter` force web search, `Esc` dismiss, `F5` rescan apps |
 
 Bang aliases are editable in Settings (default: `yt`/`youtube`, `gh`/`github`, `w`/`wiki`, `r`, `m`, `t`, `a`, `x`, `so`, `d`, `g` — each with its own color).
@@ -45,7 +46,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release
 ```
 
-The last line runs the unit tests (calculator incl. divide-by-zero and `-2^2` precedence, fuzzy ranking, bang parsing, URL detection, JSON decoding, settings caps, Enter-key decision table).
+The last line runs the unit tests (calculator incl. divide-by-zero and `-2^2` precedence, fuzzy ranking, bang parsing, URL detection, JSON decoding, settings caps, Enter-key decision table, file-browse helpers + single-level scan).
 
 No compiler yet? One line (then reopen the terminal and re-run `build.bat`):
 
@@ -103,6 +104,7 @@ Tray → **Settings…** (tabbed, dark, matches the app — every change saves i
 src/main.cpp       window, hotkey, tray, palette UI, execution  (WinMain)
 src/app_index.h/.cpp  Start Menu scan + fuzzy rank (lazy, one-shot)
 src/bangs.h        !bang table + URL encoding (header-only)
+src/files.h        single-level file browser: names + count only (header-only)
 src/settings.h     INI load/save + Run-at-startup (header-only)
 src/app.ico        app/tray icon (multi-size, built from search.png)
 src/app.rc         icon + version info resources
