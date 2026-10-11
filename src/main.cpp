@@ -73,6 +73,7 @@ static const wchar_t* kPaletteClass  = L"SneekPeekPalette";
 static const wchar_t* kSettingsClass = L"SneekPeekSettings";
 static const wchar_t* kChipClass     = L"SneekPeekChip";
 static const wchar_t* kChipRowClass  = L"SneekPeekChipRow";
+static const wchar_t* kFileBarClass  = L"SneekPeekFileBar";
 static const wchar_t* kMutexName     = L"SneekPeek_SingleInstance_v1";
 static const UINT HOTKEY_ID = 1;
 static const UINT WM_TRAYICON = WM_APP + 10;
@@ -94,10 +95,12 @@ static const int kMaxItems = 9;
 static int kCornerR = 14;
 static int kChipH = 28;
 static int kChipRowH = 40;
+static int kBottomBarH = 30;
 static const int kMaxChips = 4;
 static void UpdateLayoutMetrics() {
     kWidth = Dpx(600); kInputH = Dpx(44); kItemH = Dpx(38);
     kCornerR = Dpx(14); kChipH = Dpx(28); kChipRowH = Dpx(40);
+    kBottomBarH = Dpx(30);
 }
 
 // Settings control IDs
@@ -177,6 +180,7 @@ static HWND        g_hwndEdit = NULL;
 static HWND        g_hwndList = NULL;
 static HWND        g_hwndChip = NULL;
 static HWND        g_hwndChipRow = NULL;
+static HWND        g_hwndFileBar = NULL; // slim Explorer bar, file mode only
 static int         g_bangChipW = 0;  // 0 = hidden
 static HWND        g_hwndSettings = NULL;
 static int         g_settingsPage = 0;
@@ -459,6 +463,9 @@ static void LayoutPaletteChildren() {
         MapWindowPoints(NULL, g_hwndPalette, (POINT*)&lr, 2);
         SetWindowPos(g_hwndList, NULL, Dpx(16), lr.top, W - Dpx(32),
                      lr.bottom - lr.top, SWP_NOZORDER);
+        if (g_hwndFileBar && IsWindowVisible(g_hwndFileBar))
+            SetWindowPos(g_hwndFileBar, NULL, Dpx(16), lr.bottom, W - Dpx(32),
+                         kBottomBarH, SWP_NOZORDER);
     }
 }
 
@@ -477,6 +484,7 @@ static void PlacePalette() {
     // Chips row + list start hidden until results arrive.
     ShowWindow(g_hwndChipRow, SW_HIDE);
     ShowWindow(g_hwndChip, SW_HIDE);
+    ShowWindow(g_hwndFileBar, SW_HIDE);
 }
 
 static void ShowPalette() {
@@ -717,10 +725,6 @@ static void UpdateFileResults(const std::wstring& filter) {
     ResultItem hh{ResultKind::Header, head, L"", L"", kHintCol};
     g_results.push_back(std::move(hh));
     if (filter.empty()) {
-        // Pinned quick action: no shortcut to remember, taught in place.
-        ResultItem ex{ResultKind::Explorer, L"Open in Explorer  (Shift+Enter)",
-                      L"", g_fileDir, kFolderCol};
-        g_results.push_back(std::move(ex));
         // Up entry: back to parent, or to drive list from a drive root.
         std::wstring parent = ParentDirOf(g_fileDir);
         ResultItem up{ResultKind::Folder, L"..", L"", parent, kFolderCol};
@@ -1045,9 +1049,12 @@ static void RebuildListControl() {
         SendMessageW(g_hwndList, LB_SETCURSEL, FirstSelectable(g_results), 0);
 
     bool showChips = !g_chips.empty();
+    bool showBar = InFileMode() && !g_fileDir.empty();
     size_t rows = g_results.size() > kMaxItems ? kMaxItems : g_results.size();
     int listY = kInputH + (showChips ? kChipRowH : 0);
-    int h = listY + (int)rows * kItemH + 4; // 4px bottom pad mirrors the top
+    int listH = (int)rows * kItemH;
+    int barH = showBar ? kBottomBarH : 0;
+    int h = listY + listH + barH + 4; // 4px bottom pad mirrors the top
 
     // Resize (window + region + children) only when the height changed:
     // this is what stops the per-keystroke blink.
@@ -1066,11 +1073,21 @@ static void RebuildListControl() {
             ShowWindow(g_hwndList, SW_HIDE); // bar-only: no list at all
         else
             SetWindowPos(g_hwndList, NULL, Dpx(16), listY, cr.right - Dpx(32),
-                         (int)rows * kItemH, SWP_NOZORDER | SWP_SHOWWINDOW);
+                         listH, SWP_NOZORDER | SWP_SHOWWINDOW);
+    }
+    // Explorer bar docks under the list (positioned every refresh: cheap).
+    {
+        RECT cr; GetClientRect(g_hwndPalette, &cr);
+        if (showBar)
+            SetWindowPos(g_hwndFileBar, NULL, Dpx(16), listY + listH,
+                         cr.right - Dpx(32), barH, SWP_NOZORDER | SWP_SHOWWINDOW);
+        else if (g_hwndFileBar)
+            ShowWindow(g_hwndFileBar, SW_HIDE);
     }
     // No background erase (controls paint every pixel themselves).
     InvalidateRect(g_hwndList, NULL, FALSE);
     if (showChips) InvalidateRect(g_hwndChipRow, NULL, FALSE);
+    if (showBar) InvalidateRect(g_hwndFileBar, NULL, FALSE);
     // Vertical scroll without a visible bar: the window stays compact (max 9
     // rows) while longer file lists scroll via arrows + mouse wheel.
     ShowScrollBar(g_hwndList, SB_VERT, FALSE);
@@ -1684,6 +1701,56 @@ static LRESULT CALLBACK ChipRowProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(hwnd, m, w, l);
 }
 
+// ------------------------------------------------------- file bottom bar
+// Minimalist Explorer shortcut: one slim bar docked under the list, visible
+// in file mode (dir level) only. Click opens the current folder in Explorer.
+static LRESULT CALLBACK FileBarProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT cl; GetClientRect(hwnd, &cl);
+        FillRect(dc, &cl, g_brBg);
+        // hairline separator on top
+        HBRUSH sep = CreateSolidBrush(RGB(30, 30, 32));
+        RECT sr = cl; sr.bottom = sr.top + 1;
+        FillRect(dc, &sr, sep);
+        DeleteObject(sep);
+        // amber tick, like the list rows
+        HBRUSH tick = CreateSolidBrush(Darken(kFolderCol, 65));
+        RECT br{cl.left + Dpx(14), cl.top + Dpx(8), cl.left + Dpx(16), cl.bottom - Dpx(8)};
+        FillRect(dc, &br, tick);
+        DeleteObject(tick);
+        SetBkMode(dc, TRANSPARENT);
+        SelectObject(dc, g_fontSub);
+        SetTextColor(dc, kText);
+        RECT tr = cl; tr.left += Dpx(30); tr.right -= Dpx(10);
+        DrawTextW(dc, L"Open in Explorer", -1, &tr,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        const wchar_t* hint = L"Shift+Enter";
+        RECT hr{0, 0, 0, 0};
+        DrawTextW(dc, hint, -1, &hr, DT_SINGLELINE | DT_CALCRECT);
+        SetTextColor(dc, kSub);
+        RECT rr = cl; rr.left = rr.right - Dpx(10) - (hr.right - hr.left);
+        DrawTextW(dc, hint, -1, &rr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        if (InFileMode() && !g_fileDir.empty()) {
+            std::wstring dir = g_fileDir; // copy: HidePalette clears file state
+            HidePalette(); // hide first: never wait for Explorer
+            if ((UINT_PTR)ShellExecuteW(NULL, L"open", dir.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
+                NotifyLaunchFailed(L"Couldn't open this folder");
+        }
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, m, w, l);
+}
+
 // ------------------------------------------------------------- palette wndproc
 static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
@@ -1708,6 +1775,11 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             WS_CHILD | WS_CLIPSIBLINGS,
             16, kInputH, kWidth - 32, kChipRowH,
             hwnd, (HMENU)4, g_hInst, NULL);
+
+        g_hwndFileBar = CreateWindowExW(0, kFileBarClass, L"",
+            WS_CHILD | WS_CLIPSIBLINGS,
+            16, kInputH, kWidth - 32, kBottomBarH,
+            hwnd, (HMENU)5, g_hInst, NULL);
 
         g_hwndList = CreateWindowExW(0, L"LISTBOX", L"",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | LBS_NOTIFY | LBS_OWNERDRAWFIXED |
@@ -2911,6 +2983,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     wcRow.hCursor = LoadCursorW(NULL, IDC_HAND);
     wcRow.hbrBackground = g_brBg;
     RegisterClassExW(&wcRow);
+
+    WNDCLASSEXW wcBar{};
+    wcBar.cbSize = sizeof(wcBar);
+    wcBar.hInstance = hInst;
+    wcBar.lpszClassName = kFileBarClass;
+    wcBar.lpfnWndProc = FileBarProc;
+    wcBar.hCursor = LoadCursorW(NULL, IDC_HAND);
+    wcBar.hbrBackground = g_brBg;
+    RegisterClassExW(&wcBar);
 
     g_hwndPalette = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_COMPOSITED, // topmost, no taskbar, smooth
