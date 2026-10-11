@@ -290,7 +290,7 @@ int main() {
         CHECK(b.size() == 2 && b[0].name == L"Camera" && b[0].isStore &&
               b[0].lower == L"camera" && b[1].target == L"C:\\x\\notepad.lnk" &&
               !b[1].isStore);
-        DeleteFileW(f);
+        DeleteFileW(f.c_str());
         HANDLE hf = CreateFileW(f.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
         DWORD w = 0;
         const char junk[20] = {0}; // bad magic
@@ -301,7 +301,7 @@ int main() {
         std::vector<AppEntry> c;
         CHECK(!LoadAppCache(f, c) && c.empty());
         CHECK(!LoadAppCache(L"Z:\\no\\such\\file.bin", c));
-        DeleteFileW(f);
+        DeleteFileW(f.c_str());
     }
     if (g_fail == 0) printf("ALL TESTS PASSED\n");
     return g_fail ? 1 : 0;
