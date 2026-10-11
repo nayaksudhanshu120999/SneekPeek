@@ -56,6 +56,12 @@ inline std::wstring SettingsPath() {
     return dir + L"\\settings.ini";
 }
 
+inline std::wstring AppCachePath() {
+    std::wstring ini = SettingsPath(); // ensures the directory exists
+    size_t p = ini.rfind(L'\\');
+    return (p == std::wstring::npos ? L"" : ini.substr(0, p + 1)) + L"apps.cache";
+}
+
 // Split on '|' (single-line INI value <-> lines).
 inline std::vector<std::wstring> SplitPipe(const std::wstring& s) {
     std::vector<std::wstring> out;

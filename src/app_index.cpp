@@ -1,6 +1,7 @@
 #include "app_index.h"
 #include "minjson.h"
 #include <windows.h>
+#include <cstdint>
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <shlguid.h>
@@ -61,6 +62,17 @@ static bool IsRunnableTarget(const std::wstring& target) {
 static bool StartsWithUninstall(const std::wstring& name) {
     std::wstring n = ToLower(name);
     return n.compare(0, 9, L"uninstall") == 0;
+}
+
+// True for direct filesystem paths ("C:\...", "\\server\..."): the only
+// StartApps AppIDs launchable without the shell:AppsFolder prefix.
+static bool IsAbsoluteFilePath(const std::wstring& p) {
+    if (p.size() >= 3 && ((p[0] >= L'A' && p[0] <= L'Z') ||
+                           (p[0] >= L'a' && p[0] <= L'z')) &&
+        p[1] == L':' && (p[2] == L'\\' || p[2] == L'/'))
+        return true;
+    if (p.size() >= 2 && p[0] == L'\\' && p[1] == L'\\') return true;
+    return false;
 }
 
 static void ScanLnkDir(const std::wstring& root, std::vector<AppEntry>& out) {
@@ -357,15 +369,38 @@ static void ScanStartAppsPS(std::vector<AppEntry>& out, const std::atomic<bool>*
         if (!DecodeJsonString(pp, end, appid)) { pos = q2 + 1; continue; }
         pos = (size_t)(pp - data.c_str());
         if (name.empty() || appid.empty()) continue;
+        if (StartsWithUninstall(name)) continue;
+        // Docs/help/URLs are not apps (mirrors the .lnk scan's policy).
+        if (appid.compare(0, 7, L"file://") == 0 ||
+            appid.compare(0, 5, L"file:") == 0)
+            continue;
         AppEntry e;
         e.name = name;
         e.lower = ToLower(name);
         if (appid.find(L'!') != std::wstring::npos) {
             e.target = L"shell:AppsFolder\\" + appid; // Store app
             e.isStore = true;
-        } else {
-            e.target = appid; // classic app: full .lnk path
+        } else if (IsAbsoluteFilePath(appid)) {
+            // Direct path (e.g. "F:\7-Zip\7zFM.exe"): launch as-is, but
+            // drop non-runnable files (.txt/.chm/.url/...) like ScanLnkDir.
+            size_t dot = appid.find_last_of(L'.');
+            size_t sep = appid.find_last_of(L"\\/");
+            if (dot != std::wstring::npos &&
+                (sep == std::wstring::npos || dot > sep)) {
+                std::wstring ext = ToLower(appid.substr(dot + 1));
+                if (!(ext == L"exe" || ext == L"msc" || ext == L"bat" ||
+                      ext == L"cmd" || ext == L"com" || ext == L"pif" ||
+                      ext == L"scr" || ext == L"cpl" || ext == L"lnk"))
+                    continue; // doc/help/url file, not an app
+            }
+            e.target = appid;
             e.isStore = false;
+        } else {
+            // Bare Start-menu ID ("Microsoft.Windows.Explorer",
+            // "{GUID}\notepad.exe", "MSEdge", ...): only launchable via
+            // shell:AppsFolder, exactly like Store apps.
+            e.target = L"shell:AppsFolder\\" + appid;
+            e.isStore = true;
         }
         out.push_back(std::move(e));
     }
@@ -484,4 +519,92 @@ std::vector<ScoredApp> SearchApps(const std::vector<AppEntry>& apps,
               [](const ScoredApp& x, const ScoredApp& y) { return x.score > y.score; });
     if (hits.size() > limit) hits.resize(limit);
     return hits;
+}
+
+// ------------------------------------------------------- persisted index cache
+// Format: magic u32 ("SPIC" LE), version u32, count u32, then per entry:
+// nameLen u32 + UTF-16 chars, targetLen u32 + UTF-16 chars, flags u32.
+// lower[] is recomputed on load, never stored.
+static const uint32_t kAppCacheMagic = 0x43495053;
+static const uint32_t kAppCacheVersion = 2; // v2: StartApps IDs launch via shell:AppsFolder
+
+static void WriteU32(std::string& b, uint32_t v) {
+    b.push_back((char)(v & 0xFF));
+    b.push_back((char)((v >> 8) & 0xFF));
+    b.push_back((char)((v >> 16) & 0xFF));
+    b.push_back((char)((v >> 24) & 0xFF));
+}
+static void WriteWStr(std::string& b, const std::wstring& s) {
+    WriteU32(b, (uint32_t)s.size());
+    b.append((const char*)s.data(), s.size() * sizeof(wchar_t));
+}
+bool SaveAppCache(const std::wstring& path, const std::vector<AppEntry>& apps) {
+    std::string b;
+    WriteU32(b, kAppCacheMagic);
+    WriteU32(b, kAppCacheVersion);
+    size_t n = apps.size() < 20000 ? apps.size() : 20000;
+    WriteU32(b, (uint32_t)n);
+    for (size_t i = 0; i < n; i++) {
+        WriteWStr(b, apps[i].name);
+        WriteWStr(b, apps[i].target);
+        WriteU32(b, apps[i].isStore ? 1u : 0u);
+    }
+    HANDLE hf = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+    DWORD wrote = 0;
+    BOOL ok = WriteFile(hf, b.data(), (DWORD)b.size(), &wrote, NULL);
+    CloseHandle(hf);
+    return ok && wrote == b.size();
+}
+static bool ReadU32(const char*& p, const char* end, uint32_t& v) {
+    if ((size_t)(end - p) < 4) return false;
+    const unsigned char* u = (const unsigned char*)p;
+    v = (uint32_t)u[0] | ((uint32_t)u[1] << 8) |
+        ((uint32_t)u[2] << 16) | ((uint32_t)u[3] << 24);
+    p += 4;
+    return true;
+}
+static bool ReadWStr(const char*& p, const char* end, std::wstring& s) {
+    uint32_t n = 0;
+    if (!ReadU32(p, end, n) || n > 32768) return false;
+    if ((size_t)(end - p) < (size_t)n * sizeof(wchar_t)) return false;
+    s.assign((const wchar_t*)p, n);
+    p += n * sizeof(wchar_t);
+    return true;
+}
+bool LoadAppCache(const std::wstring& path, std::vector<AppEntry>& out) {
+    out.clear();
+    HANDLE hf = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, 0, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+    std::string data;
+    char buf[8192];
+    DWORD rd = 0;
+    while (ReadFile(hf, buf, sizeof(buf), &rd, NULL) && rd) {
+        data.append(buf, rd);
+        if (data.size() > 8 * 1024 * 1024) break;
+    }
+    CloseHandle(hf);
+    const char* p = data.c_str();
+    const char* end = p + data.size();
+    uint32_t magic = 0, ver = 0, count = 0;
+    if (!ReadU32(p, end, magic) || magic != kAppCacheMagic) return false;
+    if (!ReadU32(p, end, ver) || ver != kAppCacheVersion) return false;
+    if (!ReadU32(p, end, count) || count > 20000) return false;
+    std::vector<AppEntry> fresh;
+    fresh.reserve(count);
+    for (uint32_t i = 0; i < count; i++) {
+        AppEntry e;
+        uint32_t flags = 0;
+        if (!ReadWStr(p, end, e.name) || !ReadWStr(p, end, e.target) ||
+            !ReadU32(p, end, flags))
+            return false;
+        e.lower = ToLower(e.name);
+        e.isStore = (flags & 1u) != 0;
+        fresh.push_back(std::move(e));
+    }
+    if (p != end) return false; // trailing garbage: reject
+    out.swap(fresh);
+    return true;
 }

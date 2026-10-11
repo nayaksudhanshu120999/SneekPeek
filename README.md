@@ -92,7 +92,7 @@ Tray → **Settings…** (tabbed, dark, matches the app — every change saves i
 ## Why it uses (almost) nothing
 
 - One hidden `HWND` + blocking `GetMessage` loop → thread sleeps until an event. No timers, no polling → **0% CPU**.
-- App index is a single `vector<{name, path}>` with cached lowercase names, built **once** on a background thread (Start Menu `.lnk` targets resolved to keep exe-tools only, Store apps via `shell:AppsFolder` ×2 COM routes plus `Get-StartApps`), then the thread exits. No icon extraction, no file watchers → **~1–3 MB** total.
+- App index is a single `vector<{name, path}>` with cached lowercase names, built **once** on a background thread (Start Menu `.lnk` targets resolved to keep exe-tools only, Store apps via `shell:AppsFolder` ×2 COM routes plus `Get-StartApps`), then the thread exits. The finished index is cached to disk, so cold starts search instantly and only refresh quietly in the background. No icon extraction, no file watchers → **~1–3 MB** total.
 - Global hotkey via `RegisterHotKey` (OS-level, no low-level keyboard hook).
 - Dismiss-on-click-outside via `WM_ACTIVATE` + `WM_ACTIVATEAPP` (no mouse hook).
 - `WS_EX_TOOLWINDOW` → no taskbar button; single instance via mutex.

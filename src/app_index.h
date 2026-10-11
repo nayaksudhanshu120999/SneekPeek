@@ -38,4 +38,9 @@ std::vector<ScoredApp> SearchApps(const std::vector<AppEntry>& apps,
                                  const std::wstring& query,
                                  size_t limit = 7);
 
+// Persisted index cache (%APPDATA%\\SneekPeek\\apps.cache): versioned binary,
+// exact-size validated on load. lower[] is recomputed, not stored.
+bool SaveAppCache(const std::wstring& path, const std::vector<AppEntry>& apps);
+bool LoadAppCache(const std::wstring& path, std::vector<AppEntry>& out);
+
 std::wstring ToLower(std::wstring s);

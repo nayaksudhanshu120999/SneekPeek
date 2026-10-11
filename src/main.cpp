@@ -344,6 +344,7 @@ static void RunPower(PowerOp op);
 // joinable (never detached): shutdown sets the stop flag and joins it.
 static std::atomic<std::vector<AppEntry>*> g_pendingIndex{nullptr};
 static std::atomic<bool> g_indexStop{false};
+static std::atomic<bool> g_quitting{false}; // set at teardown: deferred work stands down
 static std::thread g_indexThread; // guarded by g_indexing: join before reuse
 static const UINT WM_APP_INDEX = WM_APP + 22; // background index published
 static void BuildIndexAsync() {
@@ -1085,7 +1086,7 @@ static void ExecuteSelected(bool forceWeb) {
     HidePalette(); // hide first: never wait for the target app
     switch (r.kind) {
     case ResultKind::App:
-        if (r.action.empty()) break;
+        if (r.action.empty()) { NotifyLaunchFailed(L"Couldn't open this app"); break; }
         if (r.isStore) {
             wchar_t winDir[MAX_PATH];
             HINSTANCE ok = NULL;
@@ -1564,6 +1565,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             g_apps.swap(*p);
             delete p;
             g_indexReady.store(true);
+            SaveAppCache(AppCachePath(), g_apps); // persist for instant restart
         }
         RefreshAppsListPreservingChecks();
         if (IsWindowVisible(hwnd)) UpdateResults();
@@ -2201,34 +2203,30 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         SetBkMode(dc, TRANSPARENT);
         SelectObject(dc, g_fontUI);
         if (isCheck) {
+            // Toggle switch: track + sliding knob + explicit On/Off word.
+            // Position, color, and text all agree, so the state is unmistakable.
             FillRect(dc, &d->rcItem, g_brBg);
-            int boxS = 14;
-            int by = d->rcItem.top + ((d->rcItem.bottom - d->rcItem.top) - boxS) / 2;
-            RECT box{d->rcItem.left + 2, by, d->rcItem.left + 2 + boxS, by + boxS};
-            HBRUSH bb = CreateSolidBrush(RGB(20, 20, 22));
-            HPEN bp = CreatePen(PS_SOLID, 1, RGB(100, 100, 108));
-            HGDIOBJ ob = SelectObject(dc, bb);
-            HGDIOBJ op = SelectObject(dc, bp);
-            RoundRect(dc, box.left, box.top, box.right, box.bottom, 4, 4);
-            SelectObject(dc, ob); SelectObject(dc, op);
-            DeleteObject(bb); DeleteObject(bp);
-            if (d->itemState & ODS_CHECKED) {
-                HPEN cp = CreatePen(PS_SOLID, 2, kAppCol);
-                HGDIOBJ ocp = SelectObject(dc, cp);
-                POINT pts[3] = {
-                    {box.left + 3, box.top + 7},
-                    {box.left + 6, box.top + 10},
-                    {box.left + 11, box.top + 4},
-                };
-                Polyline(dc, pts, 3);
-                SelectObject(dc, ocp);
-                DeleteObject(cp);
+            bool on = (d->itemState & ODS_CHECKED) != 0;
+            int th = 22, tw = 46; // track size
+            int ty = d->rcItem.top + ((d->rcItem.bottom - d->rcItem.top) - th) / 2;
+            RECT track{d->rcItem.left + 2, ty, d->rcItem.left + 2 + tw, ty + th};
+            FillPill(dc, track, on ? Darken(kAppCol, 75) : RGB(38, 38, 42));
+            int kd = th - 6; // knob diameter
+            int kx = on ? track.right - 3 - kd : track.left + 3;
+            int ky = ty + 3;
+            {
+                Gdiplus::Graphics g(dc);
+                g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                Gdiplus::SolidBrush br(on ? Gdiplus::Color(255, 255, 255, 255)
+                                           : Gdiplus::Color(255, 160, 160, 166));
+                g.FillEllipse(&br, kx, ky, kd, kd);
             }
             wchar_t text[128] = {0};
             GetWindowTextW(d->hwndItem, text, 128);
-            SetTextColor(dc, kText);
-            RECT tr = d->rcItem; tr.left = box.right + 8;
-            DrawTextW(dc, text, -1, &tr,
+            std::wstring label = std::wstring(text) + (on ? L"  On" : L"  Off");
+            SetTextColor(dc, on ? kText : kSub);
+            RECT tr = d->rcItem; tr.left = track.right + 10;
+            DrawTextW(dc, label.c_str(), -1, &tr,
                       DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
             return TRUE;
         }
@@ -2520,6 +2518,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     RebuildHiddenSet();
     g_awakeOn = g_settings.awakeOn;
     if (g_awakeOn) ApplyAwake(); // restore the held-awake state silently
+    if (LoadAppCache(AppCachePath(), g_apps)) {
+        g_indexReady.store(true); // instant results; a refresh follows shortly
+        std::thread([] { // deferred: let cold start settle first
+            Sleep(5000);
+            if (!g_quitting.load()) BuildIndexAsync();
+        }).detach();
+    }
 
     // Fonts scale with the monitor DPI (rebuilt on WM_DPICHANGED); brushes
     // are solid colors, DPI-independent.
@@ -2614,6 +2619,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
         DispatchMessageW(&msg);
     }
 
+    g_quitting.store(true); // deferred startup work must stand down too
     g_indexStop.store(true); // stop the indexer, then join it (bounded: ~2s)
     if (g_indexThread.joinable()) g_indexThread.join();
     delete g_pendingIndex.exchange(nullptr); // published but never consumed

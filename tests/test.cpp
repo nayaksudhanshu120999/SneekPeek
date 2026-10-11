@@ -192,6 +192,34 @@ int main() {
         for (size_t i = 1; i < vars.size(); i++)
             CHECK(_wcsicmp(vars[i - 1].c_str(), vars[i].c_str()) <= 0);
     }
+    // app index cache round-trip (+ corrupt rejection)
+    {
+        wchar_t tmp[MAX_PATH];
+        CHECK(GetTempPathW(MAX_PATH, tmp) != 0);
+        std::wstring f = std::wstring(tmp) + L"sneekpeek_test_cache.bin";
+        std::vector<AppEntry> a = {
+            {L"Camera", L"shell:AppsFolder\\Microsoft.WindowsCamera_8wekyb3d8bbwe!App", L"camera", true},
+            {L"Notepad", L"C:\\x\\notepad.lnk", L"notepad", false},
+        };
+        CHECK(SaveAppCache(f, a));
+        std::vector<AppEntry> b;
+        CHECK(LoadAppCache(f, b));
+        CHECK(b.size() == 2 && b[0].name == L"Camera" && b[0].isStore &&
+              b[0].lower == L"camera" && b[1].target == L"C:\\x\\notepad.lnk" &&
+              !b[1].isStore);
+        DeleteFileW(f);
+        HANDLE hf = CreateFileW(f.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        DWORD w = 0;
+        const char junk[20] = {0}; // bad magic
+        if (hf != INVALID_HANDLE_VALUE) {
+            WriteFile(hf, junk, sizeof(junk), &w, NULL);
+            CloseHandle(hf);
+        }
+        std::vector<AppEntry> c;
+        CHECK(!LoadAppCache(f, c) && c.empty());
+        CHECK(!LoadAppCache(L"Z:\\no\\such\\file.bin", c));
+        DeleteFileW(f);
+    }
     if (g_fail == 0) printf("ALL TESTS PASSED\n");
     return g_fail ? 1 : 0;
 }
