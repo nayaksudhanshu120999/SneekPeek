@@ -343,6 +343,8 @@ static void ExecuteFileSelected(bool inExplorer);
 static std::wstring SystemExe(const wchar_t* name);
 static void RebuildListControl();
 static int CurrentSelection();
+static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
+                                     UINT_PTR id, DWORD_PTR ref);
 static void CloseCellEdit(bool commit);
 static void ApplyAwake();
 static void RequestOnline(const std::wstring& q);
@@ -1045,8 +1047,11 @@ static void RebuildListControl() {
     // selectable row (headers never take Enter).
     if (g_chipsFocus && !g_chips.empty())
         SendMessageW(g_hwndList, LB_SETCURSEL, (WPARAM)-1, 0);
-    else
-        SendMessageW(g_hwndList, LB_SETCURSEL, FirstSelectable(g_results), 0);
+    else {
+        int first = FirstSelectable(g_results);
+        SendMessageW(g_hwndList, LB_SETCURSEL, first, 0);
+        EnsureVisible(first);
+    }
 
     bool showChips = !g_chips.empty();
     bool showBar = InFileMode() && !g_fileDir.empty();
@@ -1088,9 +1093,8 @@ static void RebuildListControl() {
     InvalidateRect(g_hwndList, NULL, FALSE);
     if (showChips) InvalidateRect(g_hwndChipRow, NULL, FALSE);
     if (showBar) InvalidateRect(g_hwndFileBar, NULL, FALSE);
-    // Vertical scroll without a visible bar: the window stays compact (max 9
-    // rows) while longer file lists scroll via arrows + mouse wheel.
-    ShowScrollBar(g_hwndList, SB_VERT, FALSE);
+    // No scrollbar by construction (WS_VSCROLL removed): longer file lists
+    // scroll via EnsureVisible on arrows + wheel. Vertical only.
 }
 
 // Domain-shaped input lives in bangs.h now (shared with the unit tests).
@@ -1467,6 +1471,64 @@ static void SyncSelToBox(int listSel) {
     g_changingEdit = false;
 }
 
+// No scrollbar anywhere (WS_VSCROLL removed): scrolling is driven by us.
+// After any programmatic selection change, pin the view so the row shows.
+static void EnsureVisible(int sel) {
+    if (sel < 0 || !g_hwndList) return;
+    int top = (int)SendMessageW(g_hwndList, LB_GETTOPINDEX, 0, 0);
+    RECT lr; GetClientRect(g_hwndList, &lr);
+    int vis = (lr.bottom - lr.top) / kItemH;
+    if (vis < 1) vis = 1;
+    if (sel < top)
+        SendMessageW(g_hwndList, LB_SETTOPINDEX, sel, 0);
+    else if (sel >= top + vis)
+        SendMessageW(g_hwndList, LB_SETTOPINDEX, sel - vis + 1, 0);
+}
+
+// Multi-step arrow motion (shared by keys + wheel), no wrapping.
+static void MoveSelSteps(int steps) {
+    if (steps == 0 || g_results.empty()) return;
+    EnsureNavStart();
+    int sel = (int)SendMessageW(g_hwndList, LB_GETCURSEL, 0, 0);
+    int dir = (steps > 0) ? +1 : -1;
+    int to = sel;
+    for (int i = 0, n = steps > 0 ? steps : -steps; i < n; i++) {
+        int nx = MoveSelNoWrap(to, dir);
+        if (nx < 0) break; // past either end: stop, list stays
+        to = nx;
+    }
+    if (to != sel && to >= 0) {
+        SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
+        SyncSelToBox(to);
+        EnsureVisible(to);
+    }
+    InvalidateRect(g_hwndList, NULL, FALSE);
+    if (!g_chips.empty()) InvalidateRect(g_hwndChipRow, NULL, FALSE);
+}
+
+// Vertical mouse wheel: moves selection (3 rows per notch) only when the
+// list overflows the visible area; otherwise ignored. Horizontal ignored.
+static void WheelScrollList(int delta) {
+    if (!g_hwndList || !IsWindowVisible(g_hwndList)) return;
+    RECT lr; GetClientRect(g_hwndList, &lr);
+    int vis = (lr.bottom - lr.top) / kItemH;
+    if (vis < 1) vis = 1;
+    if ((int)g_results.size() <= vis) return; // nothing to scroll
+    int notches = delta / WHEEL_DELTA;
+    int move = -notches * 3; // wheel up = toward first row
+    if (move == 0) move = (delta > 0) ? -1 : 1; // partial notch
+    MoveSelSteps(move);
+}
+
+static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
+                                     UINT_PTR, DWORD_PTR) {
+    if (m == WM_MOUSEWHEEL) {
+        WheelScrollList(GET_WHEEL_DELTA_WPARAM(w));
+        return 0;
+    }
+    return DefSubclassProc(h, m, w, l);
+}
+
 // ------------------------------------------------------------- edit subclass
 // WM_CHAR swallowing kills the system beep: a single-line EDIT beeps for
 // Enter/Esc/Tab chars it cannot insert.
@@ -1474,6 +1536,10 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                                     UINT_PTR, DWORD_PTR) {
     if (m == WM_CHAR) {
         if (w == 13 || w == 10 || w == 27 || w == 9) return 0;
+    }
+    if (m == WM_MOUSEWHEEL) {
+        WheelScrollList(GET_WHEEL_DELTA_WPARAM(w));
+        return 0;
     }
     if (m == WM_KEYDOWN) {
         int sel = (int)SendMessageW(g_hwndList, LB_GETCURSEL, 0, 0);
@@ -1515,7 +1581,7 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                 EnsureNavStart();
                 int to = MoveSelNoWrap(-1, +1);
                 SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
-                if (to >= 0) SyncSelToBox(to);
+                if (to >= 0) { SyncSelToBox(to); EnsureVisible(to); }
                 InvalidateRect(g_hwndChipRow, NULL, FALSE);
                 InvalidateRect(g_hwndList, NULL, FALSE);
             } else if (count > 0) {
@@ -1524,6 +1590,7 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                 if (to >= 0) {
                     SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
                     SyncSelToBox(to);
+                    EnsureVisible(to);
                 } else {
                     RestoreOrigSel(); // past last: back to the typed text
                 }
@@ -1545,6 +1612,7 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                 if (to >= 0) {
                     SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
                     SyncSelToBox(to);
+                    EnsureVisible(to);
                 } else {
                     RestoreOrigSel(); // above first: back to the typed text
                 }
@@ -1747,6 +1815,9 @@ static LRESULT CALLBACK FileBarProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     }
+    case WM_MOUSEWHEEL: // wheel over the bar scrolls the list above it
+        WheelScrollList(GET_WHEEL_DELTA_WPARAM(w));
+        return 0;
     }
     return DefWindowProcW(hwnd, m, w, l);
 }
@@ -1783,9 +1854,10 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
 
         g_hwndList = CreateWindowExW(0, L"LISTBOX", L"",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | LBS_NOTIFY | LBS_OWNERDRAWFIXED |
-            LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT | WS_VSCROLL,
+            LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
             16, kInputH, kWidth - 32, kItemH,
             hwnd, (HMENU)2, g_hInst, NULL);
+        SetWindowSubclass(g_hwndList, ListSubclass, 2, 0);
         break;
     }
     case WM_ERASEBKGND: {
