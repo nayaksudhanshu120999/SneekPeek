@@ -3,7 +3,7 @@
 One hotkey. One text box. Zero idle cost.
 
 - Press **Ctrl+Space** → only a search bar appears (nothing else until you type).
-- Type → fuzzy **app search** (Start Menu, exe-only, plus Store apps), **system settings pages**, **power/awake/bang/quick chips**, **web search** with live **online suggestions** (<0.5s), calculator — grouped under one header per section.
+- Type → fuzzy **app search** (Start Menu, exe-only, plus Store apps), **system settings pages**, **power/awake/bang/quick chips**, **web search**, calculator — grouped under one header per section.
 - **Enter** always runs the top *actionable* result (never a section heading — with nothing selected it searches the typed text) — the palette hides instantly, before the app even opens. Click anywhere outside (or `Esc`) → it disappears. Failed launches report a tray balloon; clicking it reopens the palette to retry.
 - Next **Ctrl+Space** → fresh empty bar.
 - Tray icon → **Settings… / Refresh apps / Run at startup / Quit**.
@@ -16,7 +16,7 @@ Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 | Input | Action |
 |---|---|
 | `code` | fuzzy-matches apps (`Visual Studio Code`), Enter launches |
-| `anything else` | Enter → web search with your engine (default DuckDuckGo) + live online suggestions (typically <0.5s on a warm connection; per-phase network caps, local-only fallback) |
+| `anything else` | Enter → web search with your engine (default DuckDuckGo) |
 | `google.com` | URL-shaped input opens the site directly (scheme optional, `https` assumed) |
 | `yt` | matching site bangs appear as chips above the list — Enter arms the chip (`yt` + `Space` does the same): just the pill in the bar, no list — type the query, Enter searches (Backspace on empty query or click `x` exits) |
 | `!g cats` | one-shot bang without the chip (Google for `cats`) |
@@ -84,7 +84,7 @@ Notes:
 
 Tray → **Settings…** (tabbed, dark, matches the app — every change saves instantly, no Save button). Stored in `%APPDATA%\SneekPeek\settings.ini`:
 
-- **General** — engine (DuckDuckGo / Google / Bing / Brave / Custom URL with `%s`), browser for web + bang + quick links (System default or picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe`), online suggestions on/off (sends typed text to DuckDuckGo; off = fully local)
+- **General** — engine (DuckDuckGo / Google / Bing / Brave / Custom URL with `%s`), browser for web + bang + quick links (System default or picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe`)
 - **Hidden apps** — checkbox list of every indexed app; checked ones never appear in suggestions
 - **Bangs** — table (Aliases / Name / URL, `https://` or `http://` only): Add appends an editable row, double-click any cell to edit in place, Del or Remove deletes rows, colors auto-picked
 - **Quick links** — table (Name / URL, `https://` or `http://` only) with the same editing; typing the name in the palette shows a chip that opens the fixed URL on Enter (e.g. Gmail)

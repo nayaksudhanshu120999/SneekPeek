@@ -32,7 +32,6 @@
 #include <commdlg.h>
 #include <powrprof.h>
 #include <gdiplus.h>
-#include <winhttp.h>
 #include <cwctype>
 #include <cmath>
 #include <cstdio>
@@ -65,7 +64,6 @@
 #pragma comment(lib, "powrprof.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "gdiplus.lib")
-#pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "gdiplus.lib")
 
 // ---------------------------------------------------------------- constants
@@ -78,7 +76,6 @@ static const wchar_t* kMutexName     = L"SneekPeek_SingleInstance_v1";
 static const UINT HOTKEY_ID = 1;
 static const UINT WM_TRAYICON = WM_APP + 10;
 static const UINT WM_APP_SHOW = WM_APP + 11;
-static const UINT WM_APP_ONLINE = WM_APP + 21; // background suggestions arrived
 static const UINT ID_TRAY_SETTINGS = 1001;
 static const UINT ID_TRAY_REFRESH  = 1002;
 static const UINT ID_TRAY_STARTUP   = 1003;
@@ -115,7 +112,6 @@ enum {
     IDC_QUICK_LIST = 120, IDC_QUICK_NAME = 121, IDC_QUICK_URL = 122,
     IDC_QUICK_ADD = 123, IDC_QUICK_UPDATE = 124, IDC_QUICK_DEL = 125,
     IDC_SAVE = 201, IDC_RESCAN = 202, IDC_CLOSE = 203,
-    IDC_CHK_ONLINE = 204,
     IDC_PAGE_0 = 301, IDC_PAGE_1, IDC_PAGE_2, IDC_PAGE_3,
 };
 
@@ -187,7 +183,6 @@ static int         g_settingsPage = 0;
 static HWND        g_hwndEngineCombo = NULL;
 static HWND        g_hwndEngineUrl = NULL;
 static HWND        g_hwndBrowserCombo = NULL;
-static HWND        g_hwndChkOnline = NULL;
 static HWND        g_hwndSavedLabel = NULL; // "Saved HH:MM:SS" indicator
 static HWND        g_hwndAppsList = NULL;
 static HWND        g_hwndBangsList = NULL;
@@ -305,18 +300,8 @@ static const COLORREF kAwakeCol = RGB(45, 212, 191);
 static const COLORREF kFileCol = RGB(96, 165, 250);   // files: blue
 static const COLORREF kFolderCol = RGB(251, 191, 36); // folders/drives: amber
 
-// Awake state + online worker state (see below).
+// Awake state (see below).
 static bool g_awakeOn = false;
-static HANDLE g_onlineEvent = NULL;
-static HANDLE g_onlineStop = NULL;  // manual-reset: worker exits
-static HANDLE g_onlineThread = NULL;
-static std::atomic<int> g_onlineSeq{0};
-static std::wstring g_onlineRequested;
-static std::wstring g_onlineFor;
-static std::vector<std::wstring> g_online;
-static SRWLOCK g_onlineLock = SRWLOCK_INIT;
-static std::unordered_map<std::wstring, std::vector<std::wstring>> g_sugCache;
-static bool g_warmedUp = false;
 
 // ------------------------------------------------------- forward declarations
 static void ShowPalette();
@@ -348,7 +333,6 @@ static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                                      UINT_PTR id, DWORD_PTR ref);
 static void CloseCellEdit(bool commit);
 static void ApplyAwake();
-static void RequestOnline(const std::wstring& q);
 static void SaveNow();
 static void ApplyUIFont(HWND parent);
 static void NotifyLaunchFailed(const wchar_t* msg);
@@ -506,10 +490,6 @@ static void ShowPalette() {
     SetForegroundWindow(g_hwndPalette);
     SetFocus(g_hwndEdit);
     UpdateResults();
-    if (!g_warmedUp && g_onlineEvent && g_settings.onlineOn) {
-        g_warmedUp = true;
-        RequestOnline(L"the"); // warm DNS/TLS/proxy while the user starts typing
-    }
 }
 
 static void HidePalette() {
@@ -863,123 +843,6 @@ static void ApplyAwake() {
         ? (ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
         : ES_CONTINUOUS);
 }
-
-// ------------------------------------------------- online suggestions (async)
-// One persistent HTTPS session (no per-keystroke handshake), warmed on first
-// open, debounced, hard-capped ~0.5s, plus an instant local prefix cache.
-static HINTERNET g_whSession = NULL; // worker thread only: no lock needed
-static HINTERNET g_whConnect = NULL;
-static std::vector<std::wstring> FetchSuggestions(const std::wstring& q) {
-    std::vector<std::wstring> out;
-    if (!g_whSession) {
-        g_whSession = WinHttpOpen(L"SneekPeek/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-        if (!g_whSession) return out;
-        WinHttpSetTimeouts(g_whSession, 300, 700, 300, 500); // tight per-phase caps
-    }
-    if (!g_whConnect) {
-        g_whConnect = WinHttpConnect(g_whSession, L"duckduckgo.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
-        if (!g_whConnect) { WinHttpCloseHandle(g_whSession); g_whSession = NULL; return out; }
-    }
-    std::wstring path = L"/ac/?q=" + UrlEncodeQuery(q) + L"&type=list";
-    HINTERNET hR = NULL;
-    if (g_whConnect) hR = WinHttpOpenRequest(g_whConnect, L"GET", path.c_str(), NULL, WINHTTP_NO_REFERER,
-                                             WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    std::string data;
-    bool ok = hR && WinHttpSendRequest(hR, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                       WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-              WinHttpReceiveResponse(hR, NULL);
-    if (ok) {
-        DWORD avail = 0;
-        char buf[4096];
-        while (WinHttpQueryDataAvailable(hR, &avail) && avail) {
-            DWORD chunk = avail > sizeof(buf) ? (DWORD)sizeof(buf) : avail;
-            DWORD rd = 0;
-            if (!WinHttpReadData(hR, buf, chunk, &rd) || !rd) break;
-            data.append(buf, rd);
-            if (data.size() > 16384) break;
-        }
-    } else {
-        WinHttpCloseHandle(g_whConnect); g_whConnect = NULL; // drop dead; rebuilt next
-    }
-    if (hR) WinHttpCloseHandle(hR);
-    // Collect "..." tokens; skip the echo + "phrase" keys; unescape basics.
-    bool first = true;
-    for (size_t i = 0; i < data.size() && out.size() < 5;) {
-        if (data[i] != '"') { i++; continue; }
-        std::string tok;
-        i++;
-        while (i < data.size() && data[i] != '"') {
-            if (data[i] == '\\' && i + 1 < data.size()) { i++; tok += data[i++]; }
-            else tok += data[i++];
-        }
-        if (i < data.size()) i++;
-        if (first) { first = false; continue; }
-        if (tok.empty() || tok == "phrase") continue;
-        int n = MultiByteToWideChar(CP_UTF8, 0, tok.c_str(), (int)tok.size(), NULL, 0);
-        if (n > 0) {
-            std::wstring w((size_t)n, L'\0');
-            MultiByteToWideChar(CP_UTF8, 0, tok.c_str(), (int)tok.size(), w.data(), n);
-            out.push_back(std::move(w));
-        }
-    }
-    return out;
-}
-
-static void CloseOnlineNet() {
-    if (g_whConnect) { WinHttpCloseHandle(g_whConnect); g_whConnect = NULL; }
-    if (g_whSession) { WinHttpCloseHandle(g_whSession); g_whSession = NULL; }
-}
-
-static DWORD WINAPI OnlineWorker(LPVOID) {
-    HANDLE wait[2] = { g_onlineEvent, g_onlineStop };
-    for (;;) {
-        if (WaitForMultipleObjects(2, wait, FALSE, INFINITE) != WAIT_OBJECT_0)
-            break; // stop signaled: exit cleanly, no more network use
-        int seq;
-        std::wstring q;
-        AcquireSRWLockExclusive(&g_onlineLock);
-        seq = g_onlineSeq.load();
-        q = g_onlineRequested;
-        ReleaseSRWLockExclusive(&g_onlineLock);
-        Sleep(130); // debounce: let fast typing settle
-        AcquireSRWLockExclusive(&g_onlineLock);
-        bool stale = (seq != g_onlineSeq.load());
-        ReleaseSRWLockExclusive(&g_onlineLock);
-        if (stale || q.size() < 2) continue;
-        std::vector<std::wstring> out = FetchSuggestions(q);
-        AcquireSRWLockExclusive(&g_onlineLock);
-        bool current = (seq == g_onlineSeq.load());
-        if (current) {
-            g_online = out;
-            g_onlineFor = q;
-            g_sugCache[q] = out; // instant next time (<5ms, offline-safe)
-            if (g_sugCache.size() > 60) {
-                // keep it bounded: drop everything except the fresh entry
-                std::vector<std::wstring> keep = out;
-                g_sugCache.clear();
-                g_sugCache[q] = std::move(keep);
-            }
-        }
-        ReleaseSRWLockExclusive(&g_onlineLock);
-        if (current) PostMessageW(g_hwndPalette, WM_APP_ONLINE, (WPARAM)seq, 0);
-    }
-    CloseOnlineNet();
-    return 0;
-}
-
-// Ask the worker for fresh suggestions unless already requested.
-static void RequestOnline(const std::wstring& q) {
-    if (q.size() < 2 || !g_onlineEvent || !g_settings.onlineOn) return;
-    AcquireSRWLockExclusive(&g_onlineLock);
-    bool need = (q != g_onlineRequested);
-    if (need) {
-        g_onlineRequested = q;
-        g_onlineSeq++;
-    }
-    ReleaseSRWLockExclusive(&g_onlineLock);
-    if (need) SetEvent(g_onlineEvent);
-}
 static ResultItem MakeAppRow(const AppEntry& app) {
     ResultItem r;
     r.kind = ResultKind::App;
@@ -1192,22 +1055,9 @@ static void UpdateResults() {
         return;
     }
 
-    // --- normal: sectioned results (Calculator / Apps / Settings / Web / Online)
+    // --- normal: sectioned results (Calculator / Apps / Settings / Web)
     std::vector<ResultItem> calcRows;
     calcRows.swap(g_results); // whatever the calculator produced above
-
-    RequestOnline(q);
-    std::vector<std::wstring> online;
-    if (g_settings.onlineOn) {
-        AcquireSRWLockShared(&g_onlineLock);
-        if (g_onlineFor == q) online = g_online;
-        else {
-            auto cit = g_sugCache.find(q);
-            if (cit != g_sugCache.end()) online = cit->second;
-        }
-        ReleaseSRWLockShared(&g_onlineLock);
-    } // off = no online rows at all (cached ones stay stored, just hidden)
-    if (online.size() > 3) online.resize(3);
 
     std::vector<ResultItem> appRows;
     if (g_indexReady.load()) {
@@ -1238,13 +1088,6 @@ static void UpdateResults() {
         webRows.push_back(std::move(web));
     }
 
-    std::vector<ResultItem> onlineRows;
-    for (const auto& s : online) {
-        ResultItem r{ResultKind::Online, s, L"",
-                     ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(s)), kWebCol};
-        onlineRows.push_back(std::move(r));
-    }
-
     auto pushSection = [&](const wchar_t* h, std::vector<ResultItem>& rows) {
         if (rows.empty()) return;
         size_t room = g_results.size() >= 9 ? 0 : 9 - g_results.size();
@@ -1258,7 +1101,6 @@ static void UpdateResults() {
     pushSection(L"Apps", appRows);
     pushSection(L"Settings", setRows);
     pushSection(L"Web", webRows);
-    pushSection(L"Online", onlineRows);
 
     RebuildListControl();
 }
@@ -1389,7 +1231,6 @@ static void ExecuteSelected(bool forceWeb) {
         break;
     case ResultKind::Web:
     case ResultKind::Bang:
-    case ResultKind::Online:
         if ((UINT_PTR)OpenUrl(r.action, g_settings.browserPath) <= 32)
             NotifyLaunchFailed(L"Browser launch failed");
         break;
@@ -1461,8 +1302,7 @@ static void SyncSelToBox(int listSel) {
     const ResultItem& r = g_results[(size_t)listSel];
     std::wstring keep = GetEditText(g_hwndEdit);
     std::wstring t = keep;
-    if (r.kind == ResultKind::App || r.kind == ResultKind::Setting ||
-        r.kind == ResultKind::Online)
+    if (r.kind == ResultKind::App || r.kind == ResultKind::Setting)
         t = r.title;
     else if ((r.kind == ResultKind::Folder || r.kind == ResultKind::File) &&
              r.title != L"..")
@@ -2046,16 +1886,6 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         if (IsWindowVisible(hwnd)) UpdateResults();
         break;
     }
-    case WM_APP_ONLINE: // background suggestions arrived
-        if ((int)w == g_onlineSeq.load() && IsWindowVisible(hwnd)) {
-            std::wstring cur = Trim(GetEditText(g_hwndEdit));
-            AcquireSRWLockShared(&g_onlineLock);
-            bool match = (!g_online.empty() && g_onlineFor == cur && !ActiveBang() &&
-                          !InFileMode());
-            ReleaseSRWLockShared(&g_onlineLock);
-            if (match) UpdateResults(); // same query -> merges, no refetch loop
-        }
-        break;
     case WM_TRAYICON:
         if (LOWORD(l) == WM_RBUTTONUP || LOWORD(l) == WM_CONTEXTMENU)
             ShowTrayMenu(hwnd);
@@ -2251,7 +2081,7 @@ static void ShowSettingsPage(int page) {
 static HWND NewCtrl(const wchar_t* cls, const wchar_t* text, DWORD style,
                     int x, int y, int w, int h, HWND parent, UINT id) {
     DWORD st = WS_CHILD | style;
-    // All buttons owner-drawn (dark theme); auto-checkbox state still managed.
+    // All buttons owner-drawn (dark theme).
     if (wcscmp(cls, L"BUTTON") == 0)
         st |= BS_OWNERDRAW;
     // ComboBoxes owner-drawn so field + list stay dark under any system theme.
@@ -2527,17 +2357,12 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 24, 180, 360, 200, hwnd, IDC_BROWSER_COMBO));
             page(g_pageGeneral, NewCtrl(L"BUTTON", L"Browse...",
                 WS_VISIBLE, 394, 179, 122, 26, hwnd, IDC_BROWSER_BROWSE));
-            g_hwndChkOnline = page(g_pageGeneral, NewCtrl(L"BUTTON",
-                L"Online suggestions (sends typed text to DuckDuckGo)",
-                WS_VISIBLE | BS_AUTOCHECKBOX, 24, 214, 536, 22, hwnd, IDC_CHK_ONLINE));
             page(g_pageGeneral, NewCtrl(L"STATIC",
                 L"Web + bang + quick links open in the chosen browser.\r\n"
                 L"Every change saves automatically.",
-                WS_VISIBLE, 24, 242, 536, 44, hwnd, 0));
+                WS_VISIBLE, 24, 214, 536, 44, hwnd, 0));
             FillEngineCombo();
             FillBrowserCombo();
-            SendMessageW(g_hwndChkOnline, BM_SETCHECK,
-                         g_settings.onlineOn ? BST_CHECKED : BST_UNCHECKED, 0);
         }
 
         // ---- Hidden apps page (checkbox list)
@@ -2673,51 +2498,8 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             return TRUE;
         }
         if (d->CtlType != ODT_BUTTON) break;
-        // The online-suggestions box is the only checkbox: detect by handle.
-        // Style-bit detection cannot work because NewCtrl ORs BS_OWNERDRAW
-        // onto buttons, which masks the AUTOCHECKBOX type bits. Owner-drawn
-        // buttons also never auto-toggle, so WM_COMMAND flips it manually.
-        bool isCheck = (d->hwndItem == g_hwndChkOnline);
         SetBkMode(dc, TRANSPARENT);
         SelectObject(dc, g_fontUI);
-        if (isCheck) {
-            // Simple checkbox: square box + check mark, plain label beside it.
-            // State still comes from the button itself (BS_AUTOCHECKBOX
-            // toggles on click; ODS_CHECKED mirrors it), so only the
-            // painting changes here — the save path is untouched.
-            FillRect(dc, &d->rcItem, g_brBg);
-            bool on = (d->itemState & ODS_CHECKED) != 0;
-            bool disabled = (d->itemState & ODS_DISABLED) != 0;
-            int bs = 16; // box size
-            int by = d->rcItem.top + ((d->rcItem.bottom - d->rcItem.top) - bs) / 2;
-            RECT box{d->rcItem.left + 2, by, d->rcItem.left + 2 + bs, by + bs};
-            HBRUSH bg = CreateSolidBrush(on ? RGB(29, 65, 115) : RGB(26, 26, 28));
-            HPEN pen = CreatePen(PS_SOLID, 1, disabled ? RGB(80, 80, 86)
-                                : ((d->itemState & ODS_FOCUS) ? RGB(130, 130, 140)
-                                                             : RGB(110, 110, 118)));
-            HGDIOBJ oldB = SelectObject(dc, bg);
-            HGDIOBJ oldP = SelectObject(dc, pen);
-            Rectangle(dc, box.left, box.top, box.right, box.bottom);
-            SelectObject(dc, oldB); SelectObject(dc, oldP);
-            DeleteObject(bg); DeleteObject(pen);
-            if (on) {
-                HPEN cp = CreatePen(PS_SOLID, 2,
-                                    disabled ? RGB(120, 120, 126) : RGB(255, 255, 255));
-                HGDIOBJ ocp = SelectObject(dc, cp);
-                MoveToEx(dc, box.left + 4, box.top + 8, NULL);
-                LineTo(dc, box.left + 7, box.top + 11);
-                LineTo(dc, box.left + 12, box.top + 5);
-                SelectObject(dc, ocp);
-                DeleteObject(cp);
-            }
-            wchar_t text[128] = {0};
-            GetWindowTextW(d->hwndItem, text, 128);
-            SetTextColor(dc, disabled ? kSub : kText);
-            RECT tr = d->rcItem; tr.left = box.right + 8;
-            DrawTextW(dc, text, -1, &tr,
-                      DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
-            return TRUE;
-        }
         bool pressed = (d->itemState & ODS_SELECTED) != 0;
         bool focus = (d->itemState & ODS_FOCUS) != 0;
         bool isSave = d->CtlID == (UINT)IDC_SAVE;
@@ -2852,28 +2634,6 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             SaveEngineBrowser(hwnd); // instant save, no Save button
         } else if (id == IDC_ENGINE_URL && code == EN_KILLFOCUS) {
             SaveEngineBrowser(hwnd);
-        } else if (id == IDC_CHK_ONLINE) {
-            // Owner-drawn buttons never auto-toggle: flip the state ourselves
-            // (programmatic BM_SETCHECK during setup sends no notification,
-            // so this only runs on real clicks).
-            if (code == BN_CLICKED && !g_fillingSettings) {
-                bool on = SendMessageW(g_hwndChkOnline, BM_GETCHECK, 0, 0) != BST_CHECKED;
-                SendMessageW(g_hwndChkOnline, BM_SETCHECK,
-                             on ? BST_CHECKED : BST_UNCHECKED, 0);
-                InvalidateRect(g_hwndChkOnline, NULL, FALSE);
-            }
-            g_settings.onlineOn =
-                SendMessageW(g_hwndChkOnline, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            SaveSettings(g_settings);
-            if (!g_settings.onlineOn) {
-                AcquireSRWLockExclusive(&g_onlineLock);
-                g_online.clear();
-                g_onlineFor.clear();
-                g_onlineRequested.clear();
-                g_onlineSeq++;
-                ReleaseSRWLockExclusive(&g_onlineLock);
-                if (g_hwndPalette && IsWindowVisible(g_hwndPalette)) UpdateResults();
-            }
         } else if (id == IDC_BROWSER_COMBO && code == CBN_SELCHANGE) {
             int sel = (int)SendMessageW(g_hwndBrowserCombo, CB_GETCURSEL, 0, 0);
             int count = (int)SendMessageW(g_hwndBrowserCombo, CB_GETCOUNT, 0, 0);
@@ -2949,7 +2709,6 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     case WM_DESTROY:
         g_hwndSettings = NULL;
         g_hwndCellEdit = NULL;
-        g_hwndChkOnline = NULL;
         g_hwndSavedLabel = NULL;
         g_cellLv = 0; g_cellRow = -1; g_cellCol = 0;
         g_hwndEngineCombo = g_hwndEngineUrl = g_hwndBrowserCombo = NULL;
@@ -3110,12 +2869,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     // Costs one short burst; afterwards the thread exits (0% CPU).
     BuildIndexAsync();
 
-    // Suggestion worker: one thread, event-driven, sleeps until typed to.
-    g_onlineEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
-    g_onlineStop = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (g_onlineEvent && g_onlineStop)
-        g_onlineThread = CreateThread(NULL, 0, OnlineWorker, NULL, 0, NULL);
-
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
         // Dialog-manager keys (Tab navigation) for Settings.
@@ -3129,21 +2882,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     g_indexStop.store(true); // stop the indexer, then join it (bounded: ~2s)
     if (g_indexThread.joinable()) g_indexThread.join();
     delete g_pendingIndex.exchange(nullptr); // published but never consumed
-    if (g_onlineStop) SetEvent(g_onlineStop); // stop the suggestion worker
-    if (g_onlineThread) {
-        if (WaitForSingleObject(g_onlineThread, 5000) != WAIT_OBJECT_0) {
-            // Stuck inside WinHTTP: closing the session/connect from here
-            // aborts the pending call; the worker then exits promptly.
-            // Worst case a transient handle leaks in a dying process.
-            if (g_whSession) { WinHttpCloseHandle(g_whSession); g_whSession = NULL; }
-            if (g_whConnect) { WinHttpCloseHandle(g_whConnect); g_whConnect = NULL; }
-            WaitForSingleObject(g_onlineThread, 2000);
-        }
-        CloseHandle(g_onlineThread);
-        g_onlineThread = NULL;
-    }
-    if (g_onlineEvent) CloseHandle(g_onlineEvent);
-    if (g_onlineStop) CloseHandle(g_onlineStop);
     UnregisterHotKey(g_hwndPalette, HOTKEY_ID);
     SetThreadExecutionState(ES_CONTINUOUS); // release any Awake hold
     DeleteObject(g_fontInput); DeleteObject(g_fontTitle);

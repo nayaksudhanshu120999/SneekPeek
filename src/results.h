@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-enum class ResultKind { App, Web, Bang, Calc, Setting, Header, Online, Folder, File, Explorer };
+enum class ResultKind { App, Web, Bang, Calc, Setting, Header, Folder, File, Explorer };
 
 struct ResultItem {
     ResultKind kind;
