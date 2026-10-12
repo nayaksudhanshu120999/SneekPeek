@@ -858,6 +858,44 @@ static void PushAppRow(const AppEntry& app) {
     g_results.push_back(MakeAppRow(app));
 }
 
+// ------------------------------------------------------- app row icons
+// Real icons, apps only: a small process-lifetime LRU (bounded, never
+// persisted) keyed by launch target. Store/shell: targets have no file icon
+// and keep the generic glyph. Extraction runs on the UI thread for visible
+// rows only (a few app rows per repaint); misses evict oldest-first.
+// Cleared whenever a fresh index is adopted.
+struct AppIconEntry { std::wstring target; HICON h; };
+static std::vector<AppIconEntry> g_appIcons;
+static const size_t kMaxAppIcons = 64;
+static void ClearAppIconCache() {
+    for (size_t i = 0; i < g_appIcons.size(); i++)
+        if (g_appIcons[i].h) DestroyIcon(g_appIcons[i].h);
+    g_appIcons.clear();
+}
+static HICON AppRowIcon(const std::wstring& target) {
+    if (target.empty()) return NULL;
+    if (target.compare(0, 6, L"shell:") == 0) return NULL; // Store/shell row
+    for (size_t i = 0; i < g_appIcons.size(); i++) {
+        if (g_appIcons[i].target == target) {
+            AppIconEntry hit = g_appIcons[i]; // copy: vector mutates below
+            g_appIcons.erase(g_appIcons.begin() + i);
+            g_appIcons.push_back(hit); // most-recently-used last
+            return hit.h;
+        }
+    }
+    SHFILEINFOW sfi{};
+    if (!SHGetFileInfoW(target.c_str(), 0, &sfi, sizeof(sfi),
+                        SHGFI_ICON | SHGFI_LARGEICON))
+        return NULL;
+    if (!sfi.hIcon) return NULL;
+    if (g_appIcons.size() >= kMaxAppIcons) {
+        if (g_appIcons.front().h) DestroyIcon(g_appIcons.front().h);
+        g_appIcons.erase(g_appIcons.begin());
+    }
+    g_appIcons.push_back({target, sfi.hIcon});
+    return sfi.hIcon;
+}
+
 // Prefix-matched power + bang + quick-link chips (separate row above list).
 static void BuildChips(const std::wstring& qlower) {
     g_chips.clear();
@@ -1297,6 +1335,7 @@ static void RestoreOrigSel() {
                      (WPARAM)g_origQuery.size(), (LPARAM)g_origQuery.size());
         g_changingEdit = false;
     }
+    g_navigating = false; // back at the typed text: fresh arrow cycling
 }
 static void SyncSelToBox(int listSel) {
     if (listSel < 0 || listSel >= (int)g_results.size()) return;
@@ -1465,23 +1504,31 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
             }
             return 0;
         case VK_BACK:
-            // Empty query + Backspace exits file/bang mode (file mode goes up first).
-            if (GetWindowTextLengthW(h) == 0) {
-                if (InFileMode()) {
+            if (InFileMode()) {
+                // Go up when the box is empty OR holds an arrow-mirrored name:
+                // only a user-typed filter gets normal letter deletion.
+                bool empty = GetWindowTextLengthW(h) == 0;
+                if (empty || g_navigating) {
                     if (!g_fileDir.empty()) {
                         g_fileDir = ParentDirOf(g_fileDir); // up one, drives at root
                         if (g_fileDir.empty()) RefreshDriveCache();
                     } else
                         DeactivateFileMode(); // drive list -> exit file mode
                     g_navigating = false;
+                    g_changingEdit = true; // programmatic clear: no refilter
+                    SetWindowTextW(h, L"");
+                    SendMessageW(h, EM_SETSEL, 0, 0);
+                    g_changingEdit = false;
                     UpdateResults();
                     return 0;
                 }
-                if (g_activeBang >= 0) {
-                    DeactivateBang();
-                    UpdateResults();
-                    return 0;
-                }
+                break; // typed filter: Backspace deletes a letter as usual
+            }
+            // Empty query + Backspace exits bang-chip mode.
+            if (g_activeBang >= 0 && GetWindowTextLengthW(h) == 0) {
+                DeactivateBang();
+                UpdateResults();
+                return 0;
             }
             break;
         case VK_F5:
@@ -1805,14 +1852,25 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 return TRUE;
             }
             // Kind icon replaces the old accent bar: shape carries the category.
+            // App rows try their real icon first (apps-only extraction).
             {
                 FileGlyph fg = GlyphForResult(r.kind, r.title, r.action, r.color);
                 int isz = Dpx(20);
                 int icy = (d->rcItem.top + d->rcItem.bottom) / 2;
                 RECT cell{d->rcItem.left + Dpx(14), icy - isz / 2,
                           d->rcItem.left + Dpx(14) + isz, icy + isz / 2};
-                wchar_t letter = r.title.empty() ? L'?' : r.title[0];
-                PaintGlyph(dc, cell, fg, sel, letter, g_fontChip);
+                bool drewIcon = false;
+                if (r.kind == ResultKind::App) {
+                    if (HICON h = AppRowIcon(r.action)) {
+                        DrawIconEx(dc, cell.left, cell.top, h, isz, isz,
+                                   0, NULL, DI_NORMAL);
+                        drewIcon = true;
+                    }
+                }
+                if (!drewIcon) {
+                    wchar_t letter = r.title.empty() ? L'?' : r.title[0];
+                    PaintGlyph(dc, cell, fg, sel, letter, g_fontChip);
+                }
             }
 
             RECT tr = d->rcItem; tr.left += Dpx(44); tr.right -= Dpx(10);
@@ -1884,6 +1942,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             g_apps.swap(*p);
             delete p;
             g_indexReady.store(true);
+            ClearAppIconCache(); // targets may have changed
             SaveAppCache(AppCachePath(), g_apps); // persist for instant restart
         }
         RefreshAppsListPreservingChecks();
@@ -2893,6 +2952,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     DeleteObject(g_brBg); DeleteObject(g_brInput); DeleteObject(g_brSel);
     if (g_hIconBig) DestroyIcon(g_hIconBig);
     if (g_hIconSmall) DestroyIcon(g_hIconSmall);
+    ClearAppIconCache();
     Gdiplus::GdiplusShutdown(g_gdiplusToken);
     CloseHandle(mutex);
     return (int)msg.wParam;
