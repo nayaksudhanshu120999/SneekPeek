@@ -49,6 +49,7 @@
 #include "bangs.h"
 #include "calc.h"
 #include "files.h"
+#include "icons.h"
 #include "settings.h"
 #include "syspages.h"
 #include "results.h"
@@ -1803,15 +1804,18 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                 return TRUE;
             }
-            // Category color bar: thin, brighter when selected.
-            HBRUSH bar = CreateSolidBrush(sel ? r.color : Darken(r.color, 65));
-            RECT br = d->rcItem;
-            br.left += 14; br.right = br.left + 2;
-            br.top += 9; br.bottom -= 9;
-            FillRect(dc, &br, bar);
-            DeleteObject(bar);
+            // Kind icon replaces the old accent bar: shape carries the category.
+            {
+                FileGlyph fg = GlyphForResult(r.kind, r.title, r.action, r.color);
+                int isz = Dpx(20);
+                int icy = (d->rcItem.top + d->rcItem.bottom) / 2;
+                RECT cell{d->rcItem.left + Dpx(14), icy - isz / 2,
+                          d->rcItem.left + Dpx(14) + isz, icy + isz / 2};
+                wchar_t letter = r.title.empty() ? L'?' : r.title[0];
+                PaintGlyph(dc, cell, fg, sel, letter, g_fontChip);
+            }
 
-            RECT tr = d->rcItem; tr.left += 30; tr.right -= 10;
+            RECT tr = d->rcItem; tr.left += Dpx(44); tr.right -= Dpx(10);
             SetTextColor(dc, sel ? kText : RGB(218, 218, 226));
             SelectObject(dc, g_fontTitle);
             DrawTextW(dc, r.title.c_str(), -1, &tr,

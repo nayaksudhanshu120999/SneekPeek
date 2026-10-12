@@ -105,6 +105,7 @@ src/main.cpp       window, hotkey, tray, palette UI, execution  (WinMain)
 src/app_index.h/.cpp  Start Menu scan + fuzzy rank (lazy, one-shot)
 src/bangs.h        !bang table + URL encoding (header-only)
 src/files.h        single-level file browser: names + count only (header-only)
+src/icons.h        predefined kind/extension glyphs, drawn not loaded (header-only)
 src/settings.h     INI load/save + Run-at-startup (header-only)
 src/app.ico        app/tray icon (multi-size, built from search.png)
 src/app.rc         icon + version info resources

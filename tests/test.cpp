@@ -9,6 +9,7 @@
 #include "calc.h"
 #include "bangs.h"
 #include "files.h"
+#include "icons.h"
 #include "minjson.h"
 #include "settings.h"
 #include "results.h"
@@ -202,6 +203,23 @@ int main() {
         CHECK(FormatFileCount(0) == L"0 items");
         CHECK(FormatFileCount(1) == L"1 item");
         CHECK(FormatFileCount(42) == L"42 items");
+        // extension -> glyph mapping (case-insensitive, last dot wins)
+        CHECK(FileGlyphFor(L"setup.exe", false).style == GlyphStyle::Exe);
+        CHECK(FileGlyphFor(L"a.TXT", false).style == GlyphStyle::DocLines);
+        CHECK(FileGlyphFor(L"archive.tar.gz", false).style == GlyphStyle::Archive);
+        CHECK(FileGlyphFor(L"song.MP3", false).style == GlyphStyle::Audio);
+        CHECK(FileGlyphFor(L"noext", false).style == GlyphStyle::FilePage);
+        CHECK(FileGlyphFor(L"file.", false).style == GlyphStyle::FilePage);
+        CHECK(FileGlyphFor(L"backup.zip", true).style == GlyphStyle::Folder);
+        // rows -> glyphs (drives detected by path, bang keeps its color)
+        CHECK(GlyphForResult(ResultKind::Folder, L"Win 10 (C:)", L"C:\\", RGB(0, 0, 0)).style ==
+              GlyphStyle::Drive);
+        CHECK(GlyphForResult(ResultKind::Folder, L"..", L"", RGB(0, 0, 0)).style ==
+              GlyphStyle::Folder);
+        CHECK(GlyphForResult(ResultKind::File, L"x.mp3", L"E:\\x.mp3", RGB(0, 0, 0)).style ==
+              GlyphStyle::Audio);
+        CHECK(GlyphForResult(ResultKind::Bang, L"cats", L"https://x", RGB(1, 2, 3)).color ==
+              RGB(1, 2, 3));
         CHECK(DriveTitle(L"C:\\", L"Win 10") == L"Win 10 (C:)");
         CHECK(DriveTitle(L"M:\\", L"Music") == L"Music (M:)");
         CHECK(DriveTitle(L"D:\\", L"") == L"D:\\");
