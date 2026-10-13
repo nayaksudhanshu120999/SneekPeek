@@ -48,6 +48,25 @@ inline int FileMatchRank(const std::wstring& nameLower, const std::wstring& filt
     return nameLower.find(filterLower) != std::wstring::npos ? 2 : -1;
 }
 
+// Shared ordering for every ranked name list in the app: best rank first,
+// then earliest occurrence ("c++ projects" beats "c file dev c++" for "++"),
+// then case-insensitive alphabetical. Empty filter = pure alphabetical.
+inline bool RankedNameLess(const std::wstring& aLower, const std::wstring& bLower,
+                           const std::wstring& filterLower,
+                           const std::wstring& aOrig, const std::wstring& bOrig) {
+    if (!filterLower.empty()) {
+        int ra = FileMatchRank(aLower, filterLower);
+        int rb = FileMatchRank(bLower, filterLower);
+        if (ra != rb) return ra < rb;
+        size_t pa = aLower.find(filterLower);
+        size_t pb = bLower.find(filterLower);
+        if (pa != pb) return pa < pb;
+    }
+    int c = _wcsicmp(aOrig.c_str(), bOrig.c_str());
+    if (c != 0) return c < 0;
+    return aOrig < bOrig;
+}
+
 // Folders first, then best match first, then case-insensitive alphabetical.
 // Empty filter keeps the classic folders-first alphabetical order.
 inline void SortFileEntries(std::vector<FileEntry>& v, const std::wstring& filterLower = L"") {
@@ -57,14 +76,7 @@ inline void SortFileEntries(std::vector<FileEntry>& v, const std::wstring& filte
     for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
     std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
         if (v[a].isDir != v[b].isDir) return v[a].isDir > v[b].isDir;
-        if (!filterLower.empty()) {
-            int ra = FileMatchRank(low[a], filterLower);
-            int rb = FileMatchRank(low[b], filterLower);
-            if (ra != rb) return ra < rb;
-        }
-        int c = _wcsicmp(v[a].name.c_str(), v[b].name.c_str());
-        if (c != 0) return c < 0;
-        return v[a].name < v[b].name;
+        return RankedNameLess(low[a], low[b], filterLower, v[a].name, v[b].name);
     });
     std::vector<FileEntry> sorted;
     sorted.reserve(v.size());
@@ -127,6 +139,15 @@ inline std::wstring DriveTitle(const std::wstring& root, const std::wstring& lab
     if (label.empty()) return root;
     std::wstring letter = root.size() >= 2 ? root.substr(0, 2) : root; // "C:"
     return label + L" (" + letter + L")";
+}
+
+// Drive list ordering: best rank, earliest occurrence, then title.
+// Headless-testable; the palette sorts DriveInfos before building rows.
+inline void SortDrivesByRank(std::vector<DriveInfo>& v, const std::wstring& filterLower) {
+    std::sort(v.begin(), v.end(), [&](const DriveInfo& a, const DriveInfo& b) {
+        return RankedNameLess(FileLower(a.title), FileLower(b.title),
+                              filterLower, a.title, b.title);
+    });
 }
 
 inline std::wstring GetDriveLabel(const std::wstring& root) {

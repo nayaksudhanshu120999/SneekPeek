@@ -249,8 +249,28 @@ int main() {
             };
             SortFileEntries(v, L"doc");
             CHECK(v.size() == 3 && v[0].name == L"Documents");
-            CHECK(v[1].name == L"ado.doc" && v[2].name == L"mydocs.txt");
+            CHECK(v[1].name == L"mydocs.txt" && v[2].name == L"ado.doc");
         }
+        // shared ordering: rank, earliest occurrence, then alphabetical
+        CHECK(RankedNameLess(L"all files (g:)", L"installed (f:)", L"all",
+                             L"ALL FILES (G:)", L"INSTALLED (F:)"));
+        CHECK(!RankedNameLess(L"installed (f:)", L"all files (g:)", L"all",
+                              L"INSTALLED (F:)", L"ALL FILES (G:)"));
+        CHECK(RankedNameLess(L"c++ projects", L"c file dev c++", L"++",
+                             L"c++ projects", L"c file dev c++"));
+        CHECK(!RankedNameLess(L"c file dev c++", L"c++ projects", L"++",
+                              L"c file dev c++", L"c++ projects"));
+        // drive sort is headless-testable: "all" puts ALL FILES first
+        {
+            std::vector<DriveInfo> d = {
+                {L"F:\\", L"INSTALLED", L"INSTALLED (F:)"},
+                {L"G:\\", L"ALL FILES", L"ALL FILES (G:)"},
+            };
+            SortDrivesByRank(d, L"all");
+            CHECK(d.size() == 2 && d[0].root == L"G:\\" && d[1].root == L"F:\\");
+        }
+        // app search already ranks by position (regression pin)
+        CHECK(FuzzyScore(L"c++ projects", L"++") > FuzzyScore(L"c file dev c++", L"++"));
         // file rows are actionable like app rows (headers never are)
         auto frow = [](ResultKind k, const wchar_t* t) {
             ResultItem r;

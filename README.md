@@ -82,9 +82,9 @@ Notes:
 
 ## Settings
 
-Tray → **Settings…** (tabbed, dark, matches the app — every change saves instantly, no Save button). Stored in `%APPDATA%\SneekPeek\settings.ini`:
+Tray → **Settings…** (icon rail, dark, matches the app — every change saves instantly, no Save button). A filter box narrows General/Files rows and the apps list. Stored in `%APPDATA%\SneekPeek\settings.ini`:
 
-- **General** — engine (DuckDuckGo / Google / Bing / Brave / Custom URL with `%s`), browser for web + bang + quick links (System default or picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe`)
+- **General** — search engine tiles (DuckDuckGo / Google / Bing / Brave, or `+ Custom` with your own name + URL containing `%s`), browser for web + bang + quick links (System default or picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe`)
 - **Files** — file browser view (List/Grid, grid by default), grid rows (1–4) and columns (2–7); file mode only, applies instantly
 - **Hidden apps** — checkbox list of every indexed app; checked ones never appear in suggestions
 - **Bangs** — table (Aliases / Name / URL, `https://` or `http://` only): Add appends an editable row, double-click any cell to edit in place, Del or Remove deletes rows, colors auto-picked
