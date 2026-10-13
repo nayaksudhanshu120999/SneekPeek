@@ -24,6 +24,16 @@ inline int ClampCustomCount(int n) {
     return n > kMaxCustomEntries ? kMaxCustomEntries : n;
 }
 
+// File grid dimensions (file mode only): rows 1-4, columns 2-7.
+inline int ClampGridRows(int n) {
+    if (n < 1) return 1;
+    return n > 4 ? 4 : n;
+}
+inline int ClampGridCols(int n) {
+    if (n < 2) return 2;
+    return n > 7 ? 7 : n;
+}
+
 inline bool ParseQuickLine(const std::wstring& line, QuickLink& out) {
     size_t p = line.find(L'|');
     if (p == std::wstring::npos) return false;
@@ -42,7 +52,9 @@ struct Settings {
     std::vector<Bang> bangs;
     std::vector<QuickLink> quicks; // name -> fixed URL launched on Enter (no query)
     bool awakeOn = false;          // keep display+system awake (tray + Awake chip)
-    bool fileGrid = false;         // file browser presentation: grid vs list
+    bool fileGrid = true;          // file browser presentation: grid vs list
+    int gridRows = 3;              // grid tile rows, 1-4 (file grid only)
+    int gridCols = 5;              // grid tile columns, 2-7 (file grid only)
     bool includePathExes = false;
     bool runAtStartup = false;
 };
@@ -113,7 +125,9 @@ inline void LoadSettings(Settings& s) {
     s.includePathExes = GetPrivateProfileIntW(L"General", L"IncludePathExes", 0, ini.c_str()) != 0;
     s.runAtStartup = GetPrivateProfileIntW(L"General", L"RunAtStartup", 0, ini.c_str()) != 0;
     s.awakeOn = GetPrivateProfileIntW(L"General", L"Awake", 0, ini.c_str()) != 0;
-    s.fileGrid = GetPrivateProfileIntW(L"General", L"FileGrid", 0, ini.c_str()) != 0;
+    s.fileGrid = GetPrivateProfileIntW(L"General", L"FileGrid", 1, ini.c_str()) != 0;
+    s.gridRows = ClampGridRows(GetPrivateProfileIntW(L"General", L"GridRows", 3, ini.c_str()));
+    s.gridCols = ClampGridCols(GetPrivateProfileIntW(L"General", L"GridCols", 5, ini.c_str()));
 
     int count = GetPrivateProfileIntW(L"Bangs", L"Count", 0, ini.c_str());
     count = ClampCustomCount(count); // clamp, never drop all
@@ -168,6 +182,13 @@ inline void SaveSettings(const Settings& s) {
     WritePrivateProfileStringW(L"General", L"RunAtStartup", s.runAtStartup ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"General", L"Awake", s.awakeOn ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"General", L"FileGrid", s.fileGrid ? L"1" : L"0", ini.c_str());
+    {
+        wchar_t nr[16], nc[16];
+        swprintf_s(nr, 16, L"%d", s.gridRows);
+        swprintf_s(nc, 16, L"%d", s.gridCols);
+        WritePrivateProfileStringW(L"General", L"GridRows", nr, ini.c_str());
+        WritePrivateProfileStringW(L"General", L"GridCols", nc, ini.c_str());
+    }
     size_t nbangs = s.bangs.size() < (size_t)kMaxCustomEntries
         ? s.bangs.size() : (size_t)kMaxCustomEntries;
     wchar_t count[16];

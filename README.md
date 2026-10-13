@@ -25,7 +25,7 @@ Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 | `bluetooth` | matching Windows Settings pages under their own header — Enter opens the page |
 | `gmail` | quick-link chips (fixed URLs, no query) work the same way — Enter opens |
 | `12*8` | calculator (Enter copies result; undefined math like `1/0` shows nothing) |
-| `file` + `Space` | names-only file browser (hidden items excluded): drives show as `Name (C:)` — type to filter, `Space`/`Enter` on a folder drills in (stays open), `Space`/`Enter` on a file opens it; slim bottom bar + `Shift+Enter` opens the current folder in Explorer; long lists scroll with `↑` `↓` or mouse wheel (no scrollbar); list or Explorer-like grid view via Settings → General; `..` / empty-box `Backspace` goes up, `x` or drive-level `Backspace` exits — one folder scanned at a time, no sizes/icons/recursion |
+| `file` + `Space` | names-only file browser (hidden items excluded): drives show as `Name (C:)` — type to filter, `Space`/`Enter` on a folder drills in (stays open), `Space`/`Enter` on a file opens it; slim bottom bar + `Shift+Enter` opens the current folder in Explorer; long lists scroll with `↑` `↓` or mouse wheel (no scrollbar); grid view by default (rows/columns via Settings → Files); `..` / empty-box `Backspace` goes up, `x` or drive-level `Backspace` exits — one folder scanned at a time, no sizes/icons/recursion |
 | `↑` `↓` | move selection (mirrors into the box without refiltering; wraps past either end back to your typed text; Up from the first row jumps back to the chips), `Enter` open, `Shift+Enter` force web search, `Esc` dismiss, `F5` rescan apps |
 
 Bang aliases are editable in Settings (default: `yt`/`youtube`, `gh`/`github`, `w`/`wiki`, `r`, `m`, `t`, `a`, `x`, `so`, `d`, `g` — each with its own color).
@@ -84,7 +84,8 @@ Notes:
 
 Tray → **Settings…** (tabbed, dark, matches the app — every change saves instantly, no Save button). Stored in `%APPDATA%\SneekPeek\settings.ini`:
 
-- **General** — engine (DuckDuckGo / Google / Bing / Brave / Custom URL with `%s`), browser for web + bang + quick links (System default or picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe`), Files view List/Grid toggle for the file browser
+- **General** — engine (DuckDuckGo / Google / Bing / Brave / Custom URL with `%s`), browser for web + bang + quick links (System default or picked Chrome/Edge/Firefox/Brave/Opera/Vivaldi/custom `.exe`)
+- **Files** — file browser view (List/Grid, grid by default), grid rows (1–4) and columns (2–7); file mode only, applies instantly
 - **Hidden apps** — checkbox list of every indexed app; checked ones never appear in suggestions
 - **Bangs** — table (Aliases / Name / URL, `https://` or `http://` only): Add appends an editable row, double-click any cell to edit in place, Del or Remove deletes rows, colors auto-picked
 - **Quick links** — table (Name / URL, `https://` or `http://` only) with the same editing; typing the name in the palette shows a chip that opens the fixed URL on Enter (e.g. Gmail)

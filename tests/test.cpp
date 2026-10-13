@@ -223,6 +223,34 @@ int main() {
         CHECK(DriveTitle(L"C:\\", L"Win 10") == L"Win 10 (C:)");
         CHECK(DriveTitle(L"M:\\", L"Music") == L"Music (M:)");
         CHECK(DriveTitle(L"D:\\", L"") == L"D:\\");
+        // match ranking: prefix beats substring, empty filter is neutral
+        CHECK(FileMatchRank(L"all files (g:)", L"all") == 1);
+        CHECK(FileMatchRank(L"installed (f:)", L"all") == 2);
+        CHECK(FileMatchRank(L"readme", L"zzz") < 0);
+        CHECK(FileMatchRank(L"x", L"") == 0);
+        CHECK(ClampGridRows(0) == 1);
+        CHECK(ClampGridRows(3) == 3);
+        CHECK(ClampGridRows(9) == 4);
+        CHECK(ClampGridCols(1) == 2);
+        CHECK(ClampGridCols(5) == 5);
+        CHECK(ClampGridCols(99) == 7);
+        // ranked sort: "all" puts ALL FILES before instALLEd
+        {
+            std::vector<FileEntry> v = {
+                {L"INSTALLED", true}, {L"ALL FILES", true},
+            };
+            SortFileEntries(v, L"all");
+            CHECK(v.size() == 2 && v[0].name == L"ALL FILES" && v[1].name == L"INSTALLED");
+        }
+        // folders still first; prefix files before substring files
+        {
+            std::vector<FileEntry> v = {
+                {L"mydocs.txt", false}, {L"Documents", true}, {L"ado.doc", false},
+            };
+            SortFileEntries(v, L"doc");
+            CHECK(v.size() == 3 && v[0].name == L"Documents");
+            CHECK(v[1].name == L"ado.doc" && v[2].name == L"mydocs.txt");
+        }
         // file rows are actionable like app rows (headers never are)
         auto frow = [](ResultKind k, const wchar_t* t) {
             ResultItem r;

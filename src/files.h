@@ -39,14 +39,37 @@ inline bool FileMatchesFilter(const std::wstring& nameLower, const std::wstring&
     return nameLower.find(filterLower) != std::wstring::npos;
 }
 
-// Folders first, then case-insensitive alphabetical. Pure, unit-tested.
-inline void SortFileEntries(std::vector<FileEntry>& v) {
-    std::sort(v.begin(), v.end(), [](const FileEntry& a, const FileEntry& b) {
-        if (a.isDir != b.isDir) return a.isDir > b.isDir;
-        int c = _wcsicmp(a.name.c_str(), b.name.c_str());
+// Match quality for ranking: 0 = neutral (empty filter), 1 = prefix,
+// 2 = substring, -1 = no match. Pure, unit-tested.
+inline int FileMatchRank(const std::wstring& nameLower, const std::wstring& filterLower) {
+    if (filterLower.empty()) return 0;
+    if (nameLower.size() < filterLower.size()) return -1;
+    if (nameLower.compare(0, filterLower.size(), filterLower) == 0) return 1;
+    return nameLower.find(filterLower) != std::wstring::npos ? 2 : -1;
+}
+
+// Folders first, then best match first, then case-insensitive alphabetical.
+// Empty filter keeps the classic folders-first alphabetical order.
+inline void SortFileEntries(std::vector<FileEntry>& v, const std::wstring& filterLower = L"") {
+    std::vector<std::wstring> low(v.size());
+    for (size_t i = 0; i < v.size(); i++) low[i] = FileLower(v[i].name);
+    std::vector<size_t> idx(v.size());
+    for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
+    std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+        if (v[a].isDir != v[b].isDir) return v[a].isDir > v[b].isDir;
+        if (!filterLower.empty()) {
+            int ra = FileMatchRank(low[a], filterLower);
+            int rb = FileMatchRank(low[b], filterLower);
+            if (ra != rb) return ra < rb;
+        }
+        int c = _wcsicmp(v[a].name.c_str(), v[b].name.c_str());
         if (c != 0) return c < 0;
-        return a.name < b.name;
+        return v[a].name < v[b].name;
     });
+    std::vector<FileEntry> sorted;
+    sorted.reserve(v.size());
+    for (size_t i = 0; i < idx.size(); i++) sorted.push_back(std::move(v[idx[i]]));
+    v.swap(sorted);
 }
 
 // Pure path helpers (no filesystem access), unit-tested.

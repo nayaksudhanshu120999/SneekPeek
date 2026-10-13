@@ -97,7 +97,6 @@ static int kChipRowH = 40;
 static int kBottomBarH = 30;
 static int kGridTileH = 86; // Explorer-like tile height (glyph + 2 name lines)
 static int kGridHeadH = 24; // slim count header above the tiles
-static const int kGridVisRows = 2; // tile rows visible without scrolling
 static const int kMaxChips = 4;
 static void UpdateLayoutMetrics() {
     kWidth = Dpx(600); kInputH = Dpx(44); kItemH = Dpx(38);
@@ -118,8 +117,10 @@ enum {
     IDC_QUICK_LIST = 120, IDC_QUICK_NAME = 121, IDC_QUICK_URL = 122,
     IDC_QUICK_ADD = 123, IDC_QUICK_UPDATE = 124, IDC_QUICK_DEL = 125,
     IDC_SAVE = 201, IDC_RESCAN = 202, IDC_CLOSE = 203,
-    IDC_VIEW_TOGGLE = 204,
-    IDC_PAGE_0 = 301, IDC_PAGE_1, IDC_PAGE_2, IDC_PAGE_3,
+    IDC_VIEW_LIST = 204, IDC_VIEW_GRID = 205,
+    IDC_ROWS_DEC = 206, IDC_ROWS_INC = 207,
+    IDC_COLS_DEC = 208, IDC_COLS_INC = 209,
+    IDC_PAGE_0 = 301, IDC_PAGE_1, IDC_PAGE_2, IDC_PAGE_3, IDC_PAGE_4,
 };
 
 // ------------------------------------------------------------- small helpers
@@ -192,7 +193,8 @@ static HWND        g_hwndEngineCombo = NULL;
 static HWND        g_hwndEngineUrl = NULL;
 static HWND        g_hwndBrowserCombo = NULL;
 static HWND        g_hwndSavedLabel = NULL; // "Saved HH:MM:SS" indicator
-static HWND        g_hwndViewToggle = NULL; // Files view List/Grid button
+static HWND        g_hwndRowsVal = NULL; // grid rows value label (Files tab)
+static HWND        g_hwndColsVal = NULL; // grid columns value label (Files tab)
 static HWND        g_hwndAppsList = NULL;
 static HWND        g_hwndBangsList = NULL;
 static HWND        g_hwndQuickList = NULL;
@@ -200,7 +202,7 @@ static HWND        g_hwndCellEdit = NULL; // in-place table cell editor
 static int         g_cellLv = 0;   // 1 = bangs table, 2 = quick table
 static int         g_cellRow = -1;
 static int         g_cellCol = 0;
-static std::vector<HWND> g_pageGeneral, g_pageApps, g_pageBangs, g_pageQuick;
+static std::vector<HWND> g_pageGeneral, g_pageApps, g_pageBangs, g_pageQuick, g_pageFiles;
 static bool        g_fillingSettings = false;
 static HFONT       g_fontInput = NULL;
 static HFONT       g_fontTitle = NULL;
@@ -679,6 +681,18 @@ static void UpdateFileResults(const std::wstring& filter) {
             ResultItem r{ResultKind::Folder, d.title, L"", d.root, kFolderCol};
             rows.push_back(std::move(r));
         }
+        // Ranked, not letter-ordered: prefix matches first ("all" finds
+        // ALL FILES before instALLEd), then alphabetical by title.
+        std::sort(rows.begin(), rows.end(), [&](const ResultItem& a, const ResultItem& b) {
+            if (!fl.empty()) {
+                int ra = FileMatchRank(FileLower(a.title), fl);
+                int rb = FileMatchRank(FileLower(b.title), fl);
+                if (ra != rb) return ra < rb;
+            }
+            int c = _wcsicmp(a.title.c_str(), b.title.c_str());
+            if (c != 0) return c < 0;
+            return a.title < b.title;
+        });
         wchar_t head[64];
         if (filter.empty())
             swprintf_s(head, 64, L"Drives - %u %s", (unsigned)totalDrives,
@@ -709,7 +723,7 @@ static void UpdateFileResults(const std::wstring& filter) {
     for (const auto& e : entries) {
         if (FileMatchesFilter(FileLower(e.name), fl)) kept.push_back(e);
     }
-    SortFileEntries(kept);
+    SortFileEntries(kept, fl);
     size_t shown = kept.size() < kMaxFileList ? kept.size() : kMaxFileList;
     bool listCapped = kept.size() > kMaxFileList;
     std::wstring head;
@@ -821,18 +835,16 @@ static void ExecuteFileSelected(bool inExplorer) {
 // Grid is file-mode-only and setting-gated. Columns derive from the fixed
 // palette width; tiles map 1:1 onto g_results indices (after one header).
 static bool GridActive() { return InFileMode() && g_settings.fileGrid; }
-static int GridColumns() {
-    int w = kWidth - Dpx(16) * 2;
-    int c = w / Dpx(104);
-    return c < 1 ? 1 : c;
-}
+static int GridRows() { return ClampGridRows(g_settings.gridRows); }
+static int GridColumns() { return ClampGridCols(g_settings.gridCols); }
 static int GridContentH() {
     bool head = !g_results.empty() && g_results.front().kind == ResultKind::Header;
     size_t base = head ? 1 : 0;
     size_t tiles = g_results.size() > base ? g_results.size() - base : 0;
     int cols = GridColumns();
+    int gr = GridRows();
     int need = tiles ? (int)((tiles + (size_t)cols - 1) / (size_t)cols) : 0;
-    int vis = need < kGridVisRows ? need : kGridVisRows;
+    int vis = need < gr ? need : gr;
     return (head ? kGridHeadH : 0) + vis * kGridTileH;
 }
 
@@ -1431,9 +1443,10 @@ static void EnsureVisible(int sel) {
         int cols = GridColumns();
         if (cols < 1) cols = 1;
         int row = (sel - (int)base) / cols;
+        int gr = GridRows();
         if (row < g_gridTopRow) g_gridTopRow = row;
-        else if (row >= g_gridTopRow + kGridVisRows)
-            g_gridTopRow = row - kGridVisRows + 1;
+        else if (row >= g_gridTopRow + gr)
+            g_gridTopRow = row - gr + 1;
         InvalidateRect(g_hwndFileGrid, NULL, FALSE);
         return;
     }
@@ -1884,7 +1897,7 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         for (size_t i = start; i < g_results.size(); i++) {
             size_t t = i - base;
             int r = (int)(t / (size_t)cols) - g_gridTopRow;
-            if (r >= kGridVisRows) break;
+            if (r >= GridRows()) break;
             int c = (int)(t % (size_t)cols);
             RECT tile{cl.left + c * tw, y + r * kGridTileH,
                       cl.left + (c + 1) * tw, y + (r + 1) * kGridTileH};
@@ -2357,8 +2370,9 @@ static void FillQuickList() {
 
 static void ShowSettingsPage(int page) {
     g_settingsPage = page;
-    const std::vector<HWND>* pages[4] = {&g_pageGeneral, &g_pageApps, &g_pageBangs, &g_pageQuick};
-    for (int i = 0; i < 4; i++)
+    const std::vector<HWND>* pages[5] = {&g_pageGeneral, &g_pageApps, &g_pageBangs, &g_pageQuick,
+                                         &g_pageFiles};
+    for (int i = 0; i < 5; i++)
         for (HWND h : *pages[i])
             ShowWindow(h, (i == page) ? SW_SHOW : SW_HIDE);
 }
@@ -2612,14 +2626,14 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     case WM_CREATE: {
         g_fillingSettings = true;
         g_pageGeneral.clear(); g_pageApps.clear();
-        g_pageBangs.clear(); g_pageQuick.clear();
+        g_pageBangs.clear(); g_pageQuick.clear(); g_pageFiles.clear();
 
         // Page tabs: owner-drawn buttons matching the app theme (no tab
         // control, so there is no light-themed rim anywhere in Settings).
-        const wchar_t* tabs[] = {L"General", L"Hidden apps", L"Bangs", L"Quick links"};
-        const int tabX[] = {16, 140, 280, 384};
-        const int tabW[] = {118, 134, 98, 120};
-        for (int i = 0; i < 4; i++)
+        const wchar_t* tabs[] = {L"General", L"Hidden apps", L"Bangs", L"Quick links", L"Files"};
+        const int tabX[] = {16, 122, 248, 344, 460};
+        const int tabW[] = {100, 120, 90, 110, 100};
+        for (int i = 0; i < 5; i++)
             NewCtrl(L"BUTTON", tabs[i], WS_VISIBLE | WS_TABSTOP,
                     tabX[i], 12, tabW[i], 28, hwnd, IDC_PAGE_0 + i);
 
@@ -2646,11 +2660,8 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 L"Web + bang + quick links open in the chosen browser.\r\n"
                 L"Every change saves automatically.",
                 WS_VISIBLE, 24, 214, 536, 44, hwnd, 0));
-            g_hwndViewToggle = page(g_pageGeneral, NewCtrl(L"BUTTON", L"Files view: List",
-                WS_VISIBLE, 24, 266, 200, 26, hwnd, IDC_VIEW_TOGGLE));
             FillEngineCombo();
             FillBrowserCombo();
-            SetWindowTextW(g_hwndViewToggle, g_settings.fileGrid ? L"Files view: Grid" : L"Files view: List");
         }
 
         // ---- Hidden apps page (checkbox list)
@@ -2713,6 +2724,43 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 WS_VISIBLE, 24, 448, 100, 26, hwnd, IDC_QUICK_ADD));
             page(g_pageQuick, NewCtrl(L"BUTTON", L"Remove",
                 WS_VISIBLE, 134, 448, 100, 26, hwnd, IDC_QUICK_DEL));
+        }
+
+        // ---- Files page (file browser presentation: view + grid size).
+        // File mode only: list view and all other searches are unaffected.
+        // Everything applies instantly, like the rest of Settings.
+        {
+            page(g_pageFiles, NewCtrl(L"STATIC", L"View:",
+                WS_VISIBLE, 24, 52, 200, 20, hwnd, 0));
+            page(g_pageFiles, NewCtrl(L"BUTTON", L"List",
+                WS_VISIBLE, 24, 74, 120, 28, hwnd, IDC_VIEW_LIST));
+            page(g_pageFiles, NewCtrl(L"BUTTON", L"Grid",
+                WS_VISIBLE, 154, 74, 120, 28, hwnd, IDC_VIEW_GRID));
+            page(g_pageFiles, NewCtrl(L"STATIC", L"Grid rows:",
+                WS_VISIBLE, 24, 114, 200, 20, hwnd, 0));
+            page(g_pageFiles, NewCtrl(L"BUTTON", L"-",
+                WS_VISIBLE, 24, 136, 48, 26, hwnd, IDC_ROWS_DEC));
+            g_hwndRowsVal = page(g_pageFiles, NewCtrl(L"STATIC", L"3",
+                WS_VISIBLE | SS_CENTER, 78, 136, 60, 26, hwnd, 0));
+            page(g_pageFiles, NewCtrl(L"BUTTON", L"+",
+                WS_VISIBLE, 144, 136, 48, 26, hwnd, IDC_ROWS_INC));
+            page(g_pageFiles, NewCtrl(L"STATIC", L"Grid columns:",
+                WS_VISIBLE, 220, 114, 200, 20, hwnd, 0));
+            page(g_pageFiles, NewCtrl(L"BUTTON", L"-",
+                WS_VISIBLE, 220, 136, 48, 26, hwnd, IDC_COLS_DEC));
+            g_hwndColsVal = page(g_pageFiles, NewCtrl(L"STATIC", L"5",
+                WS_VISIBLE | SS_CENTER, 274, 136, 60, 26, hwnd, 0));
+            page(g_pageFiles, NewCtrl(L"BUTTON", L"+",
+                WS_VISIBLE, 340, 136, 48, 26, hwnd, IDC_COLS_INC));
+            page(g_pageFiles, NewCtrl(L"STATIC",
+                L"File browser grid only. List view and other searches are unaffected.\r\n"
+                L"Changes apply instantly.",
+                WS_VISIBLE, 24, 172, 536, 44, hwnd, 0));
+            wchar_t rv[16], cv[16];
+            swprintf_s(rv, 16, L"%d", g_settings.gridRows);
+            swprintf_s(cv, 16, L"%d", g_settings.gridCols);
+            SetWindowTextW(g_hwndRowsVal, rv);
+            SetWindowTextW(g_hwndColsVal, cv);
         }
 
         // Shared bottom buttons (always visible).
@@ -2791,9 +2839,11 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         bool pressed = (d->itemState & ODS_SELECTED) != 0;
         bool focus = (d->itemState & ODS_FOCUS) != 0;
         bool isSave = d->CtlID == (UINT)IDC_SAVE;
-        bool isPage = d->CtlID >= (UINT)IDC_PAGE_0 && d->CtlID <= (UINT)IDC_PAGE_3;
+        bool isPage = d->CtlID >= (UINT)IDC_PAGE_0 && d->CtlID <= (UINT)IDC_PAGE_4;
         bool pageSel = isPage && (int)(d->CtlID - (UINT)IDC_PAGE_0) == g_settingsPage;
-        bool accent = isSave || pageSel;
+        bool isView = d->CtlID == (UINT)IDC_VIEW_LIST || d->CtlID == (UINT)IDC_VIEW_GRID;
+        bool viewSel = isView && ((d->CtlID == (UINT)IDC_VIEW_GRID) == g_settings.fileGrid);
+        bool accent = isSave || pageSel || viewSel;
         FillRect(dc, &d->rcItem, g_brBg);
         COLORREF fill = accent ? (pressed ? RGB(38, 82, 140) : RGB(29, 65, 115))
                                : (pressed ? RGB(52, 52, 56) : RGB(26, 26, 28));
@@ -2906,9 +2956,9 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_COMMAND: {
         WORD id = LOWORD(w), code = HIWORD(w);
-        if (id >= IDC_PAGE_0 && id <= IDC_PAGE_3) {
+        if (id >= IDC_PAGE_0 && id <= IDC_PAGE_4) {
             ShowSettingsPage(id - IDC_PAGE_0);
-            for (int i = IDC_PAGE_0; i <= IDC_PAGE_3; i++) {
+            for (int i = IDC_PAGE_0; i <= IDC_PAGE_4; i++) {
                 HWND b = GetDlgItem(hwnd, i);
                 if (b) InvalidateRect(b, NULL, FALSE);
             }
@@ -2937,13 +2987,29 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 }
             }
             SaveEngineBrowser(hwnd);
-        } else if (id == IDC_VIEW_TOGGLE) {
-            g_settings.fileGrid = !g_settings.fileGrid;
-            SetWindowTextW(g_hwndViewToggle, g_settings.fileGrid ? L"Files view: Grid" : L"Files view: List");
-            InvalidateRect(g_hwndViewToggle, NULL, FALSE);
+        } else if (id == IDC_VIEW_LIST || id == IDC_VIEW_GRID) {
+            g_settings.fileGrid = (id == IDC_VIEW_GRID);
             SaveNow();
+            HWND bl = GetDlgItem(hwnd, IDC_VIEW_LIST);
+            HWND bg = GetDlgItem(hwnd, IDC_VIEW_GRID);
+            if (bl) InvalidateRect(bl, NULL, FALSE);
+            if (bg) InvalidateRect(bg, NULL, FALSE);
             if (g_hwndPalette && IsWindowVisible(g_hwndPalette) && InFileMode())
                 UpdateResults(); // re-layout list <-> grid live
+        } else if (id == IDC_ROWS_DEC || id == IDC_ROWS_INC ||
+                   id == IDC_COLS_DEC || id == IDC_COLS_INC) {
+            if (id == IDC_ROWS_DEC) g_settings.gridRows = ClampGridRows(g_settings.gridRows - 1);
+            else if (id == IDC_ROWS_INC) g_settings.gridRows = ClampGridRows(g_settings.gridRows + 1);
+            else if (id == IDC_COLS_DEC) g_settings.gridCols = ClampGridCols(g_settings.gridCols - 1);
+            else g_settings.gridCols = ClampGridCols(g_settings.gridCols + 1);
+            wchar_t b[16];
+            swprintf_s(b, 16, L"%d", g_settings.gridRows);
+            SetWindowTextW(g_hwndRowsVal, b);
+            swprintf_s(b, 16, L"%d", g_settings.gridCols);
+            SetWindowTextW(g_hwndColsVal, b);
+            SaveNow();
+            if (g_hwndPalette && IsWindowVisible(g_hwndPalette) && InFileMode())
+                UpdateResults(); // re-layout grid live
         } else if (id == IDC_BROWSER_BROWSE) {
             std::wstring picked;
             if (BrowseForBrowser(hwnd, picked)) {
@@ -3007,10 +3073,10 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         g_hwndSavedLabel = NULL;
         g_cellLv = 0; g_cellRow = -1; g_cellCol = 0;
         g_hwndEngineCombo = g_hwndEngineUrl = g_hwndBrowserCombo = NULL;
-        g_hwndViewToggle = NULL;
+        g_hwndRowsVal = g_hwndColsVal = NULL;
         g_hwndAppsList = g_hwndBangsList = g_hwndQuickList = NULL;
         g_pageGeneral.clear(); g_pageApps.clear();
-        g_pageBangs.clear(); g_pageQuick.clear();
+        g_pageBangs.clear(); g_pageQuick.clear(); g_pageFiles.clear();
         break;
     }
     return DefWindowProcW(hwnd, m, w, l);
