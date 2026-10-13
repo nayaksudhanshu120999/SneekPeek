@@ -107,7 +107,7 @@ static void UpdateLayoutMetrics() {
 
 // Settings control IDs
 enum {
-    IDC_CHK_PATH = 103,
+    IDC_ENGINE_COMBO = 101, IDC_ENGINE_URL = 102, IDC_CHK_PATH = 103,
     IDC_CHK_STARTUP = 104, IDC_BROWSER_COMBO = 105, IDC_BROWSER_BROWSE = 106,
     IDC_APPS_LIST = 110,
     IDC_BANGS_LIST = 111, IDC_BANG_ALIAS = 112, IDC_BANG_NAME = 113,
@@ -117,14 +117,7 @@ enum {
     IDC_QUICK_LIST = 120, IDC_QUICK_NAME = 121, IDC_QUICK_URL = 122,
     IDC_QUICK_ADD = 123, IDC_QUICK_UPDATE = 124, IDC_QUICK_DEL = 125,
     IDC_SAVE = 201, IDC_RESCAN = 202, IDC_CLOSE = 203,
-    IDC_VIEW_LIST = 204, IDC_VIEW_GRID = 205,
-    IDC_ROWS_DEC = 206, IDC_ROWS_INC = 207,
-    IDC_COLS_DEC = 208, IDC_COLS_INC = 209,
-    IDC_FILTER_EDIT = 210,
-    IDC_ENG_0 = 211, IDC_ENG_1, IDC_ENG_2, IDC_ENG_3, IDC_ENG_CUSTOM,
-    IDC_CENG_NAME = 216, IDC_CENG_URL = 217,
-    IDC_BROWSER_LABEL = 218, IDC_GENERAL_HINT = 219,
-    IDC_PAGE_0 = 301, IDC_PAGE_1, IDC_PAGE_2, IDC_PAGE_3, IDC_PAGE_4,
+    IDC_PAGE_0 = 301, IDC_PAGE_1, IDC_PAGE_2, IDC_PAGE_3,
 };
 
 // ------------------------------------------------------------- small helpers
@@ -193,42 +186,10 @@ static HWND        g_hwndFileGrid = NULL; // tile grid, file grid-view only
 static int         g_bangChipW = 0;  // 0 = hidden
 static HWND        g_hwndSettings = NULL;
 static int         g_settingsPage = 0;
-static HWND        g_hwndCEngNameLbl = NULL; // custom engine rows (General)
-static HWND        g_hwndCEngName = NULL;
-static HWND        g_hwndCEngUrlLbl = NULL;
-static HWND        g_hwndCEngUrl = NULL;
-static HWND        g_hwndFilter = NULL; // settings filter box (always visible)
-static int         g_engineSel = -1; // 0-3 preset, 4 custom
-
-// Search-engine presets (also the tile colors). Custom engines live in
-// g_settings.engineName/engineUrl with a %s placeholder.
-struct EnginePreset { const wchar_t* name; const wchar_t* url; COLORREF color; };
-static const EnginePreset kEngines[] = {
-    {L"DuckDuckGo", L"https://duckduckgo.com/?q=%s", RGB(222, 88, 51)},
-    {L"Google", L"https://www.google.com/search?q=%s", RGB(66, 133, 244)},
-    {L"Bing", L"https://www.bing.com/search?q=%s", RGB(0, 131, 143)},
-    {L"Brave", L"https://search.brave.com/search?q=%s", RGB(251, 84, 43)},
-};
-static int EnginePresetIndex(const std::wstring& url) {
-    for (int i = 0; i < 4; i++)
-        if (url == kEngines[i].url) return i;
-    return -1;
-}
-
-// Settings filter registry: General + Files rows hide + restack on typing;
-// the Hidden-apps list refills instead (tables excluded).
-struct SettingFilterRow {
-    HWND h;
-    int page; // 0 = General, 4 = Files
-    std::wstring keys; // lowercased match text
-    int baseX, baseY, baseH;
-};
-static std::wstring g_settingFilter;
-static std::vector<SettingFilterRow> g_filterRows;
+static HWND        g_hwndEngineCombo = NULL;
+static HWND        g_hwndEngineUrl = NULL;
 static HWND        g_hwndBrowserCombo = NULL;
 static HWND        g_hwndSavedLabel = NULL; // "Saved HH:MM:SS" indicator
-static HWND        g_hwndRowsVal = NULL; // grid rows value label (Files tab)
-static HWND        g_hwndColsVal = NULL; // grid columns value label (Files tab)
 static HWND        g_hwndAppsList = NULL;
 static HWND        g_hwndBangsList = NULL;
 static HWND        g_hwndQuickList = NULL;
@@ -236,7 +197,7 @@ static HWND        g_hwndCellEdit = NULL; // in-place table cell editor
 static int         g_cellLv = 0;   // 1 = bangs table, 2 = quick table
 static int         g_cellRow = -1;
 static int         g_cellCol = 0;
-static std::vector<HWND> g_pageGeneral, g_pageApps, g_pageBangs, g_pageQuick, g_pageFiles;
+static std::vector<HWND> g_pageGeneral, g_pageApps, g_pageBangs, g_pageQuick;
 static bool        g_fillingSettings = false;
 static HFONT       g_fontInput = NULL;
 static HFONT       g_fontTitle = NULL;
@@ -2325,6 +2286,23 @@ static void DeleteSelectedTableRow(HWND lv) {
     SaveNow();
 }
 
+static void FillEngineCombo() {
+    SendMessageW(g_hwndEngineCombo, CB_RESETCONTENT, 0, 0);
+    SendMessageW(g_hwndEngineCombo, CB_ADDSTRING, 0, (LPARAM)L"DuckDuckGo");
+    SendMessageW(g_hwndEngineCombo, CB_ADDSTRING, 0, (LPARAM)L"Google");
+    SendMessageW(g_hwndEngineCombo, CB_ADDSTRING, 0, (LPARAM)L"Bing");
+    SendMessageW(g_hwndEngineCombo, CB_ADDSTRING, 0, (LPARAM)L"Brave");
+    SendMessageW(g_hwndEngineCombo, CB_ADDSTRING, 0, (LPARAM)L"Custom...");
+    int sel = 0;
+    if (g_settings.engineName == L"Google") sel = 1;
+    else if (g_settings.engineName == L"Bing") sel = 2;
+    else if (g_settings.engineName == L"Brave") sel = 3;
+    else if (g_settings.engineName != L"DuckDuckGo") sel = 4;
+    SendMessageW(g_hwndEngineCombo, CB_SETCURSEL, sel, 0);
+    SetWindowTextW(g_hwndEngineUrl, g_settings.engineUrl.c_str());
+    EnableWindow(g_hwndEngineUrl, sel == 4);
+}
+
 static void FillBrowserCombo() {
     g_browsers = DetectBrowsers();
     SendMessageW(g_hwndBrowserCombo, CB_RESETCONTENT, 0, 0);
@@ -2352,77 +2330,9 @@ static void FillBrowserCombo() {
 
 static void FillAppsList() {
     ListView_DeleteAllItems(g_hwndAppsList);
-    std::wstring fl = ToLower(g_settingFilter);
     for (size_t i = 0; i < g_apps.size(); i++) {
-        if (!fl.empty() && ToLower(g_apps[i].name).find(fl) == std::wstring::npos)
-            continue; // settings filter narrows the hidden-apps list too
         int row = LVAppendRow(g_hwndAppsList, g_apps[i].name.c_str());
         ListView_SetCheckState(g_hwndAppsList, row, IsHiddenApp(g_apps[i].name));
-    }
-}
-
-// Settings filter: General + Files rows hide + restack (original gaps kept,
-// hidden rows collapse); the apps list refills instead. Tables excluded.
-static void RegFilter(HWND parent, HWND h, int page, const wchar_t* extra) {
-    if (!h) return;
-    RECT r;
-    GetWindowRect(h, &r);
-    MapWindowPoints(NULL, parent, (POINT*)&r, 2);
-    std::wstring keys = BangLower(GetWindowString(h));
-    if (extra && *extra) {
-        keys += L" ";
-        keys += extra;
-    }
-    g_filterRows.push_back({h, page, keys, r.left, r.top, r.bottom - r.top});
-}
-
-static void ApplySettingFilter() {
-    if (!g_hwndSettings) return;
-    std::wstring fl = FileLower(g_settingFilter);
-    const int pages[] = {0, 4}; // General + Files only
-    for (int pi = 0; pi < 2; pi++) {
-        int y = -1, prevBottom = 0, prevBaseBottom = 0;
-        bool first = true;
-        for (auto& row : g_filterRows) {
-            if (row.page != pages[pi]) continue;
-            bool show = fl.empty() || row.keys.find(fl) != std::wstring::npos;
-            ShowWindow(row.h, show ? SW_SHOW : SW_HIDE);
-            if (!show) continue;
-            int ry;
-            if (first) { ry = row.baseY; first = false; }
-            else ry = prevBottom + (row.baseY - prevBaseBottom);
-            SetWindowPos(row.h, NULL, row.baseX, ry, 0, 0,
-                         SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
-            prevBottom = ry + row.baseH;
-            prevBaseBottom = row.baseY + row.baseH;
-        }
-    }
-    RefreshAppsListPreservingChecks(); // refill respects the same filter
-}
-
-// Compact vs expanded General layout (custom engine rows collapse).
-static void LayoutGeneralCustom(HWND parent) {
-    bool custom = (g_engineSel == 4);
-    ShowWindow(g_hwndCEngNameLbl, custom ? SW_SHOW : SW_HIDE);
-    ShowWindow(g_hwndCEngName, custom ? SW_SHOW : SW_HIDE);
-    ShowWindow(g_hwndCEngUrlLbl, custom ? SW_SHOW : SW_HIDE);
-    ShowWindow(g_hwndCEngUrl, custom ? SW_SHOW : SW_HIDE);
-    struct { UINT id; int y; } moved[] = {
-        {IDC_BROWSER_LABEL, custom ? 256 : 112},
-        {IDC_BROWSER_COMBO, custom ? 278 : 134},
-        {IDC_BROWSER_BROWSE, custom ? 277 : 133},
-        {IDC_GENERAL_HINT, custom ? 312 : 168},
-    };
-    for (size_t i = 0; i < sizeof(moved) / sizeof(moved[0]); i++) {
-        HWND c = GetDlgItem(parent, moved[i].id);
-        if (!c) continue;
-        RECT r;
-        GetWindowRect(c, &r);
-        MapWindowPoints(NULL, parent, (POINT*)&r, 2);
-        SetWindowPos(c, NULL, r.left, moved[i].y, 0, 0,
-                     SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
-        for (auto& row : g_filterRows)
-            if (row.h == c) row.baseY = moved[i].y;
     }
 }
 
@@ -2450,9 +2360,8 @@ static void FillQuickList() {
 
 static void ShowSettingsPage(int page) {
     g_settingsPage = page;
-    const std::vector<HWND>* pages[5] = {&g_pageGeneral, &g_pageApps, &g_pageBangs, &g_pageQuick,
-                                         &g_pageFiles};
-    for (int i = 0; i < 5; i++)
+    const std::vector<HWND>* pages[4] = {&g_pageGeneral, &g_pageApps, &g_pageBangs, &g_pageQuick};
+    for (int i = 0; i < 4; i++)
         for (HWND h : *pages[i])
             ShowWindow(h, (i == page) ? SW_SHOW : SW_HIDE);
 }
@@ -2488,7 +2397,7 @@ static void DarkTitleBar(HWND hwnd) {
 
 static void OpenSettings() {
     if (g_hwndSettings) { ShowWindow(g_hwndSettings, SW_SHOW); SetForegroundWindow(g_hwndSettings); return; }
-    int W = 640, H = 590;
+    int W = 600, H = 590;
     POINT pt{}; GetCursorPos(&pt); // open on the monitor being used
     HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi{ sizeof(mi) };
@@ -2547,9 +2456,36 @@ static void SaveNow() {
     }
 }
 
-// Browser combo -> settings -> disk. (Engine tiles save themselves.)
-static void SaveBrowserChoice(HWND owner) {
-    (void)owner;
+// Engine + browser combos / custom URL -> settings -> disk.
+static void SaveEngineBrowser(HWND owner) {
+    int esel = (int)SendMessageW(g_hwndEngineCombo, CB_GETCURSEL, 0, 0);
+    std::wstring eurl = GetWindowString(g_hwndEngineUrl);
+    const wchar_t* names[] = {L"DuckDuckGo", L"Google", L"Bing", L"Brave", L"Custom"};
+    const wchar_t* urls[] = {
+        L"https://duckduckgo.com/?q=%s",
+        L"https://www.google.com/search?q=%s",
+        L"https://www.bing.com/search?q=%s",
+        L"https://search.brave.com/search?q=%s", eurl.c_str()};
+    if (esel < 0 || esel > 4) esel = 0;
+    if (esel == 4 && eurl.find(L"%s") == std::wstring::npos) {
+        MessageBoxW(owner, L"Custom URL must contain %s as the query placeholder.",
+                    L"SneekPeek", MB_ICONWARNING | MB_OK);
+        SetWindowTextW(g_hwndEngineUrl, g_settings.engineUrl.c_str());
+        return;
+    }
+    if (esel == 4) {
+        std::wstring probe = eurl;
+        size_t pp = probe.find(L"%s");
+        if (pp != std::wstring::npos) probe.replace(pp, 2, L"test");
+        if (!IsSafeWebUrl(probe)) {
+            MessageBoxW(owner, L"Custom URL must be an https:// (or http://) address.",
+                        L"SneekPeek", MB_ICONWARNING | MB_OK);
+            SetWindowTextW(g_hwndEngineUrl, g_settings.engineUrl.c_str());
+            return;
+        }
+    }
+    g_settings.engineName = names[esel];
+    g_settings.engineUrl = urls[esel];
     int bsel = (int)SendMessageW(g_hwndBrowserCombo, CB_GETCURSEL, 0, 0);
     if (bsel <= 0) g_settings.browserPath.clear();
     else if (bsel - 1 < (int)g_browsers.size())
@@ -2679,78 +2615,51 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     case WM_CREATE: {
         g_fillingSettings = true;
         g_pageGeneral.clear(); g_pageApps.clear();
-        g_pageBangs.clear(); g_pageQuick.clear(); g_pageFiles.clear();
-        g_filterRows.clear();
+        g_pageBangs.clear(); g_pageQuick.clear();
 
-        // Icon rail (replaces text tabs): 5 glyph buttons, accent on active.
-        for (int i = 0; i < 5; i++)
-            NewCtrl(L"BUTTON", L"", WS_VISIBLE | WS_TABSTOP,
-                    12, 12 + i * 56, 48, 48, hwnd, IDC_PAGE_0 + i);
-
-        // Filter box (always visible): narrows General/Files rows + apps list.
-        g_hwndFilter = NewCtrl(L"EDIT", L"",
-            WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 84, 12, 500, 24, hwnd, IDC_FILTER_EDIT);
-        SendMessageW(g_hwndFilter, EM_SETCUEBANNER, TRUE, (LPARAM)L"Filter settings");
+        // Page tabs: owner-drawn buttons matching the app theme (no tab
+        // control, so there is no light-themed rim anywhere in Settings).
+        const wchar_t* tabs[] = {L"General", L"Hidden apps", L"Bangs", L"Quick links"};
+        const int tabX[] = {16, 140, 280, 384};
+        const int tabW[] = {118, 134, 98, 120};
+        for (int i = 0; i < 4; i++)
+            NewCtrl(L"BUTTON", tabs[i], WS_VISIBLE | WS_TABSTOP,
+                    tabX[i], 12, tabW[i], 28, hwnd, IDC_PAGE_0 + i);
 
         auto page = [&](std::vector<HWND>& v, HWND h) { v.push_back(h); return h; };
 
         // ---- General page
         {
-            page(g_pageGeneral, NewCtrl(L"STATIC", L"Search engine:",
-                WS_VISIBLE, 84, 52, 200, 20, hwnd, 0));
-            page(g_pageGeneral, NewCtrl(L"BUTTON", L"",
-                WS_VISIBLE, 84, 74, 123, 30, hwnd, IDC_ENG_0));
-            page(g_pageGeneral, NewCtrl(L"BUTTON", L"",
-                WS_VISIBLE, 215, 74, 123, 30, hwnd, IDC_ENG_1));
-            page(g_pageGeneral, NewCtrl(L"BUTTON", L"",
-                WS_VISIBLE, 346, 74, 123, 30, hwnd, IDC_ENG_2));
-            page(g_pageGeneral, NewCtrl(L"BUTTON", L"",
-                WS_VISIBLE, 477, 74, 123, 30, hwnd, IDC_ENG_3));
-            page(g_pageGeneral, NewCtrl(L"BUTTON", L"",
-                WS_VISIBLE, 84, 112, 200, 28, hwnd, IDC_ENG_CUSTOM));
-            g_hwndCEngNameLbl = page(g_pageGeneral, NewCtrl(L"STATIC", L"Custom engine name:",
-                WS_VISIBLE, 84, 148, 300, 20, hwnd, 0));
-            g_hwndCEngName = page(g_pageGeneral, NewCtrl(L"EDIT", L"",
-                WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 84, 170, 400, 24, hwnd, IDC_CENG_NAME));
-            g_hwndCEngUrlLbl = page(g_pageGeneral, NewCtrl(L"STATIC", L"Custom engine URL (must contain %s):",
-                WS_VISIBLE, 84, 202, 340, 20, hwnd, 0));
-            g_hwndCEngUrl = page(g_pageGeneral, NewCtrl(L"EDIT", L"",
-                WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 84, 224, 500, 24, hwnd, IDC_CENG_URL));
+            HWND a = page(g_pageGeneral, NewCtrl(L"STATIC", L"Search engine:",
+                WS_VISIBLE, 24, 52, 200, 20, hwnd, 0));
+            (void)a;
+            g_hwndEngineCombo = page(g_pageGeneral, NewCtrl(L"COMBOBOX", L"",
+                WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 24, 74, 220, 160, hwnd, IDC_ENGINE_COMBO));
+            page(g_pageGeneral, NewCtrl(L"STATIC", L"Custom engine URL (must contain %s):",
+                WS_VISIBLE, 24, 104, 320, 20, hwnd, 0));
+            g_hwndEngineUrl = page(g_pageGeneral, NewCtrl(L"EDIT", L"",
+                WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 24, 126, 536, 24, hwnd, IDC_ENGINE_URL));
             page(g_pageGeneral, NewCtrl(L"STATIC", L"Browser for web + bang + quick links:",
-                WS_VISIBLE, 84, 256, 340, 20, hwnd, IDC_BROWSER_LABEL));
+                WS_VISIBLE, 24, 158, 340, 20, hwnd, 0));
             g_hwndBrowserCombo = page(g_pageGeneral, NewCtrl(L"COMBOBOX", L"",
-                WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 84, 278, 360, 200, hwnd, IDC_BROWSER_COMBO));
+                WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 24, 180, 360, 200, hwnd, IDC_BROWSER_COMBO));
             page(g_pageGeneral, NewCtrl(L"BUTTON", L"Browse...",
-                WS_VISIBLE, 454, 277, 122, 26, hwnd, IDC_BROWSER_BROWSE));
+                WS_VISIBLE, 394, 179, 122, 26, hwnd, IDC_BROWSER_BROWSE));
             page(g_pageGeneral, NewCtrl(L"STATIC",
                 L"Web + bang + quick links open in the chosen browser.\r\n"
                 L"Every change saves automatically.",
-                WS_VISIBLE, 84, 312, 500, 44, hwnd, IDC_GENERAL_HINT));
-            // Resolve the active tile: preset by URL, unknown-but-valid URL
-            // stays custom, garbage falls back to DuckDuckGo in memory.
-            g_engineSel = EnginePresetIndex(g_settings.engineUrl);
-            if (g_engineSel < 0) {
-                if (g_settings.engineUrl.find(L"%s") != std::wstring::npos) {
-                    g_engineSel = 4;
-                } else {
-                    g_engineSel = 0;
-                    g_settings.engineName = kEngines[0].name;
-                    g_settings.engineUrl = kEngines[0].url;
-                }
-            }
-            SetWindowTextW(g_hwndCEngName, g_settings.engineName.c_str());
-            SetWindowTextW(g_hwndCEngUrl, g_settings.engineUrl.c_str());
+                WS_VISIBLE, 24, 214, 536, 44, hwnd, 0));
+            FillEngineCombo();
             FillBrowserCombo();
-            LayoutGeneralCustom(hwnd);
         }
 
         // ---- Hidden apps page (checkbox list)
         {
             page(g_pageApps, NewCtrl(L"STATIC", L"Check apps to hide from suggestions:",
-                WS_VISIBLE, 84, 52, 400, 20, hwnd, 0));
+                WS_VISIBLE, 24, 52, 400, 20, hwnd, 0));
             g_hwndAppsList = page(g_pageApps, NewCtrl(WC_LISTVIEWW, L"",
                 WS_VISIBLE | WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL |
-                LVS_SHOWSELALWAYS, 84, 76, 536, 404, hwnd, IDC_APPS_LIST));
+                LVS_SHOWSELALWAYS, 24, 76, 536, 404, hwnd, IDC_APPS_LIST));
             ListView_SetExtendedListViewStyle(g_hwndAppsList,
                 LVS_EX_FULLROWSELECT | LVS_EX_CHECKBOXES | LVS_EX_DOUBLEBUFFER);
             LVAddColumn(g_hwndAppsList, 0, L"Application", 500);
@@ -2765,10 +2674,10 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         {
             page(g_pageBangs, NewCtrl(L"STATIC",
                 L"Add appends an editable row - double-click a cell to edit - Del/Remove deletes:",
-                WS_VISIBLE, 84, 52, 536, 20, hwnd, 0));
+                WS_VISIBLE, 24, 52, 536, 20, hwnd, 0));
             g_hwndBangsList = page(g_pageBangs, NewCtrl(WC_LISTVIEWW, L"",
                 WS_VISIBLE | WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL |
-                LVS_SHOWSELALWAYS | LVS_EDITLABELS, 84, 74, 536, 366, hwnd, IDC_BANGS_LIST));
+                LVS_SHOWSELALWAYS | LVS_EDITLABELS, 24, 74, 536, 366, hwnd, IDC_BANGS_LIST));
             ListView_SetExtendedListViewStyle(g_hwndBangsList,
                 LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
             LVAddColumn(g_hwndBangsList, 0, L"Aliases", 150);
@@ -2779,19 +2688,19 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             ListView_SetTextBkColor(g_hwndBangsList, kBg);
             FillBangsList();
             page(g_pageBangs, NewCtrl(L"BUTTON", L"Add",
-                WS_VISIBLE, 84, 448, 100, 26, hwnd, IDC_BANG_ADD));
+                WS_VISIBLE, 24, 448, 100, 26, hwnd, IDC_BANG_ADD));
             page(g_pageBangs, NewCtrl(L"BUTTON", L"Remove",
-                WS_VISIBLE, 194, 448, 100, 26, hwnd, IDC_BANG_DEL));
+                WS_VISIBLE, 134, 448, 100, 26, hwnd, IDC_BANG_DEL));
         }
 
         // ---- Quick links page (same in-place pattern, no query)
         {
             page(g_pageQuick, NewCtrl(L"STATIC",
                 L"Type the name in the palette - Enter opens the fixed URL - Del/Remove deletes:",
-                WS_VISIBLE, 84, 52, 536, 20, hwnd, 0));
+                WS_VISIBLE, 24, 52, 536, 20, hwnd, 0));
             g_hwndQuickList = page(g_pageQuick, NewCtrl(WC_LISTVIEWW, L"",
                 WS_VISIBLE | WS_BORDER | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL |
-                LVS_SHOWSELALWAYS | LVS_EDITLABELS, 84, 74, 536, 366, hwnd, IDC_QUICK_LIST));
+                LVS_SHOWSELALWAYS | LVS_EDITLABELS, 24, 74, 536, 366, hwnd, IDC_QUICK_LIST));
             ListView_SetExtendedListViewStyle(g_hwndQuickList,
                 LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
             LVAddColumn(g_hwndQuickList, 0, L"Name", 170);
@@ -2801,69 +2710,9 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             ListView_SetTextBkColor(g_hwndQuickList, kBg);
             FillQuickList();
             page(g_pageQuick, NewCtrl(L"BUTTON", L"Add",
-                WS_VISIBLE, 84, 448, 100, 26, hwnd, IDC_QUICK_ADD));
+                WS_VISIBLE, 24, 448, 100, 26, hwnd, IDC_QUICK_ADD));
             page(g_pageQuick, NewCtrl(L"BUTTON", L"Remove",
-                WS_VISIBLE, 194, 448, 100, 26, hwnd, IDC_QUICK_DEL));
-        }
-
-        // ---- Files page (file browser presentation: view + grid size).
-        // File mode only: list view and all other searches are unaffected.
-        // Everything applies instantly, like the rest of Settings.
-        {
-            page(g_pageFiles, NewCtrl(L"STATIC", L"View:",
-                WS_VISIBLE, 84, 52, 200, 20, hwnd, 0));
-            page(g_pageFiles, NewCtrl(L"BUTTON", L"List",
-                WS_VISIBLE, 84, 74, 120, 28, hwnd, IDC_VIEW_LIST));
-            page(g_pageFiles, NewCtrl(L"BUTTON", L"Grid",
-                WS_VISIBLE, 214, 74, 120, 28, hwnd, IDC_VIEW_GRID));
-            page(g_pageFiles, NewCtrl(L"STATIC", L"Grid rows:",
-                WS_VISIBLE, 84, 114, 200, 20, hwnd, 0));
-            page(g_pageFiles, NewCtrl(L"BUTTON", L"-",
-                WS_VISIBLE, 84, 136, 48, 26, hwnd, IDC_ROWS_DEC));
-            g_hwndRowsVal = page(g_pageFiles, NewCtrl(L"STATIC", L"3",
-                WS_VISIBLE | SS_CENTER, 138, 136, 60, 26, hwnd, 0));
-            page(g_pageFiles, NewCtrl(L"BUTTON", L"+",
-                WS_VISIBLE, 204, 136, 48, 26, hwnd, IDC_ROWS_INC));
-            page(g_pageFiles, NewCtrl(L"STATIC", L"Grid columns:",
-                WS_VISIBLE, 280, 114, 200, 20, hwnd, 0));
-            page(g_pageFiles, NewCtrl(L"BUTTON", L"-",
-                WS_VISIBLE, 280, 136, 48, 26, hwnd, IDC_COLS_DEC));
-            g_hwndColsVal = page(g_pageFiles, NewCtrl(L"STATIC", L"5",
-                WS_VISIBLE | SS_CENTER, 334, 136, 60, 26, hwnd, 0));
-            page(g_pageFiles, NewCtrl(L"BUTTON", L"+",
-                WS_VISIBLE, 400, 136, 48, 26, hwnd, IDC_COLS_INC));
-            page(g_pageFiles, NewCtrl(L"STATIC",
-                L"File browser grid only. List view and other searches are unaffected.\r\n"
-                L"Changes apply instantly.",
-                WS_VISIBLE, 84, 172, 516, 44, hwnd, 0));
-            wchar_t rv[16], cv[16];
-            swprintf_s(rv, 16, L"%d", g_settings.gridRows);
-            swprintf_s(cv, 16, L"%d", g_settings.gridCols);
-            SetWindowTextW(g_hwndRowsVal, rv);
-            SetWindowTextW(g_hwndColsVal, cv);
-        }
-
-        // Filter registry (creation order == vector order): General + Files.
-        {
-            static const wchar_t* gx[] = {
-                L"", L"duckduckgo search", L"google search", L"bing search",
-                L"brave search", L"custom plus add own", L"name custom",
-                L"name custom", L"address link placeholder", L"address link",
-                L"browser web", L"chrome edge firefox opera vivaldi",
-                L"pick exe file", L"",
-            };
-            for (size_t i = 0; i < g_pageGeneral.size() &&
-                 i < sizeof(gx) / sizeof(gx[0]); i++)
-                RegFilter(hwnd, g_pageGeneral[i], 0, gx[i]);
-            static const wchar_t* fx[] = {
-                L"appearance", L"list appearance", L"grid appearance",
-                L"size number rows", L"minus decrease", L"value number",
-                L"plus increase", L"size number columns", L"minus decrease",
-                L"value number", L"plus increase", L"",
-            };
-            for (size_t i = 0; i < g_pageFiles.size() &&
-                 i < sizeof(fx) / sizeof(fx[0]); i++)
-                RegFilter(hwnd, g_pageFiles[i], 4, fx[i]);
+                WS_VISIBLE, 134, 448, 100, 26, hwnd, IDC_QUICK_DEL));
         }
 
         // Shared bottom buttons (always visible).
@@ -2875,7 +2724,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 380, 518, 188, 20, hwnd, 0);
 
         // Silence the edit-control beep in settings (Enter/Esc/Tab chars).
-        HWND plainEdits[] = {g_hwndCEngName, g_hwndCEngUrl, g_hwndFilter};
+        HWND plainEdits[] = {g_hwndEngineUrl};
         for (size_t i = 0; i < sizeof(plainEdits) / sizeof(plainEdits[0]); i++)
             SetWindowSubclass(plainEdits[i], PlainEditSubclass, 10 + (UINT_PTR)i, 0);
 
@@ -2942,93 +2791,9 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         bool pressed = (d->itemState & ODS_SELECTED) != 0;
         bool focus = (d->itemState & ODS_FOCUS) != 0;
         bool isSave = d->CtlID == (UINT)IDC_SAVE;
-        bool isPage = d->CtlID >= (UINT)IDC_PAGE_0 && d->CtlID <= (UINT)IDC_PAGE_4;
+        bool isPage = d->CtlID >= (UINT)IDC_PAGE_0 && d->CtlID <= (UINT)IDC_PAGE_3;
         bool pageSel = isPage && (int)(d->CtlID - (UINT)IDC_PAGE_0) == g_settingsPage;
-        bool isView = d->CtlID == (UINT)IDC_VIEW_LIST || d->CtlID == (UINT)IDC_VIEW_GRID;
-        bool viewSel = isView && ((d->CtlID == (UINT)IDC_VIEW_GRID) == g_settings.fileGrid);
-        bool accent = isSave || pageSel || viewSel;
-        if (isPage) {
-            // Icon rail: glyph button, accent when active, no text.
-            int pg = (int)(d->CtlID - (UINT)IDC_PAGE_0);
-            if (pg < 0 || pg > 4) pg = 0;
-            static const GlyphStyle railGlyph[5] = {
-                GlyphStyle::Setting, GlyphStyle::App, GlyphStyle::Bolt,
-                GlyphStyle::Link, GlyphStyle::Folder,
-            };
-            static const COLORREF railCol[5] = {
-                RGB(45, 212, 191), RGB(96, 165, 250), RGB(251, 146, 60),
-                RGB(52, 211, 153), RGB(251, 191, 36),
-            };
-            FillRect(dc, &d->rcItem, g_brBg);
-            HBRUSH rbg = CreateSolidBrush(pageSel ? RGB(29, 65, 115) : RGB(26, 26, 28));
-            HPEN rpen = CreatePen(PS_SOLID, 1, pageSel ? kAppCol : RGB(66, 66, 72));
-            HGDIOBJ roB = SelectObject(dc, rbg);
-            HGDIOBJ roP = SelectObject(dc, rpen);
-            RoundRect(dc, d->rcItem.left, d->rcItem.top,
-                      d->rcItem.right, d->rcItem.bottom, 10, 10);
-            SelectObject(dc, roB); SelectObject(dc, roP);
-            DeleteObject(rbg); DeleteObject(rpen);
-            int gz = 24;
-            int gx = (d->rcItem.left + d->rcItem.right - gz) / 2;
-            int gy = (d->rcItem.top + d->rcItem.bottom - gz) / 2;
-            RECT gcell{gx, gy, gx + gz, gy + gz};
-            FileGlyph fg{railGlyph[pg], railCol[pg]};
-            PaintGlyph(dc, gcell, fg, pageSel, 0, NULL);
-            return TRUE;
-        }
-        if (isView) {
-            // List/Grid pictograms instead of text.
-            FillRect(dc, &d->rcItem, g_brBg);
-            HBRUSH vbg = CreateSolidBrush(viewSel ? RGB(29, 65, 115) : RGB(26, 26, 28));
-            HPEN vpen = CreatePen(PS_SOLID, 1, viewSel ? kAppCol : RGB(66, 66, 72));
-            HGDIOBJ voB = SelectObject(dc, vbg);
-            HGDIOBJ voP = SelectObject(dc, vpen);
-            RoundRect(dc, d->rcItem.left, d->rcItem.top,
-                      d->rcItem.right, d->rcItem.bottom, 8, 8);
-            SelectObject(dc, voB); SelectObject(dc, voP);
-            DeleteObject(vbg); DeleteObject(vpen);
-            const COLORREF vc = RGB(240, 240, 240);
-            int cxm = (d->rcItem.left + d->rcItem.right) / 2;
-            if (d->CtlID == (UINT)IDC_VIEW_LIST) {
-                for (int i = 0; i < 3; i++) {
-                    int yy = d->rcItem.top + 8 + i * 7;
-                    GlyphFillRect(dc, cxm - 22, yy, cxm - 19, yy + 3, vc);
-                    GlyphLine(dc, cxm - 14, yy + 1, cxm + 22, yy + 1, 2, vc);
-                }
-            } else {
-                for (int r = 0; r < 3; r++)
-                    for (int c = 0; c < 3; c++)
-                        GlyphFillRect(dc, cxm - 12 + c * 10, d->rcItem.top + 4 + r * 7,
-                                      cxm - 8 + c * 10, d->rcItem.top + 8 + r * 7, vc);
-            }
-            return TRUE;
-        }
-        if (d->CtlID >= (UINT)IDC_ENG_0 && d->CtlID <= (UINT)IDC_ENG_CUSTOM) {
-            // Engine tiles: brand dot + full name (custom tile: "+ Custom").
-            int ei = (int)(d->CtlID - (UINT)IDC_ENG_0);
-            bool sel = (g_engineSel == ei);
-            FillRect(dc, &d->rcItem, g_brBg);
-            HBRUSH ebg = CreateSolidBrush(sel ? RGB(29, 65, 115) : RGB(26, 26, 28));
-            HPEN epen = CreatePen(PS_SOLID, 1, sel ? kAppCol : RGB(66, 66, 72));
-            HGDIOBJ eoB = SelectObject(dc, ebg);
-            HGDIOBJ eoP = SelectObject(dc, epen);
-            RoundRect(dc, d->rcItem.left, d->rcItem.top,
-                      d->rcItem.right, d->rcItem.bottom, 8, 8);
-            SelectObject(dc, eoB); SelectObject(dc, eoP);
-            DeleteObject(ebg); DeleteObject(epen);
-            COLORREF dot = (ei < 4) ? kEngines[ei].color : RGB(140, 140, 150);
-            int cy = (d->rcItem.top + d->rcItem.bottom) / 2;
-            GlyphFillEllipse(dc, d->rcItem.left + 12, cy - 5,
-                             d->rcItem.left + 22, cy + 5, dot);
-            const wchar_t* label = (ei < 4) ? kEngines[ei].name : L"+ Custom";
-            SetBkMode(dc, TRANSPARENT);
-            SelectObject(dc, g_fontUI);
-            SetTextColor(dc, kText);
-            RECT tr = d->rcItem; tr.left += 30; tr.right -= 8;
-            DrawTextW(dc, label, -1, &tr,
-                      DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
-            return TRUE;
-        }
+        bool accent = isSave || pageSel;
         FillRect(dc, &d->rcItem, g_brBg);
         COLORREF fill = accent ? (pressed ? RGB(38, 82, 140) : RGB(29, 65, 115))
                                : (pressed ? RGB(52, 52, 56) : RGB(26, 26, 28));
@@ -3141,61 +2906,22 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_COMMAND: {
         WORD id = LOWORD(w), code = HIWORD(w);
-        if (id >= IDC_PAGE_0 && id <= IDC_PAGE_4) {
+        if (id >= IDC_PAGE_0 && id <= IDC_PAGE_3) {
             ShowSettingsPage(id - IDC_PAGE_0);
-            for (int i = IDC_PAGE_0; i <= IDC_PAGE_4; i++) {
+            for (int i = IDC_PAGE_0; i <= IDC_PAGE_3; i++) {
                 HWND b = GetDlgItem(hwnd, i);
                 if (b) InvalidateRect(b, NULL, FALSE);
             }
-            ApplySettingFilter(); // re-apply the filter on the fresh page
-        } else if (id >= IDC_ENG_0 && id <= IDC_ENG_CUSTOM) {
-            if (id == IDC_ENG_CUSTOM) {
-                g_engineSel = 4;
-            } else {
-                int ei = (int)(id - IDC_ENG_0);
-                g_engineSel = ei;
-                g_settings.engineName = kEngines[ei].name;
-                g_settings.engineUrl = kEngines[ei].url;
-            }
-            SaveNow();
-            for (int i = IDC_ENG_0; i <= IDC_ENG_CUSTOM; i++) {
-                HWND b = GetDlgItem(hwnd, i);
-                if (b) InvalidateRect(b, NULL, FALSE);
-            }
-            LayoutGeneralCustom(hwnd);
-            ApplySettingFilter();
-        } else if (id == IDC_CENG_NAME && code == EN_KILLFOCUS) {
-            std::wstring t = Trim(GetWindowString(g_hwndCEngName));
-            if (t.empty()) {
-                MessageBoxW(hwnd, L"Engine name cannot be empty - change reverted.",
-                            L"SneekPeek", MB_ICONWARNING | MB_OK);
-                SetWindowTextW(g_hwndCEngName, g_settings.engineName.c_str());
-            } else {
-                g_settings.engineName = t;
-                SaveNow();
-            }
-        } else if (id == IDC_CENG_URL && code == EN_KILLFOCUS) {
-            std::wstring eurl = Trim(GetWindowString(g_hwndCEngUrl));
-            if (eurl.find(L"%s") == std::wstring::npos) {
-                MessageBoxW(hwnd, L"Custom URL must contain %s as the query placeholder.",
-                            L"SneekPeek", MB_ICONWARNING | MB_OK);
-                SetWindowTextW(g_hwndCEngUrl, g_settings.engineUrl.c_str());
-            } else {
-                std::wstring probe = eurl;
-                size_t pp = probe.find(L"%s");
-                if (pp != std::wstring::npos) probe.replace(pp, 2, L"test");
-                if (!IsSafeWebUrl(probe)) {
-                    MessageBoxW(hwnd, L"Custom URL must be an https:// (or http://) address.",
-                                L"SneekPeek", MB_ICONWARNING | MB_OK);
-                    SetWindowTextW(g_hwndCEngUrl, g_settings.engineUrl.c_str());
-                } else {
-                    g_settings.engineUrl = eurl;
-                    SaveNow();
-                }
-            }
-        } else if (id == IDC_FILTER_EDIT && code == EN_CHANGE) {
-            g_settingFilter = GetWindowString(g_hwndFilter);
-            ApplySettingFilter();
+        } else if (id == IDC_ENGINE_COMBO && code == CBN_SELCHANGE) {
+            int sel = (int)SendMessageW(g_hwndEngineCombo, CB_GETCURSEL, 0, 0);
+            EnableWindow(g_hwndEngineUrl, sel == 4);
+            if (sel == 0) SetWindowTextW(g_hwndEngineUrl, L"https://duckduckgo.com/?q=%s");
+            if (sel == 1) SetWindowTextW(g_hwndEngineUrl, L"https://www.google.com/search?q=%s");
+            if (sel == 2) SetWindowTextW(g_hwndEngineUrl, L"https://www.bing.com/search?q=%s");
+            if (sel == 3) SetWindowTextW(g_hwndEngineUrl, L"https://search.brave.com/search?q=%s");
+            SaveEngineBrowser(hwnd); // instant save, no Save button
+        } else if (id == IDC_ENGINE_URL && code == EN_KILLFOCUS) {
+            SaveEngineBrowser(hwnd);
         } else if (id == IDC_BROWSER_COMBO && code == CBN_SELCHANGE) {
             int sel = (int)SendMessageW(g_hwndBrowserCombo, CB_GETCURSEL, 0, 0);
             int count = (int)SendMessageW(g_hwndBrowserCombo, CB_GETCOUNT, 0, 0);
@@ -3210,30 +2936,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                     SendMessageW(g_hwndBrowserCombo, CB_SETCURSEL, 0, 0);
                 }
             }
-            SaveBrowserChoice(hwnd);
-        } else if (id == IDC_VIEW_LIST || id == IDC_VIEW_GRID) {
-            g_settings.fileGrid = (id == IDC_VIEW_GRID);
-            SaveNow();
-            HWND bl = GetDlgItem(hwnd, IDC_VIEW_LIST);
-            HWND bg = GetDlgItem(hwnd, IDC_VIEW_GRID);
-            if (bl) InvalidateRect(bl, NULL, FALSE);
-            if (bg) InvalidateRect(bg, NULL, FALSE);
-            if (g_hwndPalette && IsWindowVisible(g_hwndPalette) && InFileMode())
-                UpdateResults(); // re-layout list <-> grid live
-        } else if (id == IDC_ROWS_DEC || id == IDC_ROWS_INC ||
-                   id == IDC_COLS_DEC || id == IDC_COLS_INC) {
-            if (id == IDC_ROWS_DEC) g_settings.gridRows = ClampGridRows(g_settings.gridRows - 1);
-            else if (id == IDC_ROWS_INC) g_settings.gridRows = ClampGridRows(g_settings.gridRows + 1);
-            else if (id == IDC_COLS_DEC) g_settings.gridCols = ClampGridCols(g_settings.gridCols - 1);
-            else g_settings.gridCols = ClampGridCols(g_settings.gridCols + 1);
-            wchar_t b[16];
-            swprintf_s(b, 16, L"%d", g_settings.gridRows);
-            SetWindowTextW(g_hwndRowsVal, b);
-            swprintf_s(b, 16, L"%d", g_settings.gridCols);
-            SetWindowTextW(g_hwndColsVal, b);
-            SaveNow();
-            if (g_hwndPalette && IsWindowVisible(g_hwndPalette) && InFileMode())
-                UpdateResults(); // re-layout grid live
+            SaveEngineBrowser(hwnd);
         } else if (id == IDC_BROWSER_BROWSE) {
             std::wstring picked;
             if (BrowseForBrowser(hwnd, picked)) {
@@ -3242,7 +2945,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 SendMessageW(g_hwndBrowserCombo, CB_INSERTSTRING, count - 1,
                              (LPARAM)g_browsers.back().name.c_str());
                 SendMessageW(g_hwndBrowserCombo, CB_SETCURSEL, count - 1, 0);
-                SaveBrowserChoice(hwnd);
+                SaveEngineBrowser(hwnd);
             }
         } else if (id == IDC_BANG_DEL) {
             DeleteSelectedTableRow(g_hwndBangsList);
@@ -3296,17 +2999,10 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         g_hwndCellEdit = NULL;
         g_hwndSavedLabel = NULL;
         g_cellLv = 0; g_cellRow = -1; g_cellCol = 0;
-        g_hwndBrowserCombo = NULL;
-        g_hwndRowsVal = g_hwndColsVal = NULL;
-        g_hwndCEngNameLbl = g_hwndCEngName = NULL;
-        g_hwndCEngUrlLbl = g_hwndCEngUrl = NULL;
-        g_hwndFilter = NULL;
-        g_engineSel = -1;
-        g_settingFilter.clear();
-        g_filterRows.clear();
+        g_hwndEngineCombo = g_hwndEngineUrl = g_hwndBrowserCombo = NULL;
         g_hwndAppsList = g_hwndBangsList = g_hwndQuickList = NULL;
         g_pageGeneral.clear(); g_pageApps.clear();
-        g_pageBangs.clear(); g_pageQuick.clear(); g_pageFiles.clear();
+        g_pageBangs.clear(); g_pageQuick.clear();
         break;
     }
     return DefWindowProcW(hwnd, m, w, l);
