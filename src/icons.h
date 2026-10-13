@@ -13,6 +13,7 @@ enum class GlyphStyle {
     App, Web, Bang, Calc, Setting, Folder, Drive, FilePage,
     Exe, Terminal, Shortcut, DocLines, Pdf, DocWord, Sheet, Slide,
     Book, Picture, Audio, Video, Archive, Disc, Code, FontTag, Database,
+    Bolt, Link,
 };
 
 struct FileGlyph {
@@ -385,6 +386,16 @@ inline void PaintGlyph(HDC dc, const RECT& cell, const FileGlyph& g,
         GlyphFillRect(dc, x + 5, y + 6, x + 15, y + s - 3, base); // body
         GlyphFillEllipse(dc, x + 5, y + 3, x + 15, y + 8, base); // top rim
         GlyphFrameEllipse(dc, x + 5, y + 3, x + 15, y + 8, 1, dark);
+        break;
+    case GlyphStyle::Bolt: {
+        POINT b[6] = {{x + 12, y + 2}, {x + 6, y + 11}, {x + 9, y + 11},
+                      {x + 8, y + 18}, {x + 14, y + 9}, {x + 11, y + 9}};
+        GlyphFillPoly(dc, b, 6, base); // lightning
+        break;
+    }
+    case GlyphStyle::Link:
+        GlyphFrameEllipse(dc, x + 3, y + 6, x + 11, y + 14, 2, base); // rings
+        GlyphFrameEllipse(dc, x + 9, y + 6, x + 17, y + 14, 2, base);
         break;
     }
 }
