@@ -42,6 +42,7 @@ struct Settings {
     std::vector<Bang> bangs;
     std::vector<QuickLink> quicks; // name -> fixed URL launched on Enter (no query)
     bool awakeOn = false;          // keep display+system awake (tray + Awake chip)
+    bool fileGrid = false;         // file browser presentation: grid vs list
     bool includePathExes = false;
     bool runAtStartup = false;
 };
@@ -112,6 +113,7 @@ inline void LoadSettings(Settings& s) {
     s.includePathExes = GetPrivateProfileIntW(L"General", L"IncludePathExes", 0, ini.c_str()) != 0;
     s.runAtStartup = GetPrivateProfileIntW(L"General", L"RunAtStartup", 0, ini.c_str()) != 0;
     s.awakeOn = GetPrivateProfileIntW(L"General", L"Awake", 0, ini.c_str()) != 0;
+    s.fileGrid = GetPrivateProfileIntW(L"General", L"FileGrid", 0, ini.c_str()) != 0;
 
     int count = GetPrivateProfileIntW(L"Bangs", L"Count", 0, ini.c_str());
     count = ClampCustomCount(count); // clamp, never drop all
@@ -165,6 +167,7 @@ inline void SaveSettings(const Settings& s) {
     WritePrivateProfileStringW(L"General", L"IncludePathExes", s.includePathExes ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"General", L"RunAtStartup", s.runAtStartup ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"General", L"Awake", s.awakeOn ? L"1" : L"0", ini.c_str());
+    WritePrivateProfileStringW(L"General", L"FileGrid", s.fileGrid ? L"1" : L"0", ini.c_str());
     size_t nbangs = s.bangs.size() < (size_t)kMaxCustomEntries
         ? s.bangs.size() : (size_t)kMaxCustomEntries;
     wchar_t count[16];

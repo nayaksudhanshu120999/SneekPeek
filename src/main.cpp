@@ -73,6 +73,7 @@ static const wchar_t* kSettingsClass = L"SneekPeekSettings";
 static const wchar_t* kChipClass     = L"SneekPeekChip";
 static const wchar_t* kChipRowClass  = L"SneekPeekChipRow";
 static const wchar_t* kFileBarClass  = L"SneekPeekFileBar";
+static const wchar_t* kFileGridClass = L"SneekPeekFileGrid";
 static const wchar_t* kMutexName     = L"SneekPeek_SingleInstance_v1";
 static const UINT HOTKEY_ID = 1;
 static const UINT WM_TRAYICON = WM_APP + 10;
@@ -94,11 +95,15 @@ static int kCornerR = 14;
 static int kChipH = 28;
 static int kChipRowH = 40;
 static int kBottomBarH = 30;
+static int kGridTileH = 86; // Explorer-like tile height (glyph + 2 name lines)
+static int kGridHeadH = 24; // slim count header above the tiles
+static const int kGridVisRows = 2; // tile rows visible without scrolling
 static const int kMaxChips = 4;
 static void UpdateLayoutMetrics() {
     kWidth = Dpx(600); kInputH = Dpx(44); kItemH = Dpx(38);
     kCornerR = Dpx(14); kChipH = Dpx(28); kChipRowH = Dpx(40);
     kBottomBarH = Dpx(30);
+    kGridTileH = Dpx(86); kGridHeadH = Dpx(24);
 }
 
 // Settings control IDs
@@ -113,6 +118,7 @@ enum {
     IDC_QUICK_LIST = 120, IDC_QUICK_NAME = 121, IDC_QUICK_URL = 122,
     IDC_QUICK_ADD = 123, IDC_QUICK_UPDATE = 124, IDC_QUICK_DEL = 125,
     IDC_SAVE = 201, IDC_RESCAN = 202, IDC_CLOSE = 203,
+    IDC_VIEW_TOGGLE = 204,
     IDC_PAGE_0 = 301, IDC_PAGE_1, IDC_PAGE_2, IDC_PAGE_3,
 };
 
@@ -178,6 +184,7 @@ static HWND        g_hwndList = NULL;
 static HWND        g_hwndChip = NULL;
 static HWND        g_hwndChipRow = NULL;
 static HWND        g_hwndFileBar = NULL; // slim Explorer bar, file mode only
+static HWND        g_hwndFileGrid = NULL; // tile grid, file grid-view only
 static int         g_bangChipW = 0;  // 0 = hidden
 static HWND        g_hwndSettings = NULL;
 static int         g_settingsPage = 0;
@@ -185,6 +192,7 @@ static HWND        g_hwndEngineCombo = NULL;
 static HWND        g_hwndEngineUrl = NULL;
 static HWND        g_hwndBrowserCombo = NULL;
 static HWND        g_hwndSavedLabel = NULL; // "Saved HH:MM:SS" indicator
+static HWND        g_hwndViewToggle = NULL; // Files view List/Grid button
 static HWND        g_hwndAppsList = NULL;
 static HWND        g_hwndBangsList = NULL;
 static HWND        g_hwndQuickList = NULL;
@@ -198,12 +206,13 @@ static HFONT       g_fontInput = NULL;
 static HFONT       g_fontTitle = NULL;
 static HFONT       g_fontSub = NULL;
 static HFONT       g_fontChip = NULL;
+static HFONT       g_fontGrid = NULL; // large bang-letter font for file tiles
 static HFONT       g_fontUI = NULL; // Segoe UI for all Settings controls
 static void DeleteAppFonts() {
-    HFONT fonts[] = {g_fontInput, g_fontTitle, g_fontSub, g_fontChip, g_fontUI};
-    for (size_t i = 0; i < 5; i++)
+    HFONT fonts[] = {g_fontInput, g_fontTitle, g_fontSub, g_fontChip, g_fontGrid, g_fontUI};
+    for (size_t i = 0; i < 6; i++)
         if (fonts[i]) DeleteObject(fonts[i]);
-    g_fontInput = g_fontTitle = g_fontSub = g_fontChip = g_fontUI = NULL;
+    g_fontInput = g_fontTitle = g_fontSub = g_fontChip = g_fontGrid = g_fontUI = NULL;
 }
 static void CreateAppFonts() {
     DeleteAppFonts();
@@ -218,6 +227,9 @@ static void CreateAppFonts() {
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     g_fontChip = CreateFontW(-MulDiv(10, dpiY, 72), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    g_fontGrid = CreateFontW(-MulDiv(16, dpiY, 72), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     g_fontUI = CreateFontW(-MulDiv(9, dpiY, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
@@ -244,6 +256,10 @@ static bool g_changingEdit = false;
 // ever scanned (no parent/child prefetch, no cache).
 static bool g_fileActive = false;
 static std::wstring g_fileDir;
+// File grid view (Settings toggle): Explorer-like tiles instead of rows.
+// The hidden listbox stays the selection store; the grid only paints +
+// hit-tests, so all nav/execute code keeps working unchanged.
+static int g_gridTopRow = 0; // first visible tile row in grid mode
 // Arrow navigation: original typed text, restored when wrapping past the ends.
 static std::wstring g_origQuery;
 static bool g_navigating = false;
@@ -473,6 +489,7 @@ static void PlacePalette() {
     ShowWindow(g_hwndChipRow, SW_HIDE);
     ShowWindow(g_hwndChip, SW_HIDE);
     ShowWindow(g_hwndFileBar, SW_HIDE);
+    ShowWindow(g_hwndFileGrid, SW_HIDE);
 }
 
 static void ShowPalette() {
@@ -800,6 +817,25 @@ static void ExecuteFileSelected(bool inExplorer) {
     }
 }
 
+// ------------------------------------------------------- file grid metrics
+// Grid is file-mode-only and setting-gated. Columns derive from the fixed
+// palette width; tiles map 1:1 onto g_results indices (after one header).
+static bool GridActive() { return InFileMode() && g_settings.fileGrid; }
+static int GridColumns() {
+    int w = kWidth - Dpx(16) * 2;
+    int c = w / Dpx(104);
+    return c < 1 ? 1 : c;
+}
+static int GridContentH() {
+    bool head = !g_results.empty() && g_results.front().kind == ResultKind::Header;
+    size_t base = head ? 1 : 0;
+    size_t tiles = g_results.size() > base ? g_results.size() - base : 0;
+    int cols = GridColumns();
+    int need = tiles ? (int)((tiles + (size_t)cols - 1) / (size_t)cols) : 0;
+    int vis = need < kGridVisRows ? need : kGridVisRows;
+    return (head ? kGridHeadH : 0) + vis * kGridTileH;
+}
+
 // ------------------------------------------------------------- power actions
 // Absolute system paths only: never resolve power tools from CWD or PATH.
 static std::wstring SystemExe(const wchar_t* name) {
@@ -959,11 +995,12 @@ static void RebuildListControl() {
 
     bool showChips = !g_chips.empty();
     bool showBar = InFileMode() && !g_fileDir.empty();
+    bool gridOn = GridActive();
     size_t rows = g_results.size() > kMaxItems ? kMaxItems : g_results.size();
     int listY = kInputH + (showChips ? kChipRowH : 0);
-    int listH = (int)rows * kItemH;
+    int contentH = gridOn ? GridContentH() : (int)rows * kItemH;
     int barH = showBar ? kBottomBarH : 0;
-    int h = listY + listH + barH + 4; // 4px bottom pad mirrors the top
+    int h = listY + contentH + barH + 4; // 4px bottom pad mirrors the top
 
     // Resize (window + region + children) only when the height changed:
     // this is what stops the per-keystroke blink.
@@ -978,23 +1015,35 @@ static void RebuildListControl() {
                          SWP_NOZORDER | SWP_SHOWWINDOW);
         else
             ShowWindow(g_hwndChipRow, SW_HIDE);
-        if (rows == 0)
-            ShowWindow(g_hwndList, SW_HIDE); // bar-only: no list at all
-        else
-            SetWindowPos(g_hwndList, NULL, Dpx(16), listY, cr.right - Dpx(32),
-                         listH, SWP_NOZORDER | SWP_SHOWWINDOW);
     }
-    // Explorer bar docks under the list (positioned every refresh: cheap).
+    // List/grid visibility + geometry, every refresh (cheap, idempotent).
+    {
+        RECT cr; GetClientRect(g_hwndPalette, &cr);
+        if (gridOn) {
+            if (IsWindowVisible(g_hwndList)) ShowWindow(g_hwndList, SW_HIDE);
+            SetWindowPos(g_hwndFileGrid, NULL, Dpx(16), listY,
+                         cr.right - Dpx(32), contentH, SWP_NOZORDER | SWP_SHOWWINDOW);
+        } else {
+            if (IsWindowVisible(g_hwndFileGrid)) ShowWindow(g_hwndFileGrid, SW_HIDE);
+            if (rows == 0)
+                ShowWindow(g_hwndList, SW_HIDE); // bar-only: no list at all
+            else
+                SetWindowPos(g_hwndList, NULL, Dpx(16), listY, cr.right - Dpx(32),
+                             contentH, SWP_NOZORDER | SWP_SHOWWINDOW);
+        }
+    }
+    // Explorer bar docks under the content (positioned every refresh: cheap).
     {
         RECT cr; GetClientRect(g_hwndPalette, &cr);
         if (showBar)
-            SetWindowPos(g_hwndFileBar, NULL, Dpx(16), listY + listH,
+            SetWindowPos(g_hwndFileBar, NULL, Dpx(16), listY + contentH,
                          cr.right - Dpx(32), barH, SWP_NOZORDER | SWP_SHOWWINDOW);
         else if (g_hwndFileBar)
             ShowWindow(g_hwndFileBar, SW_HIDE);
     }
     // No background erase (controls paint every pixel themselves).
-    InvalidateRect(g_hwndList, NULL, FALSE);
+    if (gridOn) InvalidateRect(g_hwndFileGrid, NULL, FALSE);
+    else InvalidateRect(g_hwndList, NULL, FALSE);
     if (showChips) InvalidateRect(g_hwndChipRow, NULL, FALSE);
     if (showBar) InvalidateRect(g_hwndFileBar, NULL, FALSE);
     // No scrollbar by construction (WS_VSCROLL removed): longer file lists
@@ -1034,6 +1083,7 @@ static void UpdateResults() {
     if (InFileMode()) {
         g_chips.clear();
         g_chipsFocus = false;
+        g_gridTopRow = 0; // fresh results start at the top
         UpdateFileResults(q);
         return;
     }
@@ -1373,6 +1423,20 @@ static void SyncSelToBox(int listSel) {
 // After any programmatic selection change, pin the view so the row shows.
 static void EnsureVisible(int sel) {
     if (sel < 0 || !g_hwndList) return;
+    if (GridActive() && g_hwndFileGrid) {
+        // Grid rows, not list rows: pin the tile into the visible band.
+        size_t base = (!g_results.empty() &&
+                       g_results.front().kind == ResultKind::Header) ? 1 : 0;
+        if ((size_t)sel < base || (size_t)sel >= g_results.size()) return;
+        int cols = GridColumns();
+        if (cols < 1) cols = 1;
+        int row = (sel - (int)base) / cols;
+        if (row < g_gridTopRow) g_gridTopRow = row;
+        else if (row >= g_gridTopRow + kGridVisRows)
+            g_gridTopRow = row - kGridVisRows + 1;
+        InvalidateRect(g_hwndFileGrid, NULL, FALSE);
+        return;
+    }
     int top = (int)SendMessageW(g_hwndList, LB_GETTOPINDEX, 0, 0);
     RECT lr; GetClientRect(g_hwndList, &lr);
     int vis = (lr.bottom - lr.top) / kItemH;
@@ -1434,6 +1498,10 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                                     UINT_PTR, DWORD_PTR) {
     if (m == WM_CHAR) {
         if (w == 13 || w == 10 || w == 27 || w == 9) return 0;
+        // File mode: Space confirms (drills/opens), so the trailing WM_CHAR
+        // must not insert a literal space into the cleared box — that phantom
+        // space is what used to cost an extra Backspace to go up.
+        if (w == 32 && InFileMode()) return 0;
     }
     if (m == WM_MOUSEWHEEL) {
         WheelScrollList(GET_WHEEL_DELTA_WPARAM(w));
@@ -1484,8 +1552,17 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                 InvalidateRect(g_hwndList, NULL, FALSE);
             } else if (count > 0) {
                 EnsureNavStart();
-                int to = MoveSelNoWrap(sel, +1);
-                if (to >= 0) {
+                // Grid mode jumps a full tile row; list mode steps one row.
+                int step = GridActive() ? GridColumns() : 1;
+                int to = sel;
+                bool moved = false;
+                for (int i = 0; i < step; i++) {
+                    int nx = MoveSelNoWrap(to, +1);
+                    if (nx < 0) break;
+                    to = nx;
+                    moved = true;
+                }
+                if (moved) {
                     SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
                     SyncSelToBox(to);
                     EnsureVisible(to);
@@ -1506,8 +1583,17 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                 InvalidateRect(g_hwndList, NULL, FALSE);
             } else if (count > 0) {
                 EnsureNavStart();
-                int to = MoveSelNoWrap(sel, -1);
-                if (to >= 0) {
+                // Grid mode jumps a full tile row; list mode steps one row.
+                int step = GridActive() ? GridColumns() : 1;
+                int to = sel;
+                bool moved = false;
+                for (int i = 0; i < step; i++) {
+                    int nx = MoveSelNoWrap(to, -1);
+                    if (nx < 0) break;
+                    to = nx;
+                    moved = true;
+                }
+                if (moved) {
                     SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
                     SyncSelToBox(to);
                     EnsureVisible(to);
@@ -1518,6 +1604,24 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                 if (haveChips) InvalidateRect(g_hwndChipRow, NULL, FALSE);
             }
             return 0;
+        case VK_LEFT:
+        case VK_RIGHT:
+            // Grid mode only: sideways tile step. List mode keeps caret keys.
+            if (GridActive() && count > 0) {
+                g_confirmPower = -1;
+                EnsureNavStart();
+                int to = MoveSelNoWrap(sel, (w == VK_RIGHT) ? +1 : -1);
+                if (to >= 0) {
+                    SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
+                    SyncSelToBox(to);
+                    EnsureVisible(to);
+                } else {
+                    RestoreOrigSel();
+                }
+                InvalidateRect(g_hwndList, NULL, FALSE);
+                return 0; // consumed by the grid
+            }
+            break;
         case VK_BACK:
             if (InFileMode()) {
                 // Go up when the box is empty OR holds an arrow-mirrored name:
@@ -1728,6 +1832,104 @@ static LRESULT CALLBACK FileBarProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(hwnd, m, w, l);
 }
 
+// ------------------------------------------------------- file grid window
+// Explorer-like tiles, file grid-view only. Paints + hit-tests; selection
+// lives in the hidden listbox (same indices), so nav/execute are untouched.
+static int GridHitTest(int fx, int fy) {
+    if (!g_hwndFileGrid || g_results.empty()) return -1;
+    size_t base = (g_results.front().kind == ResultKind::Header) ? 1 : 0;
+    RECT cl;
+    if (!GetClientRect(g_hwndFileGrid, &cl)) return -1;
+    int y = base ? kGridHeadH : 0;
+    if (fy < y) return -1;
+    int cols = GridColumns();
+    if (cols < 1) cols = 1;
+    int tw = (cl.right - cl.left) / cols;
+    if (tw <= 0) return -1;
+    int c = fx / tw;
+    int r = (fy - y) / kGridTileH;
+    if (c < 0 || c >= cols || r < 0) return -1;
+    size_t idx = base + (size_t)(g_gridTopRow + r) * (size_t)cols + (size_t)c;
+    if (idx >= g_results.size()) return -1;
+    if (g_results[idx].kind == ResultKind::Header) return -1;
+    return (int)idx;
+}
+
+static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT cl; GetClientRect(hwnd, &cl);
+        FillRect(dc, &cl, g_brBg);
+        int y = 0;
+        size_t base = 0;
+        if (!g_results.empty() && g_results.front().kind == ResultKind::Header) {
+            SetBkMode(dc, TRANSPARENT);
+            SelectObject(dc, g_fontSub);
+            SetTextColor(dc, kSub);
+            RECT hr{cl.left + Dpx(14), 0, cl.right - Dpx(8), kGridHeadH};
+            DrawTextW(dc, g_results.front().title.c_str(), -1, &hr,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            y = kGridHeadH;
+            base = 1;
+        }
+        int cols = GridColumns();
+        if (cols < 1) cols = 1;
+        int tw = (cl.right - cl.left) / cols;
+        int sel = (int)SendMessageW(g_hwndList, LB_GETCURSEL, 0, 0);
+        size_t start = base + (size_t)g_gridTopRow * (size_t)cols;
+        for (size_t i = start; i < g_results.size(); i++) {
+            size_t t = i - base;
+            int r = (int)(t / (size_t)cols) - g_gridTopRow;
+            if (r >= kGridVisRows) break;
+            int c = (int)(t % (size_t)cols);
+            RECT tile{cl.left + c * tw, y + r * kGridTileH,
+                      cl.left + (c + 1) * tw, y + (r + 1) * kGridTileH};
+            const ResultItem& ri = g_results[i];
+            if (ri.kind == ResultKind::Header) continue; // safety
+            if ((int)i == sel) FillRect(dc, &tile, g_brSel);
+            int gz = Dpx(40);
+            int gx = tile.left + (tile.right - tile.left - gz) / 2;
+            RECT gcell{gx, tile.top + Dpx(8), gx + gz, tile.top + Dpx(8) + gz};
+            FileGlyph fg = GlyphForResult(ri.kind, ri.title, ri.action, ri.color);
+            wchar_t letter = ri.title.empty() ? L'?' : ri.title[0];
+            PaintGlyph(dc, gcell, fg, (int)i == sel, letter, g_fontGrid);
+            SetBkMode(dc, TRANSPARENT);
+            SelectObject(dc, g_fontSub);
+            SetTextColor(dc, (int)i == sel ? kText : RGB(218, 218, 226));
+            RECT nr{tile.left + Dpx(4), gcell.bottom + Dpx(4),
+                    tile.right - Dpx(4), tile.bottom - Dpx(2)};
+            DrawTextW(dc, ri.title.c_str(), -1, &nr,
+                      DT_CENTER | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        int idx = GridHitTest(GET_X_LPARAM(l), GET_Y_LPARAM(l));
+        if (idx >= 0) {
+            EnsureNavStart();
+            SendMessageW(g_hwndList, LB_SETCURSEL, idx, 0);
+            SyncSelToBox(idx);
+            EnsureVisible(idx);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        SetFocus(g_hwndEdit);
+        return 0;
+    }
+    case WM_LBUTTONDBLCLK:
+        ExecuteSelected(false);
+        return 0;
+    case WM_MOUSEWHEEL: // wheel over tiles moves through them
+        WheelScrollList(GET_WHEEL_DELTA_WPARAM(w));
+        return 0;
+    }
+    return DefWindowProcW(hwnd, m, w, l);
+}
+
 // ------------------------------------------------------------- palette wndproc
 static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
@@ -1757,6 +1959,11 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             WS_CHILD | WS_CLIPSIBLINGS,
             16, kInputH, kWidth - 32, kBottomBarH,
             hwnd, (HMENU)5, g_hInst, NULL);
+
+        g_hwndFileGrid = CreateWindowExW(0, kFileGridClass, L"",
+            WS_CHILD | WS_CLIPSIBLINGS,
+            16, kInputH, kWidth - 32, kItemH,
+            hwnd, (HMENU)6, g_hInst, NULL);
 
         g_hwndList = CreateWindowExW(0, L"LISTBOX", L"",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | LBS_NOTIFY | LBS_OWNERDRAWFIXED |
@@ -2439,8 +2646,11 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 L"Web + bang + quick links open in the chosen browser.\r\n"
                 L"Every change saves automatically.",
                 WS_VISIBLE, 24, 214, 536, 44, hwnd, 0));
+            g_hwndViewToggle = page(g_pageGeneral, NewCtrl(L"BUTTON", L"Files view: List",
+                WS_VISIBLE, 24, 266, 200, 26, hwnd, IDC_VIEW_TOGGLE));
             FillEngineCombo();
             FillBrowserCombo();
+            SetWindowTextW(g_hwndViewToggle, g_settings.fileGrid ? L"Files view: Grid" : L"Files view: List");
         }
 
         // ---- Hidden apps page (checkbox list)
@@ -2727,6 +2937,13 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 }
             }
             SaveEngineBrowser(hwnd);
+        } else if (id == IDC_VIEW_TOGGLE) {
+            g_settings.fileGrid = !g_settings.fileGrid;
+            SetWindowTextW(g_hwndViewToggle, g_settings.fileGrid ? L"Files view: Grid" : L"Files view: List");
+            InvalidateRect(g_hwndViewToggle, NULL, FALSE);
+            SaveNow();
+            if (g_hwndPalette && IsWindowVisible(g_hwndPalette) && InFileMode())
+                UpdateResults(); // re-layout list <-> grid live
         } else if (id == IDC_BROWSER_BROWSE) {
             std::wstring picked;
             if (BrowseForBrowser(hwnd, picked)) {
@@ -2790,6 +3007,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         g_hwndSavedLabel = NULL;
         g_cellLv = 0; g_cellRow = -1; g_cellCol = 0;
         g_hwndEngineCombo = g_hwndEngineUrl = g_hwndBrowserCombo = NULL;
+        g_hwndViewToggle = NULL;
         g_hwndAppsList = g_hwndBangsList = g_hwndQuickList = NULL;
         g_pageGeneral.clear(); g_pageApps.clear();
         g_pageBangs.clear(); g_pageQuick.clear();
@@ -2926,6 +3144,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     wcBar.hbrBackground = g_brBg;
     RegisterClassExW(&wcBar);
 
+    WNDCLASSEXW wcGrid{};
+    wcGrid.cbSize = sizeof(wcGrid);
+    wcGrid.hInstance = hInst;
+    wcGrid.lpszClassName = kFileGridClass;
+    wcGrid.lpfnWndProc = FileGridProc;
+    wcGrid.hCursor = LoadCursorW(NULL, IDC_HAND);
+    wcGrid.hbrBackground = g_brBg;
+    wcGrid.style = CS_DBLCLKS; // double-click drills/opens
+    RegisterClassExW(&wcGrid);
+
     g_hwndPalette = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_COMPOSITED, // topmost, no taskbar, smooth
         kPaletteClass, L"SneekPeek",
@@ -2963,7 +3191,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     UnregisterHotKey(g_hwndPalette, HOTKEY_ID);
     SetThreadExecutionState(ES_CONTINUOUS); // release any Awake hold
     DeleteObject(g_fontInput); DeleteObject(g_fontTitle);
-    DeleteObject(g_fontSub); DeleteObject(g_fontChip); DeleteObject(g_fontUI);
+    DeleteObject(g_fontSub); DeleteObject(g_fontChip); DeleteObject(g_fontGrid); DeleteObject(g_fontUI);
     DeleteObject(g_brBg); DeleteObject(g_brInput); DeleteObject(g_brSel);
     if (g_hIconBig) DestroyIcon(g_hIconBig);
     if (g_hIconSmall) DestroyIcon(g_hIconSmall);
