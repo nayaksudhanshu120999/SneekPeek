@@ -247,6 +247,19 @@ int main() {
         wchar_t tmp[MAX_PATH];
         CHECK(GetTempPathW(MAX_PATH, tmp) != 0);
         std::wstring root = EnsureTrailingSlash(tmp) + L"sneekpeek_filetest\\";
+        // Best-effort pre-clean: a crashed prior run must not break the count.
+        {
+            std::wstring stale1 = root + L"a.txt";
+            std::wstring stale2 = root + L"hidden.txt";
+            std::wstring staleSub = root + L"sub\\";
+            std::wstring stale3 = staleSub + L"nested.txt";
+            SetFileAttributesW(stale2.c_str(), FILE_ATTRIBUTE_NORMAL);
+            DeleteFileW(stale3.c_str());
+            DeleteFileW(stale1.c_str());
+            DeleteFileW(stale2.c_str());
+            RemoveDirectoryW(staleSub.c_str());
+            RemoveDirectoryW(root.c_str());
+        }
         CreateDirectoryW(root.c_str(), NULL);
         std::wstring sub = root + L"sub\\";
         CreateDirectoryW(sub.c_str(), NULL);

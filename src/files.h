@@ -22,8 +22,10 @@ struct FileEntry {
 // Cap a single scan so a pathological folder (100k entries) can't balloon RAM.
 // Normal folders are fully listed; beyond the cap we report "10000+ items".
 inline constexpr size_t kMaxFileScan = 10000;
-// Rows shown under one header (header + rows fit the 9-row palette).
-inline constexpr size_t kMaxFileRows = 8;
+// Display cap for the suggestion list: filtering always sees every scanned
+// name, but at most this many rows are pushed per refresh so a huge folder
+// (e.g. System32) can't stall a keystroke with 10k listbox inserts.
+inline constexpr size_t kMaxFileList = 1000;
 
 inline std::wstring FileLower(std::wstring s) {
     for (auto& c : s) c = (wchar_t)towlower(c);

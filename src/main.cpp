@@ -693,6 +693,8 @@ static void UpdateFileResults(const std::wstring& filter) {
         if (FileMatchesFilter(FileLower(e.name), fl)) kept.push_back(e);
     }
     SortFileEntries(kept);
+    size_t shown = kept.size() < kMaxFileList ? kept.size() : kMaxFileList;
+    bool listCapped = kept.size() > kMaxFileList;
     std::wstring head;
     if (truncated) {
         wchar_t b[512];
@@ -706,6 +708,11 @@ static void UpdateFileResults(const std::wstring& filter) {
                    (unsigned)kept.size(), (unsigned)total);
         head = b;
     }
+    if (listCapped) {
+        wchar_t b[64];
+        swprintf_s(b, 64, L", showing %u", (unsigned)shown);
+        head += b;
+    }
     ResultItem hh{ResultKind::Header, head, L"", L"", kHintCol};
     g_results.push_back(std::move(hh));
     if (filter.empty()) {
@@ -714,9 +721,10 @@ static void UpdateFileResults(const std::wstring& filter) {
         ResultItem up{ResultKind::Folder, L"..", L"", parent, kFolderCol};
         g_results.push_back(std::move(up));
     }
-    // All matches go in: the window stays 9 rows tall and the list scrolls
-    // internally (scrollbar hidden, arrows + wheel work).
-    for (size_t i = 0; i < kept.size(); i++) {
+    // Matches go in (capped): the window stays 9 rows tall and the list
+    // scrolls internally (no scrollbar, arrows + wheel work). The header
+    // always reports the true count, so narrowing the filter reveals the rest.
+    for (size_t i = 0; i < shown; i++) {
         ResultItem r;
         r.kind = kept[i].isDir ? ResultKind::Folder : ResultKind::File;
         r.title = kept[i].name;
@@ -736,34 +744,27 @@ static void UpdateFileResults(const std::wstring& filter) {
 static void ExecuteFileSelected(bool inExplorer) {
     int idx = EffectiveSelection(CurrentSelection(), g_results);
     if (inExplorer) {
-        std::wstring target; // folder to open
-        std::wstring params; // or explorer /select args for a file
-        std::wstring exe = SystemExe(L"explorer.exe");
-        if (exe.empty()) exe = L"explorer.exe";
+        // Always the opened folder, whatever is selected. At drive level
+        // there is none: open the selected drive instead, if any.
+        if (!g_fileDir.empty()) {
+            std::wstring dir = g_fileDir; // copy: HidePalette clears state
+            HidePalette(); // hide first: never wait for Explorer
+            if ((UINT_PTR)ShellExecuteW(NULL, L"open", dir.c_str(), NULL, NULL,
+                                        SW_SHOWNORMAL) <= 32)
+                NotifyLaunchFailed(L"Couldn't open this folder");
+            return;
+        }
         if (idx >= 0) {
             const ResultItem& r = g_results[(size_t)idx];
             if (r.kind == ResultKind::Folder && !r.action.empty()) {
-                target = r.action; // selected folder/drive itself
-            } else if (r.kind == ResultKind::File && !r.action.empty()) {
-                params = L"/select,\"" + r.action + L"\""; // reveal the file
-            } else if (r.kind == ResultKind::Explorer && !r.action.empty()) {
-                target = r.action; // the pinned row: current folder
+                std::wstring drive = r.action; // copy: HidePalette clears state
+                HidePalette(); // hide first: never wait for Explorer
+                if ((UINT_PTR)ShellExecuteW(NULL, L"open", drive.c_str(), NULL, NULL,
+                                            SW_SHOWNORMAL) <= 32)
+                    NotifyLaunchFailed(L"Couldn't open this folder");
             }
         }
-        if (params.empty() && target.empty() && !g_fileDir.empty())
-            target = g_fileDir; // current folder fallback (dir level)
-        if (params.empty() && target.empty()) return; // drive list, nothing picked
-        HidePalette(); // hide first: never wait for Explorer
-        if (!params.empty()) {
-            if ((UINT_PTR)ShellExecuteW(NULL, L"open", exe.c_str(), params.c_str(),
-                                        NULL, SW_SHOWNORMAL) <= 32)
-                NotifyLaunchFailed(L"Couldn't open Explorer");
-        } else {
-            if ((UINT_PTR)ShellExecuteW(NULL, L"open", target.c_str(), NULL, NULL,
-                                        SW_SHOWNORMAL) <= 32)
-                NotifyLaunchFailed(L"Couldn't open this folder");
-        }
-        return;
+        return; // nothing picked: stay open
     }
     if (idx < 0) return; // header or nothing: stay open
     ResultItem r = g_results[(size_t)idx]; // copy: HidePalette clears state
@@ -1139,7 +1140,7 @@ static void UpdateResults() {
     pushSection(L"Calculator", calcRows);
     pushSection(L"Apps", appRows);
     pushSection(L"Settings", setRows);
-    pushSection(L"Web", webRows);
+    pushSection(isUrl ? L"URL" : L"Web", webRows);
 
     RebuildListControl();
 }
@@ -1195,13 +1196,27 @@ static void ExecuteChip(int idx) {
 
 static void ExecuteSelected(bool forceWeb) {
     std::wstring q = Trim(GetEditText(g_hwndEdit));
+    if (g_navigating) {
+        // Arrow-mirrored text is a preview, not input: web search below uses
+        // what was actually typed, irrespective of the mirrored suggestion.
+        std::wstring typed = Trim(g_origQuery);
+        if (!typed.empty()) q = typed;
+    }
 
     auto CopyText = [](const std::wstring& t) {
         if (!OpenClipboard(g_hwndPalette)) return;
         EmptyClipboard();
         size_t bytes = (t.size() + 1) * sizeof(wchar_t);
         HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if (h) { memcpy(GlobalLock(h), t.c_str(), bytes); GlobalUnlock(h); SetClipboardData(CF_UNICODETEXT, h); }
+        if (h) {
+            if (void* p = GlobalLock(h)) {
+                memcpy(p, t.c_str(), bytes);
+                GlobalUnlock(h);
+                SetClipboardData(CF_UNICODETEXT, h);
+            } else {
+                GlobalFree(h); // lock failed: don't leak, nothing copied
+            }
+        }
         CloseClipboard();
     };
 
