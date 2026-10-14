@@ -283,20 +283,6 @@ int main() {
         }
         // app search already ranks by position (regression pin)
         CHECK(FuzzyScore(L"c++ projects", L"++") > FuzzyScore(L"c file dev c++", L"++"));
-        // app letter tiles: initials + deterministic vibrant color
-        CHECK(AppTileLetters(L"Visual Studio Code") == L"VS");
-        CHECK(AppTileLetters(L"Code") == L"C");
-        CHECK(AppTileLetters(L"7-Zip") == L"7Z");
-        CHECK(AppTileLetters(L"") == L"?");
-        CHECK(AppTileColor(L"Code") == AppTileColor(L"Code")); // stable
-        {
-            bool inPalette = false;
-            for (size_t i = 0; i < kVibrantCount; i++)
-                if (AppTileColor(L"Code") == kVibrantCols[i]) inPalette = true;
-            CHECK(inPalette);
-        }
-        CHECK(GlyphForResult(ResultKind::App, L"Code", L"C:\\c.lnk", RGB(0, 0, 0)).style ==
-              GlyphStyle::AppTile);
         // file rows are actionable like app rows (headers never are)
         auto frow = [](ResultKind k, const wchar_t* t) {
             ResultItem r;

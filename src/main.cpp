@@ -2060,17 +2060,27 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                 return TRUE;
             }
-            // Kind icon carries the category; app rows get letter tiles.
-            {
+            // App rows keep the original v1 look (slim category bar);
+            // every other kind paints its glyph.
+            RECT tr = d->rcItem;
+            if (r.kind == ResultKind::App) {
+                HBRUSH bar = CreateSolidBrush(sel ? kAppCol : Darken(kAppCol, 65));
+                RECT br = d->rcItem;
+                br.left += Dpx(14); br.right = br.left + Dpx(2);
+                br.top += Dpx(9); br.bottom -= Dpx(9);
+                FillRect(dc, &br, bar);
+                DeleteObject(bar);
+                tr.left += Dpx(30);
+            } else {
                 FileGlyph fg = GlyphForResult(r.kind, r.title, r.action, r.color);
                 int isz = Dpx(20);
                 int icy = (d->rcItem.top + d->rcItem.bottom) / 2;
                 RECT cell{d->rcItem.left + Dpx(14), icy - isz / 2,
                           d->rcItem.left + Dpx(14) + isz, icy + isz / 2};
                 PaintGlyph(dc, cell, fg, sel, r.title, g_fontChip);
+                tr.left += Dpx(44);
             }
-
-            RECT tr = d->rcItem; tr.left += Dpx(44); tr.right -= Dpx(10);
+            tr.right -= Dpx(10);
             SetTextColor(dc, sel ? kText : RGB(218, 218, 226));
             SelectObject(dc, g_fontTitle);
             DrawTextW(dc, r.title.c_str(), -1, &tr,

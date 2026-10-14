@@ -46,7 +46,8 @@ inline std::wstring SerializeColor(COLORREF c) {
 }
 
 // Tasteful random pick for new bangs (user may leave the color empty).
-// Vibrant-only, mirroring kVibrantCols in icons.h (the single palette).
+// Vibrant pick for new bangs (user may leave the color empty).
+// High saturation tuned to pop on the black rows.
 inline COLORREF RandomBangColor() {
     static const COLORREF palette[] = {
         RGB(255, 90, 90), RGB(255, 140, 40), RGB(255, 180, 40), RGB(240, 210, 50),

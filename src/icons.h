@@ -13,7 +13,6 @@ enum class GlyphStyle {
     Web, Bang, Calc, Setting, Folder, Drive, FilePage,
     Exe, Terminal, Shortcut, DocLines, Pdf, DocWord, Sheet, Slide,
     Book, Picture, Audio, Video, Archive, Disc, Code, FontTag, Database,
-    AppTile,
 };
 
 struct FileGlyph {
@@ -25,43 +24,6 @@ inline COLORREF GlyphDim(COLORREF c, int pct) {
     return RGB(GetRValue(c) * pct / 100,
                GetGValue(c) * pct / 100,
                GetBValue(c) * pct / 100);
-}
-
-// The one vibrant palette. Every chip/tile color in the app comes from here
-// (app letter-tiles hash into it; new bangs roll from it) — never an ad-hoc
-// RGB(). High saturation tuned to pop on the black rows.
-inline const COLORREF kVibrantCols[] = {
-    RGB(255, 90, 90), RGB(255, 140, 40), RGB(255, 180, 40), RGB(240, 210, 50),
-    RGB(126, 217, 87), RGB(50, 215, 110), RGB(45, 210, 180), RGB(60, 200, 255),
-    RGB(80, 140, 255), RGB(120, 127, 240), RGB(160, 110, 255), RGB(255, 95, 170),
-};
-inline constexpr size_t kVibrantCount = sizeof(kVibrantCols) / sizeof(kVibrantCols[0]);
-
-// Deterministic tile color: same app name -> same color, every launch.
-// djb2 over the raw title (stable for identical strings, no locale issues).
-inline COLORREF AppTileColor(const std::wstring& name) {
-    unsigned long h = 5381;
-    for (wchar_t c : name) h = ((h << 5) + h) + (unsigned long)c;
-    return kVibrantCols[h % kVibrantCount];
-}
-
-// Tile letters: first alphanumeric char + first alphanumeric char of the next
-// word ("Visual Studio Code" -> "VS", "Code" -> "C", "7-Zip" -> "7Z").
-inline std::wstring AppTileLetters(const std::wstring& name) {
-    std::wstring out;
-    bool wordStart = true;
-    for (wchar_t c : name) {
-        bool alnum = (c >= L'0' && c <= L'9') ||
-                     (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z');
-        if (alnum && wordStart && out.size() < 2) {
-            wchar_t u = c;
-            if (u >= L'a' && u <= L'z') u = (wchar_t)(u - L'a' + L'A');
-            out.push_back(u);
-        }
-        wordStart = !alnum;
-    }
-    if (out.empty()) out = L"?";
-    return out;
 }
 
 // Extension -> glyph. Directories never reach the table: callers pass isDir
@@ -190,7 +152,6 @@ inline FileGlyph FileGlyphFor(const std::wstring& name, bool isDir) {
 inline FileGlyph GlyphForResult(ResultKind kind, const std::wstring& title,
                                 const std::wstring& action, COLORREF bangColor) {
     switch (kind) {
-    case ResultKind::App: return {GlyphStyle::AppTile, AppTileColor(title)};
     case ResultKind::Web: return {GlyphStyle::Web, RGB(46, 224, 158)};
     case ResultKind::Bang: return {GlyphStyle::Bang, bangColor};
     case ResultKind::Calc: return {GlyphStyle::Calc, RGB(251, 191, 36)};
@@ -266,7 +227,7 @@ inline void GlyphFillPoly(HDC dc, POINT* pts, int n, COLORREF c) {
 }
 
 // ------------------------------------------------------- the painter
-// cell is a ~20px square. title supplies the Bang letter / app tile initials.
+// cell is a ~20px square. title supplies the Bang letter.
 // tagFont supplies those letters (main palette chip font).
 inline void PaintGlyph(HDC dc, const RECT& cell, const FileGlyph& g,
                        bool sel, const std::wstring& title, HFONT tagFont) {
@@ -384,22 +345,6 @@ inline void PaintGlyph(HDC dc, const RECT& cell, const FileGlyph& g,
         GlyphFillRect(dc, x + 6, y + 6, x + 8, y + 8, base); // knobs
         GlyphFillRect(dc, x + 12, y + 12, x + 14, y + 14, base);
         break;
-    case GlyphStyle::AppTile: {
-        GlyphFillRound(dc, x + 1, y + 1, x + s - 1, y + s - 1, 5, base);
-        if (tagFont) {
-            std::wstring initials = AppTileLetters(title);
-            HGDIOBJ old = SelectObject(dc, tagFont);
-            COLORREF ot = SetTextColor(dc, W);
-            int ob = SetBkMode(dc, TRANSPARENT);
-            RECT tr{cell.left, cell.top, cell.right, cell.bottom};
-            DrawTextW(dc, initials.c_str(), (int)initials.size(), &tr,
-                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            SetBkMode(dc, ob);
-            SetTextColor(dc, ot);
-            SelectObject(dc, old);
-        }
-        break;
-    }
     case GlyphStyle::Web:
         GlyphFrameEllipse(dc, x + 3, y + 3, x + s - 3, y + s - 3, 2, base);
         GlyphFrameEllipse(dc, x + 7, y + 3, x + s - 7, y + s - 3, 1, base); // meridian
