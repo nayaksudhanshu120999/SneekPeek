@@ -20,7 +20,7 @@ Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 | `google.com` | URL-shaped input opens the site directly (scheme optional, `https` assumed) |
 | `yt` | matching site bangs appear as chips above the list — Enter arms the chip (`yt` + `Space` does the same): just the pill in the bar, no list — type the query, Enter searches (Backspace on empty query or click `x` exits) |
 | `!g cats` | one-shot bang without the chip (Google for `cats`) |
-| `shu` | power chips appear above the list (Shut down, Restart, Sleep, Hibernate) — Enter runs the selected chip, Tab cycles, Down jumps to the list |
+| `shu` | power chips appear above the list (Shut down, Restart, Sleep, Hibernate) — Enter runs the selected chip (Shut down/Restart force-close apps first, unsaved work is lost — hence the confirm), Tab cycles, Down jumps to the list |
 | `awake` | `Awake: On/Off` chip — keeps display + system awake without touching power settings; persists across restarts, also in the tray menu |
 | `bluetooth` | matching Windows Settings pages under their own header — Enter opens the page |
 | `gmail` | quick-link chips (fixed URLs, no query) work the same way — Enter opens |

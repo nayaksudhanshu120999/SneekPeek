@@ -853,15 +853,18 @@ static void RunPower(PowerOp op) {
     switch (op) {
     case PowerOp::Shutdown: {
         std::wstring exe = SystemExe(L"shutdown.exe");
+        // /f: force-close running apps first (unsaved work is lost) so
+        // nothing can veto the shutdown. Double-Enter confirm guards this.
         if (!exe.empty() &&
-            (UINT_PTR)ShellExecuteW(NULL, L"open", exe.c_str(), L"/s /t 0", NULL, SW_HIDE) <= 32)
+            (UINT_PTR)ShellExecuteW(NULL, L"open", exe.c_str(), L"/s /f /t 0", NULL, SW_HIDE) <= 32)
             NotifyLaunchFailed(L"Shutdown command failed");
         break;
     }
     case PowerOp::Restart: {
         std::wstring exe = SystemExe(L"shutdown.exe");
+        // /f: same force-close behavior as shutdown (unsaved work is lost).
         if (!exe.empty() &&
-            (UINT_PTR)ShellExecuteW(NULL, L"open", exe.c_str(), L"/r /t 0", NULL, SW_HIDE) <= 32)
+            (UINT_PTR)ShellExecuteW(NULL, L"open", exe.c_str(), L"/r /f /t 0", NULL, SW_HIDE) <= 32)
             NotifyLaunchFailed(L"Restart command failed");
         break;
     }
