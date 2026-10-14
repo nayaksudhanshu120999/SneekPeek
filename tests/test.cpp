@@ -144,6 +144,9 @@ int main() {
         const char* s4 = "\"x\\ude00\""; // lone low surrogate: reject
         const char* p4 = s4;
         CHECK(!DecodeJsonString(p4, s4 + strlen(s4), w));
+        const char* s5 = "\"abc"; // unterminated: reject, don't keep partial
+        const char* p5 = s5;
+        CHECK(!DecodeJsonString(p5, s5 + strlen(s5), w));
     }
     // settings list cap is consistent everywhere
     CHECK(ClampCustomCount(-5) == 0);
@@ -178,6 +181,15 @@ int main() {
     // file-browse helpers: names + count only, folders first, current path only
     {
         CHECK(FileLower(L"C:\\Foo") == L"c:\\foo");
+        // file-mode trigger is ":" + space/tab (a "file" keyword would
+        // hijack app searches like "file manager")
+        CHECK(IsFileTrigger(L": "));
+        CHECK(IsFileTrigger(L": c"));
+        CHECK(IsFileTrigger(L":\tc"));
+        CHECK(!IsFileTrigger(L":c"));
+        CHECK(!IsFileTrigger(L"file "));
+        CHECK(!IsFileTrigger(L"C:\\x"));
+        CHECK(!IsFileTrigger(L"a:b c"));
         CHECK(FileMatchesFilter(L"notepad.exe", L""));
         CHECK(FileMatchesFilter(L"notepad.exe", L"note"));
         CHECK(FileMatchesFilter(L"notepad.exe", L"pad"));
@@ -271,6 +283,20 @@ int main() {
         }
         // app search already ranks by position (regression pin)
         CHECK(FuzzyScore(L"c++ projects", L"++") > FuzzyScore(L"c file dev c++", L"++"));
+        // app letter tiles: initials + deterministic vibrant color
+        CHECK(AppTileLetters(L"Visual Studio Code") == L"VS");
+        CHECK(AppTileLetters(L"Code") == L"C");
+        CHECK(AppTileLetters(L"7-Zip") == L"7Z");
+        CHECK(AppTileLetters(L"") == L"?");
+        CHECK(AppTileColor(L"Code") == AppTileColor(L"Code")); // stable
+        {
+            bool inPalette = false;
+            for (size_t i = 0; i < kVibrantCount; i++)
+                if (AppTileColor(L"Code") == kVibrantCols[i]) inPalette = true;
+            CHECK(inPalette);
+        }
+        CHECK(GlyphForResult(ResultKind::App, L"Code", L"C:\\c.lnk", RGB(0, 0, 0)).style ==
+              GlyphStyle::AppTile);
         // file rows are actionable like app rows (headers never are)
         auto frow = [](ResultKind k, const wchar_t* t) {
             ResultItem r;

@@ -46,12 +46,12 @@ inline std::wstring SerializeColor(COLORREF c) {
 }
 
 // Tasteful random pick for new bangs (user may leave the color empty).
+// Vibrant-only, mirroring kVibrantCols in icons.h (the single palette).
 inline COLORREF RandomBangColor() {
     static const COLORREF palette[] = {
-        RGB(96, 165, 250), RGB(52, 211, 153), RGB(251, 191, 36),
-        RGB(248, 113, 113), RGB(192, 132, 252), RGB(45, 212, 191),
-        RGB(251, 146, 60), RGB(244, 114, 182), RGB(163, 230, 53),
-        RGB(94, 234, 212), RGB(253, 224, 71), RGB(252, 165, 165),
+        RGB(255, 90, 90), RGB(255, 140, 40), RGB(255, 180, 40), RGB(240, 210, 50),
+        RGB(126, 217, 87), RGB(50, 215, 110), RGB(45, 210, 180), RGB(60, 200, 255),
+        RGB(80, 140, 255), RGB(120, 127, 240), RGB(160, 110, 255), RGB(255, 95, 170),
     };
     return palette[rand() % 12];
 }

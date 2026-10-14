@@ -276,16 +276,16 @@ struct PowerDef {
     const wchar_t* aliases[4];
 };
 static const PowerDef kPowers[] = {
-    {PowerOp::Shutdown,  L"Shut down", RGB(248, 113, 113),
+    {PowerOp::Shutdown,  L"Shut down", RGB(255, 90, 90),
         {L"shutdown", L"shut down", L"shut", L"power off"}},
     {PowerOp::Restart,   L"Restart",   RGB(251, 191, 36),
         {L"restart", L"reboot", NULL, NULL}},
-    {PowerOp::Sleep,     L"Sleep",     RGB(96, 165, 250),
+    {PowerOp::Sleep,     L"Sleep",     RGB(80, 140, 255),
         {L"sleep", NULL, NULL, NULL}},
-    {PowerOp::Hibernate, L"Hibernate", RGB(192, 132, 252),
+    {PowerOp::Hibernate, L"Hibernate", RGB(160, 110, 255),
         {L"hibernate", L"hibernation", NULL, NULL}},
 };
-static const COLORREF kQuickCol = RGB(192, 132, 252);
+static const COLORREF kQuickCol = RGB(255, 95, 170);
 
 enum class ChipKind { Power, Quick, Bang, Awake };
 struct ChipItem {
@@ -311,7 +311,7 @@ static const COLORREF kSel    = RGB(28, 28, 30);
 static const COLORREF kText   = RGB(240, 240, 240);
 static const COLORREF kSub    = RGB(130, 130, 135);
 static const COLORREF kAppCol = RGB(96, 165, 250);
-static const COLORREF kWebCol = RGB(52, 211, 153);
+static const COLORREF kWebCol = RGB(46, 224, 158);
 static const COLORREF kCalcCol= RGB(251, 191, 36);
 static const COLORREF kHintCol= RGB(110, 110, 115);
 static const COLORREF kSetCol = RGB(45, 212, 191);  // system settings pages
@@ -596,7 +596,7 @@ static void DeactivateBang() {
 }
 
 // ------------------------------------------------------------- file-browse mode
-// "file" + Space enters a names-only browser: drives -> single-level dir
+// ":" + Space enters a names-only browser: drives -> single-level dir
 // listing. Only g_fileDir is ever scanned (one FindFirstFileW per refresh).
 static bool InFileMode() { return g_fileActive; }
 
@@ -697,8 +697,8 @@ static void UpdateFileResults(const std::wstring& filter) {
                        (unsigned)totalDrives);
         ResultItem hh{ResultKind::Header, head, L"", L"", kHintCol};
         g_results.push_back(std::move(hh));
-        // All matches go in: the window stays 9 rows tall and the list
-        // scrolls internally (scrollbar hidden, arrows + wheel work).
+        // Matches go in uncapped here (drives are few): the window stays
+        // compact and the list scrolls internally with no scrollbar.
         for (size_t i = 0; i < rows.size(); i++) g_results.push_back(std::move(rows[i]));
         RebuildListControl();
         return;
@@ -763,10 +763,9 @@ static void UpdateFileResults(const std::wstring& filter) {
 }
 
 // Enter/Space in file mode: folders drill (stay open, rescan new path only),
-// files open directly, Explorer rows open in Explorer. Headers / empty
-// matches stay open (never web-search). Shift+Enter opens the relevant path
-// in Explorer instead: selected folder/drive, reveal-selected file, or the
-// current folder as fallback.
+// files open directly. Headers / empty matches stay open (never web-search).
+// Shift+Enter always opens the current folder in Explorer (drive level:
+// the selected drive, if any).
 static void ExecuteFileSelected(bool inExplorer) {
     int idx = EffectiveSelection(CurrentSelection(), g_results);
     if (inExplorer) {
@@ -827,8 +826,8 @@ static void ExecuteFileSelected(bool inExplorer) {
 }
 
 // ------------------------------------------------------- file grid metrics
-// Grid is file-mode-only and setting-gated. Columns derive from the fixed
-// palette width; tiles map 1:1 onto g_results indices (after one header).
+// Grid is file-mode-only and setting-gated (rows/columns from Settings).
+// Tiles map 1:1 onto g_results indices (after one header).
 static bool GridActive() { return InFileMode() && g_settings.fileGrid; }
 static int GridRows() { return ClampGridRows(g_settings.gridRows); }
 static int GridColumns() { return ClampGridCols(g_settings.gridCols); }
@@ -900,44 +899,6 @@ static ResultItem MakeAppRow(const AppEntry& app) {
 }
 static void PushAppRow(const AppEntry& app) {
     g_results.push_back(MakeAppRow(app));
-}
-
-// ------------------------------------------------------- app row icons
-// Real icons, apps only: a small process-lifetime LRU (bounded, never
-// persisted) keyed by launch target. Store/shell: targets have no file icon
-// and keep the generic glyph. Extraction runs on the UI thread for visible
-// rows only (a few app rows per repaint); misses evict oldest-first.
-// Cleared whenever a fresh index is adopted.
-struct AppIconEntry { std::wstring target; HICON h; };
-static std::vector<AppIconEntry> g_appIcons;
-static const size_t kMaxAppIcons = 64;
-static void ClearAppIconCache() {
-    for (size_t i = 0; i < g_appIcons.size(); i++)
-        if (g_appIcons[i].h) DestroyIcon(g_appIcons[i].h);
-    g_appIcons.clear();
-}
-static HICON AppRowIcon(const std::wstring& target) {
-    if (target.empty()) return NULL;
-    if (target.compare(0, 6, L"shell:") == 0) return NULL; // Store/shell row
-    for (size_t i = 0; i < g_appIcons.size(); i++) {
-        if (g_appIcons[i].target == target) {
-            AppIconEntry hit = g_appIcons[i]; // copy: vector mutates below
-            g_appIcons.erase(g_appIcons.begin() + i);
-            g_appIcons.push_back(hit); // most-recently-used last
-            return hit.h;
-        }
-    }
-    SHFILEINFOW sfi{};
-    if (!SHGetFileInfoW(target.c_str(), 0, &sfi, sizeof(sfi),
-                        SHGFI_ICON | SHGFI_LARGEICON))
-        return NULL;
-    if (!sfi.hIcon) return NULL;
-    if (g_appIcons.size() >= kMaxAppIcons) {
-        if (g_appIcons.front().h) DestroyIcon(g_appIcons.front().h);
-        g_appIcons.erase(g_appIcons.begin());
-    }
-    g_appIcons.push_back({target, sfi.hIcon});
-    return sfi.hIcon;
 }
 
 // Prefix-matched power + bang + quick-link chips (separate row above list).
@@ -1479,6 +1440,22 @@ static void MoveSelSteps(int steps) {
 // Vertical mouse wheel: moves selection (3 rows per notch) only when the
 // list overflows the visible area; otherwise ignored. Horizontal ignored.
 static void WheelScrollList(int delta) {
+    if (GridActive() && g_hwndFileGrid && IsWindowVisible(g_hwndFileGrid)) {
+        // Grid band overflow: a full tile row per notch, ±1 on partials.
+        size_t base = (!g_results.empty() &&
+                       g_results.front().kind == ResultKind::Header) ? 1 : 0;
+        size_t tiles = g_results.size() > base ? g_results.size() - base : 0;
+        int cols = GridColumns();
+        if (cols < 1) cols = 1;
+        int gr = GridRows();
+        int need = tiles ? (int)((tiles + (size_t)cols - 1) / (size_t)cols) : 0;
+        if (need <= gr) return; // nothing to scroll
+        int notches = delta / WHEEL_DELTA;
+        int move = -notches * cols; // wheel up = toward first row
+        if (move == 0) move = (delta > 0) ? -1 : 1;
+        MoveSelSteps(move);
+        return;
+    }
     if (!g_hwndList || !IsWindowVisible(g_hwndList)) return;
     RECT lr; GetClientRect(g_hwndList, &lr);
     int vis = (lr.bottom - lr.top) / kItemH;
@@ -1750,7 +1727,7 @@ static LRESULT CALLBACK ChipRowProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             bool sel = g_chipsFocus && (int)i == g_chipSel;
             COLORREF base = ChipFill(c.color);
             // Solid pills, white bold text; selection = full brightness.
-            FillPill(dc, r, sel ? base : Darken(base, 50));
+            FillPill(dc, r, sel ? base : Darken(base, 65));
             SetTextColor(dc, RGB(255, 255, 255));
             RECT tr = r;
             DrawTextW(dc, c.title.c_str(), -1, &tr,
@@ -1804,7 +1781,7 @@ static LRESULT CALLBACK FileBarProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         RECT sr = cl; sr.bottom = sr.top + 1;
         FillRect(dc, &sr, sep);
         DeleteObject(sep);
-        // amber tick, like the list rows
+        // amber tick marking the action
         HBRUSH tick = CreateSolidBrush(Darken(kFolderCol, 65));
         RECT br{cl.left + Dpx(14), cl.top + Dpx(8), cl.left + Dpx(16), cl.bottom - Dpx(8)};
         FillRect(dc, &br, tick);
@@ -1903,8 +1880,7 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             int gx = tile.left + (tile.right - tile.left - gz) / 2;
             RECT gcell{gx, tile.top + Dpx(8), gx + gz, tile.top + Dpx(8) + gz};
             FileGlyph fg = GlyphForResult(ri.kind, ri.title, ri.action, ri.color);
-            wchar_t letter = ri.title.empty() ? L'?' : ri.title[0];
-            PaintGlyph(dc, gcell, fg, (int)i == sel, letter, g_fontGrid);
+            PaintGlyph(dc, gcell, fg, (int)i == sel, ri.title, g_fontGrid);
             SetBkMode(dc, TRANSPARENT);
             SelectObject(dc, g_fontSub);
             SetTextColor(dc, (int)i == sel ? kText : RGB(218, 218, 226));
@@ -2006,7 +1982,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             g_navigating = false; // real typing restarts arrow cycling
             g_confirmPower = -1; // and disarms any pending power confirm
             // Bang-chip trigger: "alias<space>" with nothing else typed.
-            // File trigger ("file<space>") is reserved and wins over bangs.
+            // File trigger (":<space>") is reserved and wins over bangs.
             if (g_activeBang < 0 && !InFileMode()) {
                 std::wstring editRaw = GetEditText(g_hwndEdit);
                 size_t sp = editRaw.find(L' ');
@@ -2014,21 +1990,21 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 size_t p = sp;
                 if (p == std::wstring::npos || (tb != std::wstring::npos && tb < p)) p = tb;
                 if (p != std::wstring::npos) {
+                    if (IsFileTrigger(editRaw)) {
+                        std::wstring rest = Trim(editRaw.substr(p + 1));
+                        ActivateFileMode(L""); // drive list; keeps any pasted filter
+                        if (!rest.empty()) {
+                            g_changingEdit = true;
+                            SetWindowTextW(g_hwndEdit, rest.c_str());
+                            SendMessageW(g_hwndEdit, EM_SETSEL,
+                                         (WPARAM)rest.size(), (LPARAM)rest.size());
+                            g_changingEdit = false;
+                            UpdateResults();
+                        }
+                        break;
+                    }
                     std::wstring token = editRaw.substr(0, p);
                     if (!token.empty() && token[0] != L'!') {
-                        if (BangLower(token) == L"file") {
-                            std::wstring rest = Trim(editRaw.substr(p + 1));
-                            ActivateFileMode(L""); // drive list; keeps any pasted filter
-                            if (!rest.empty()) {
-                                g_changingEdit = true;
-                                SetWindowTextW(g_hwndEdit, rest.c_str());
-                                SendMessageW(g_hwndEdit, EM_SETSEL,
-                                             (WPARAM)rest.size(), (LPARAM)rest.size());
-                                g_changingEdit = false;
-                                UpdateResults();
-                            }
-                            break;
-                        }
                         int bi = FindBangByAlias(g_settings.bangs, BangLower(token));
                         if (bi >= 0) {
                             ActivateBang(bi, L""); // armed: empty box, chip only
@@ -2081,26 +2057,14 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                 return TRUE;
             }
-            // Kind icon replaces the old accent bar: shape carries the category.
-            // App rows try their real icon first (apps-only extraction).
+            // Kind icon carries the category; app rows get letter tiles.
             {
                 FileGlyph fg = GlyphForResult(r.kind, r.title, r.action, r.color);
                 int isz = Dpx(20);
                 int icy = (d->rcItem.top + d->rcItem.bottom) / 2;
                 RECT cell{d->rcItem.left + Dpx(14), icy - isz / 2,
                           d->rcItem.left + Dpx(14) + isz, icy + isz / 2};
-                bool drewIcon = false;
-                if (r.kind == ResultKind::App) {
-                    if (HICON h = AppRowIcon(r.action)) {
-                        DrawIconEx(dc, cell.left, cell.top, h, isz, isz,
-                                   0, NULL, DI_NORMAL);
-                        drewIcon = true;
-                    }
-                }
-                if (!drewIcon) {
-                    wchar_t letter = r.title.empty() ? L'?' : r.title[0];
-                    PaintGlyph(dc, cell, fg, sel, letter, g_fontChip);
-                }
+                PaintGlyph(dc, cell, fg, sel, r.title, g_fontChip);
             }
 
             RECT tr = d->rcItem; tr.left += Dpx(44); tr.right -= Dpx(10);
@@ -2163,16 +2127,12 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     case WM_APP_SHOW:
         ShowPalette();
         break;
-    case WM_APP + 20: // index finished
-        if (IsWindowVisible(hwnd)) UpdateResults();
-        break;
     case WM_APP_INDEX: { // background index published: adopt on the UI thread
         auto* p = g_pendingIndex.exchange(nullptr);
         if (p) {
             g_apps.swap(*p);
             delete p;
             g_indexReady.store(true);
-            ClearAppIconCache(); // targets may have changed
             SaveAppCache(AppCachePath(), g_apps); // persist for instant restart
         }
         RefreshAppsListPreservingChecks();
@@ -3256,7 +3216,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     DeleteObject(g_brBg); DeleteObject(g_brInput); DeleteObject(g_brSel);
     if (g_hIconBig) DestroyIcon(g_hIconBig);
     if (g_hIconSmall) DestroyIcon(g_hIconSmall);
-    ClearAppIconCache();
     Gdiplus::GdiplusShutdown(g_gdiplusToken);
     CloseHandle(mutex);
     return (int)msg.wParam;

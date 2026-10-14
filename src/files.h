@@ -32,6 +32,18 @@ inline std::wstring FileLower(std::wstring s) {
     return s;
 }
 
+// File-mode trigger: a lone ":" token followed by space/tab (": ", ": query").
+// A keyword trigger ("file") collided with app searches like "file manager",
+// so the trigger is punctuation-only. Pure, unit-tested.
+inline bool IsFileTrigger(const std::wstring& raw) {
+    size_t sp = raw.find(L' ');
+    size_t tb = raw.find(L'\t');
+    size_t p = sp;
+    if (p == std::wstring::npos || (tb != std::wstring::npos && tb < p)) p = tb;
+    if (p == std::wstring::npos) return false;
+    return raw.substr(0, p) == L":";
+}
+
 // Substring filter, case-insensitive via pre-lowered inputs. Empty filter matches all.
 inline bool FileMatchesFilter(const std::wstring& nameLower, const std::wstring& filterLower) {
     if (filterLower.empty()) return true;

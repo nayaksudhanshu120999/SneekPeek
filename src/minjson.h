@@ -68,7 +68,8 @@ inline bool DecodeJsonString(const char*& p, const char* end, std::wstring& out)
             raw += *p++;
         }
     }
-    if (p < end) p++; // closing quote
+    if (p >= end) return false; // unterminated string: reject, don't keep partial
+    p++; // closing quote
     int n = MultiByteToWideChar(CP_UTF8, 0, raw.c_str(), (int)raw.size(), NULL, 0);
     if (n <= 0) return false;
     out.assign((size_t)n, L'\0');
