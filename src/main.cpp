@@ -216,6 +216,15 @@ static HFONT       g_fontSub = NULL;
 static HFONT       g_fontChip = NULL;
 static HFONT       g_fontGrid = NULL; // large bang-letter font for file tiles
 static HFONT       g_fontUI = NULL; // Segoe UI for all Settings controls
+// Lazy boot state (defined before the Ensure helpers that use them): the
+// startup path avoids file/GDI/DLL work so Windows' startup-impact
+// accounting sees a near-idle process. Heavy pieces load on first use.
+static bool g_settingsListsLoaded = false; // hidden + bangs + quicks
+static bool g_gdiplusStarted = false;
+static bool g_appFontsReady = false;
+static bool g_comCtlReady = false;
+static bool g_startupDeferredArmed = false; // 90s light-refresh timer pending
+static ULONG_PTR g_gdiplusToken = 0;
 static void DeleteAppFonts() {
     HFONT fonts[] = {g_fontInput, g_fontTitle, g_fontSub, g_fontChip, g_fontGrid, g_fontUI};
     for (size_t i = 0; i < 6; i++)
@@ -265,14 +274,7 @@ static std::vector<BrowserOpt> g_browsers;        // parallel to browser combo
 static std::atomic<bool> g_indexReady{false};
 static std::atomic<bool> g_indexing{false};
 
-// Lazy boot state: the startup path avoids file/GDI/DLL work so Windows'
-// startup-impact accounting sees a near-idle process. Heavy pieces load on
-// first interactive use instead.
-static bool g_settingsListsLoaded = false; // hidden + bangs + quicks
-static bool g_gdiplusStarted = false;
-static bool g_appFontsReady = false;
-static bool g_comCtlReady = false;
-static bool g_startupDeferredArmed = false; // 90s light-refresh timer pending
+// (Lazy boot state lives above, next to the font globals.)
 
 static void RebuildHiddenSet(); // forward: used by EnsureSettingsLists
 // (CreateAppFonts is defined above; EnsureAppFonts wraps it.)
@@ -322,7 +324,7 @@ static int g_gridTopRow = 0; // first visible tile row in grid mode
 // Arrow navigation: original typed text, restored when wrapping past the ends.
 static std::wstring g_origQuery;
 static bool g_navigating = false;
-static ULONG_PTR g_gdiplusToken = 0;
+// (g_gdiplusToken is defined above, next to the font globals.)
 
 // ------------------------------------------------------- power + quick chips
 enum class PowerOp { Shutdown, Restart, Sleep, Hibernate };
