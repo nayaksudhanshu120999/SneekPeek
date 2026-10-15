@@ -235,11 +235,36 @@ int main() {
         CHECK(DriveTitle(L"C:\\", L"Win 10") == L"Win 10 (C:)");
         CHECK(DriveTitle(L"M:\\", L"Music") == L"Music (M:)");
         CHECK(DriveTitle(L"D:\\", L"") == L"D:\\");
-        // match ranking: prefix beats substring, empty filter is neutral
-        CHECK(FileMatchRank(L"all files (g:)", L"all") == 1);
-        CHECK(FileMatchRank(L"installed (f:)", L"all") == 2);
-        CHECK(FileMatchRank(L"readme", L"zzz") < 0);
-        CHECK(FileMatchRank(L"x", L"") == 0);
+        // fuzzy score: exact > prefix > substring > subsequence; -1 / 0 sentinels
+        CHECK(FileFuzzyScore(L"all", L"all") == 100000);
+        CHECK(FileFuzzyScore(L"all files (g:)", L"all") >
+              FileFuzzyScore(L"installed (f:)", L"all"));
+        CHECK(FileFuzzyScore(L"visual studio code", L"vsc") >= 0); // subsequence
+        CHECK(FileFuzzyScore(L"readme", L"zzz") < 0);
+        CHECK(FileFuzzyScore(L"x", L"") == 0);
+        // filter is fuzzy-aware: subsequence matches pass, misses don't
+        CHECK(FileMatchesFilter(L"visual studio code", L"vsc"));
+        CHECK(FileMatchesFilter(L"all files (g:)", L"all"));
+        CHECK(!FileMatchesFilter(L"readme", L"zzz"));
+        CHECK(FileMatchesFilter(L"x", L""));
+        // Explorer natural order: digits sort numerically, case-insensitive
+        CHECK(StrCmpLogicalW(L"2", L"10") < 0);
+        CHECK(StrCmpLogicalW(L"file10", L"file2") > 0);
+        {
+            std::vector<FileEntry> v = {
+                {L"10.txt", false}, {L"2.txt", false},
+            };
+            SortFileEntries(v); // empty filter: pure Explorer order
+            CHECK(v.size() == 2 && v[0].name == L"2.txt" && v[1].name == L"10.txt");
+        }
+        // drive rows resolve to the Drive glyph (regression pin)
+        CHECK(IsDriveRootDir(L"C:\\"));
+        CHECK(!IsDriveRootDir(L""));
+        CHECK(!IsDriveRootDir(L"C:\\docs"));
+        CHECK(GlyphForResult(ResultKind::Folder, L"Win 10 (C:)", L"C:\\",
+                             RGB(0, 0, 0)).style == GlyphStyle::Drive);
+        CHECK(GlyphForResult(ResultKind::Folder, L"docs", L"C:\\docs",
+                             RGB(0, 0, 0)).style == GlyphStyle::Folder);
         CHECK(ClampGridRows(0) == 1);
         CHECK(ClampGridRows(3) == 3);
         CHECK(ClampGridRows(9) == 4);
@@ -263,7 +288,7 @@ int main() {
             CHECK(v.size() == 3 && v[0].name == L"Documents");
             CHECK(v[1].name == L"mydocs.txt" && v[2].name == L"ado.doc");
         }
-        // shared ordering: rank, earliest occurrence, then alphabetical
+        // shared ordering: tier, earliest occurrence, then Explorer order
         CHECK(RankedNameLess(L"all files (g:)", L"installed (f:)", L"all",
                              L"ALL FILES (G:)", L"INSTALLED (F:)"));
         CHECK(!RankedNameLess(L"installed (f:)", L"all files (g:)", L"all",
@@ -272,7 +297,7 @@ int main() {
                              L"c++ projects", L"c file dev c++"));
         CHECK(!RankedNameLess(L"c file dev c++", L"c++ projects", L"++",
                               L"c file dev c++", L"c++ projects"));
-        // drive sort is headless-testable: "all" puts ALL FILES first
+        // drive sort is headless-testable: "all" puts ALL FILES first ...
         {
             std::vector<DriveInfo> d = {
                 {L"F:\\", L"INSTALLED", L"INSTALLED (F:)"},
@@ -280,6 +305,15 @@ int main() {
             };
             SortDrivesByRank(d, L"all");
             CHECK(d.size() == 2 && d[0].root == L"G:\\" && d[1].root == L"F:\\");
+        }
+        // ... and an empty filter preserves Explorer letter order
+        {
+            std::vector<DriveInfo> d = {
+                {L"F:\\", L"INSTALLED", L"INSTALLED (F:)"},
+                {L"G:\\", L"ALL FILES", L"ALL FILES (G:)"},
+            };
+            SortDrivesByRank(d, L"");
+            CHECK(d.size() == 2 && d[0].root == L"F:\\" && d[1].root == L"G:\\");
         }
         // app search already ranks by position (regression pin)
         CHECK(FuzzyScore(L"c++ projects", L"++") > FuzzyScore(L"c file dev c++", L"++"));

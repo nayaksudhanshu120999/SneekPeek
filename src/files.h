@@ -7,12 +7,15 @@
 // free inside WIN32_FIND_DATAW). No sizes, dates, icons, subfolder or parent
 // scans, no watchers, no cache. State is one g_fileDir string, cleared on hide.
 #include <windows.h>
+#include <shlwapi.h> // StrCmpLogicalW: Explorer's natural sort order
 #include <cwctype>
 #include <cstdio>
 #include <cwchar>
 #include <string>
 #include <vector>
 #include <algorithm>
+
+#include "app_index.h" // FuzzyScore: one match engine for apps and files
 
 struct FileEntry {
     std::wstring name; // file or folder name only, never a path
@@ -44,43 +47,59 @@ inline bool IsFileTrigger(const std::wstring& raw) {
     return raw.substr(0, p) == L":";
 }
 
-// Substring filter, case-insensitive via pre-lowered inputs. Empty filter matches all.
+// Fuzzy match quality, shared with app search: exact (100000) > prefix
+// (50000-) > word-boundary/substring > subsequence, -1 = no match,
+// 0 = neutral (empty filter). Higher is better. Pure, unit-tested.
+inline int FileFuzzyScore(const std::wstring& nameLower, const std::wstring& filterLower) {
+    return FuzzyScore(nameLower, filterLower);
+}
+
+// Coarse tier so ranking stays predictable: exact/prefix (1) beats
+// contiguous substring (2) beats fuzzy subsequence (3); -1 never matches.
+// Within a tier, earliest occurrence wins (keeps "mydocs" ahead of "ado.doc"
+// for "doc"), then Explorer's natural order. Pure, unit-tested.
+inline int FileScoreTier(const std::wstring& nameLower, const std::wstring& filterLower) {
+    if (filterLower.empty()) return 0;
+    int s = FileFuzzyScore(nameLower, filterLower);
+    if (s < 0) return -1;
+    if (s >= 50000) return 1; // exact or prefix
+    if (nameLower.find(filterLower) != std::wstring::npos) return 2;
+    return 3; // fuzzy subsequence
+}
+
+// Substring filter, now fuzzy-aware: a subsequence match counts (so "vsc"
+// finds "Visual Studio Code"). Empty filter matches all. Pure, unit-tested.
 inline bool FileMatchesFilter(const std::wstring& nameLower, const std::wstring& filterLower) {
     if (filterLower.empty()) return true;
-    if (nameLower.size() < filterLower.size()) return false;
-    return nameLower.find(filterLower) != std::wstring::npos;
+    return FileFuzzyScore(nameLower, filterLower) >= 0;
 }
 
-// Match quality for ranking: 0 = neutral (empty filter), 1 = prefix,
-// 2 = substring, -1 = no match. Pure, unit-tested.
-inline int FileMatchRank(const std::wstring& nameLower, const std::wstring& filterLower) {
-    if (filterLower.empty()) return 0;
-    if (nameLower.size() < filterLower.size()) return -1;
-    if (nameLower.compare(0, filterLower.size(), filterLower) == 0) return 1;
-    return nameLower.find(filterLower) != std::wstring::npos ? 2 : -1;
-}
-
-// Shared ordering for every ranked name list in the app: best rank first,
-// then earliest occurrence ("c++ projects" beats "c file dev c++" for "++"),
-// then case-insensitive alphabetical. Empty filter = pure alphabetical.
+// Shared ordering for every ranked name list in the app: best tier first,
+// then earliest occurrence, then Explorer's natural logical order
+// (StrCmpLogicalW: digits sort numerically, case-insensitive). Empty filter
+// = pure Explorer order.
 inline bool RankedNameLess(const std::wstring& aLower, const std::wstring& bLower,
                            const std::wstring& filterLower,
                            const std::wstring& aOrig, const std::wstring& bOrig) {
     if (!filterLower.empty()) {
-        int ra = FileMatchRank(aLower, filterLower);
-        int rb = FileMatchRank(bLower, filterLower);
-        if (ra != rb) return ra < rb;
+        int ra = FileScoreTier(aLower, filterLower);
+        int rb = FileScoreTier(bLower, filterLower);
+        if (ra != rb) {
+            if (ra < 0) return false;
+            if (rb < 0) return true;
+            return ra < rb;
+        }
         size_t pa = aLower.find(filterLower);
         size_t pb = bLower.find(filterLower);
         if (pa != pb) return pa < pb;
     }
-    int c = _wcsicmp(aOrig.c_str(), bOrig.c_str());
+    int c = StrCmpLogicalW(aOrig.c_str(), bOrig.c_str());
     if (c != 0) return c < 0;
     return aOrig < bOrig;
 }
 
-// Folders first, then best match first, then case-insensitive alphabetical.
-// Empty filter keeps the classic folders-first alphabetical order.
+// Folders first, then best fuzzy match first, then Explorer natural order.
+// Empty filter keeps the classic folders-first Explorer order.
 inline void SortFileEntries(std::vector<FileEntry>& v, const std::wstring& filterLower = L"") {
     std::vector<std::wstring> low(v.size());
     for (size_t i = 0; i < v.size(); i++) low[i] = FileLower(v[i].name);
@@ -153,12 +172,26 @@ inline std::wstring DriveTitle(const std::wstring& root, const std::wstring& lab
     return label + L" (" + letter + L")";
 }
 
-// Drive list ordering: best rank, earliest occurrence, then title.
+// Drive list ordering: empty filter keeps Explorer letter order (the
+// enumeration order of GetLogicalDrivesWin32). With a filter, best fuzzy
+// score first; full ties keep letter order (stable_sort, no alphabetical
+// tiebreak on titles, which would sort by volume label instead).
 // Headless-testable; the palette sorts DriveInfos before building rows.
 inline void SortDrivesByRank(std::vector<DriveInfo>& v, const std::wstring& filterLower) {
-    std::sort(v.begin(), v.end(), [&](const DriveInfo& a, const DriveInfo& b) {
-        return RankedNameLess(FileLower(a.title), FileLower(b.title),
-                              filterLower, a.title, b.title);
+    if (filterLower.empty()) return;
+    std::stable_sort(v.begin(), v.end(), [&](const DriveInfo& a, const DriveInfo& b) {
+        std::wstring al = FileLower(a.title), bl = FileLower(b.title);
+        int ra = FileScoreTier(al, filterLower);
+        int rb = FileScoreTier(bl, filterLower);
+        if (ra != rb) {
+            if (ra < 0) return false;
+            if (rb < 0) return true;
+            return ra < rb;
+        }
+        size_t pa = al.find(filterLower);
+        size_t pb = bl.find(filterLower);
+        if (pa != pb) return pa < pb;
+        return false; // tie: keep Explorer letter order
     });
 }
 

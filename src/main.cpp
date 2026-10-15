@@ -93,22 +93,28 @@ static const UINT DEFERRED_REFRESH_MS = 90000; // 90s: boot settles first
 static int g_dpi = 96; // refreshed on WM_DPICHANGED
 static int Dpx(int px) { return MulDiv(px, g_dpi, 96); }
 // Layout metrics scale with DPI (recomputed by UpdateLayoutMetrics).
+// Width stays fixed; compactness comes from slimmer rows, not density:
+// data rows keep breathing room while headers/padding tighten up.
 static int kWidth = 600;
-static int kInputH = 44;
-static int kItemH = 38; // single-line rows + slim headers
+static int kInputH = 40;   // one text line incl. vertical padding (grows when wrapping)
+static int kItemH = 34;    // data rows
+static int kHeadH = 22;    // section header rows (variable-height listbox)
+static int kPadX = 12;     // horizontal margin (was 16)
 static const int kMaxItems = 9;
-static int kCornerR = 14;
+static const int kMaxEditLines = 3; // wrapped search lines before scrolling
+static int kCornerR = 12;
 static int kChipH = 28;
-static int kChipRowH = 40;
-static int kBottomBarH = 30;
-static int kGridTileH = 86; // Explorer-like tile height (glyph + 2 name lines)
-static int kGridHeadH = 24; // slim count header above the tiles
+static int kChipRowH = 34;
+static int kBottomBarH = 26;
+static int kGridTileH = 74; // Explorer-like tile height (glyph + 2 name lines)
+static int kGridHeadH = 20; // slim count header above the tiles
 static const int kMaxChips = 4;
 static void UpdateLayoutMetrics() {
-    kWidth = Dpx(600); kInputH = Dpx(44); kItemH = Dpx(38);
-    kCornerR = Dpx(14); kChipH = Dpx(28); kChipRowH = Dpx(40);
-    kBottomBarH = Dpx(30);
-    kGridTileH = Dpx(86); kGridHeadH = Dpx(24);
+    kWidth = Dpx(600); kInputH = Dpx(40); kItemH = Dpx(34); kHeadH = Dpx(22);
+    kPadX = Dpx(12);
+    kCornerR = Dpx(12); kChipH = Dpx(28); kChipRowH = Dpx(34);
+    kBottomBarH = Dpx(26);
+    kGridTileH = Dpx(74); kGridHeadH = Dpx(20);
 }
 
 // Settings control IDs
@@ -254,9 +260,11 @@ static void CreateAppFonts() {
         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     g_appFontsReady = true;
 }
+static void RefreshEditLineH(); // defined with the layout helpers below
 static void EnsureAppFonts() {
     if (g_appFontsReady) return;
     CreateAppFonts(); // sets g_appFontsReady
+    RefreshEditLineH();
     if (g_hwndEdit && g_fontInput)
         SendMessageW(g_hwndEdit, WM_SETFONT, (WPARAM)g_fontInput, TRUE);
     if (g_hwndList && g_fontTitle)
@@ -512,27 +520,83 @@ static void ApplyRoundCorners() {
 }
 
 // ------------------------------------------------------------- show / hide
+// Search-box line height (edit font + a little leading), cached whenever
+// fonts are (re)built. Multiline wrap grows the input area by whole lines,
+// capped so the palette stays compact.
+static int g_editLineH = 0;
+static void RefreshEditLineH() {
+    g_editLineH = 0;
+    if (!g_fontInput) return;
+    HWND own = (g_hwndEdit && IsWindow(g_hwndEdit)) ? g_hwndEdit : NULL;
+    HDC dc = own ? GetDC(own) : GetDC(NULL);
+    if (!dc) return;
+    HGDIOBJ old = SelectObject(dc, g_fontInput);
+    TEXTMETRICW tm{};
+    if (GetTextMetricsW(dc, &tm))
+        g_editLineH = tm.tmHeight + tm.tmExternalLeading + Dpx(4);
+    SelectObject(dc, old);
+    ReleaseDC(own, dc);
+    if (g_editLineH < Dpx(16)) g_editLineH = Dpx(16);
+}
+// Displayed (wrapped) line count, clamped to the scroll cap.
+static int EditLineCount() {
+    if (!g_hwndEdit || !IsWindow(g_hwndEdit)) return 1;
+    int n = (int)SendMessageW(g_hwndEdit, EM_GETLINECOUNT, 0, 0);
+    if (n < 1) n = 1;
+    if (n > kMaxEditLines) n = kMaxEditLines;
+    return n;
+}
+// Current input-area height: one-line base plus extra wrapped lines.
+static int CurrentInputH() {
+    int lines = EditLineCount();
+    if (lines <= 1 || g_editLineH <= 0) return kInputH;
+    return kInputH + (lines - 1) * g_editLineH;
+}
+// Height of one result row (headers are slim).
+static int RowH(size_t i) {
+    if (i < g_results.size() && g_results[i].kind == ResultKind::Header) return kHeadH;
+    return kItemH;
+}
+// Visible data rows from the current top index (variable heights).
+static int VisibleRowCount() {
+    if (!g_hwndList) return 1;
+    RECT lr; GetClientRect(g_hwndList, &lr);
+    int h = lr.bottom - lr.top;
+    int top = (int)SendMessageW(g_hwndList, LB_GETTOPINDEX, 0, 0);
+    if (top < 0) top = 0;
+    int n = 0, y = 0;
+    for (size_t i = (size_t)top; i < g_results.size() && y < h; i++) {
+        y += RowH(i);
+        n++;
+    }
+    return n < 1 ? 1 : n;
+}
 static void LayoutPaletteChildren() {
     // Child geometry in current metrics (no move/show of the top-level).
+    // The input area grows with wrapped search lines; the chip stays pinned
+    // to the first line.
     RECT cr; GetClientRect(g_hwndPalette, &cr);
     int W = cr.right;
-    int editH = kInputH - Dpx(14);
+    int inputH = CurrentInputH();
+    int editH = inputH - Dpx(14);
     int editY = Dpx(9);
-    SetWindowPos(g_hwndEdit, NULL, Dpx(16), editY, W - Dpx(32), editH, SWP_NOZORDER);
-    int chipY = editY + (editH - kChipH) / 2;
+    SetWindowPos(g_hwndEdit, NULL, kPadX, editY, W - kPadX * 2, editH, SWP_NOZORDER);
+    int firstH = g_editLineH > 0 ? g_editLineH : editH;
+    int chipY = editY + (firstH - kChipH) / 2;
+    if (chipY < editY) chipY = editY;
     UINT chipFlags = SWP_NOZORDER | SWP_NOSIZE |
         (IsWindowVisible(g_hwndChip) ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
-    SetWindowPos(g_hwndChip, NULL, Dpx(16), chipY, 0, 0, chipFlags);
+    SetWindowPos(g_hwndChip, NULL, kPadX, chipY, 0, 0, chipFlags);
     UINT rowFlags = SWP_NOZORDER | SWP_NOSIZE |
         (IsWindowVisible(g_hwndChipRow) ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
-    SetWindowPos(g_hwndChipRow, NULL, Dpx(16), kInputH, 0, 0, rowFlags);
+    SetWindowPos(g_hwndChipRow, NULL, kPadX, inputH, 0, 0, rowFlags);
     if (IsWindowVisible(g_hwndList)) {
         RECT lr; GetWindowRect(g_hwndList, &lr);
         MapWindowPoints(NULL, g_hwndPalette, (POINT*)&lr, 2);
-        SetWindowPos(g_hwndList, NULL, Dpx(16), lr.top, W - Dpx(32),
+        SetWindowPos(g_hwndList, NULL, kPadX, lr.top, W - kPadX * 2,
                      lr.bottom - lr.top, SWP_NOZORDER);
         if (g_hwndFileBar && IsWindowVisible(g_hwndFileBar))
-            SetWindowPos(g_hwndFileBar, NULL, Dpx(16), lr.bottom, W - Dpx(32),
+            SetWindowPos(g_hwndFileBar, NULL, kPadX, lr.bottom, W - kPadX * 2,
                          kBottomBarH, SWP_NOZORDER);
     }
 }
@@ -628,12 +692,14 @@ static void ActivateBang(int idx, const std::wstring& query) {
     // crossing the outline.
     RECT er; GetWindowRect(g_hwndEdit, &er);
     MapWindowPoints(NULL, g_hwndPalette, (POINT*)&er, 2);
-    int boxH = er.bottom - er.top;
-    int chH = boxH - 4;
+    // Same first-line pinning as PositionFileChip (see above).
+    int firstH = er.bottom - er.top;
+    if (g_editLineH > 0 && firstH > g_editLineH) firstH = g_editLineH;
+    int chH = firstH - 4;
     if (chH > kChipH) chH = kChipH;
     if (chH < 18) chH = 18;
     int chipX = er.left + Dpx(2);
-    int chipY = er.top + (boxH - chH) / 2;
+    int chipY = er.top + (firstH - chH) / 2;
     // HWND_TOP: the chip must stay above the edit (which has WS_CLIPSIBLINGS
     // so it never paints over the chip). Synchronous paint: no blank flash.
     SetWindowPos(g_hwndChip, HWND_TOP, chipX, chipY, w, chH, SWP_SHOWWINDOW);
@@ -689,12 +755,14 @@ static void PositionFileChip() {
     ReleaseDC(g_hwndPalette, dc);
     RECT er; GetWindowRect(g_hwndEdit, &er);
     MapWindowPoints(NULL, g_hwndPalette, (POINT*)&er, 2);
-    int boxH = er.bottom - er.top;
-    int chH = boxH - 4;
+    // Pin to the first text line: a wrapped query must not stretch the pill.
+    int firstH = er.bottom - er.top;
+    if (g_editLineH > 0 && firstH > g_editLineH) firstH = g_editLineH;
+    int chH = firstH - 4;
     if (chH > kChipH) chH = kChipH;
     if (chH < 18) chH = 18;
     int chipX = er.left + Dpx(2);
-    int chipY = er.top + (boxH - chH) / 2;
+    int chipY = er.top + (firstH - chH) / 2;
     SetWindowPos(g_hwndChip, HWND_TOP, chipX, chipY, w, chH, SWP_SHOWWINDOW);
     InvalidateRect(g_hwndChip, NULL, TRUE);
     UpdateWindow(g_hwndChip);
@@ -746,8 +814,9 @@ static void UpdateFileResults(const std::wstring& filter) {
             [&](const DriveInfo& d) {
                 return !FileMatchesFilter(FileLower(d.title), fl);
             }), shown.end());
-        // Ranked, not letter-ordered: prefix matches first ("all" finds
-        // ALL FILES before instALLEd), earliest occurrence breaks ties.
+        // Empty filter: Explorer letter order (enumeration order, untouched).
+        // Filtered: best fuzzy match first ("all" still finds ALL FILES
+        // before instALLEd), ties keep letter order.
         SortDrivesByRank(shown, fl);
         std::vector<ResultItem> rows;
         for (const auto& d : shown) {
@@ -1034,8 +1103,13 @@ static void RebuildListControl() {
     bool showBar = InFileMode() && !g_fileDir.empty();
     bool gridOn = GridActive();
     size_t rows = g_results.size() > kMaxItems ? kMaxItems : g_results.size();
-    int listY = kInputH + (showChips ? kChipRowH : 0);
-    int contentH = gridOn ? GridContentH() : (int)rows * kItemH;
+    int inputH = CurrentInputH();
+    int listY = inputH + (showChips ? kChipRowH : 0);
+    // Exact content height: headers are slim, so the window fits the rows
+    // with no trailing blank (grid tiles keep their own metric).
+    int contentH = 0;
+    if (gridOn) contentH = GridContentH();
+    else for (size_t i = 0; i < rows; i++) contentH += RowH(i);
     int barH = showBar ? kBottomBarH : 0;
     int h = listY + contentH + barH + 4; // 4px bottom pad mirrors the top
 
@@ -1048,7 +1122,7 @@ static void RebuildListControl() {
         ApplyRoundCorners();
         RECT cr; GetClientRect(g_hwndPalette, &cr);
         if (showChips)
-            SetWindowPos(g_hwndChipRow, NULL, Dpx(16), kInputH, cr.right - Dpx(32), kChipRowH,
+            SetWindowPos(g_hwndChipRow, NULL, kPadX, inputH, cr.right - kPadX * 2, kChipRowH,
                          SWP_NOZORDER | SWP_SHOWWINDOW);
         else
             ShowWindow(g_hwndChipRow, SW_HIDE);
@@ -1058,14 +1132,14 @@ static void RebuildListControl() {
         RECT cr; GetClientRect(g_hwndPalette, &cr);
         if (gridOn) {
             if (IsWindowVisible(g_hwndList)) ShowWindow(g_hwndList, SW_HIDE);
-            SetWindowPos(g_hwndFileGrid, NULL, Dpx(16), listY,
-                         cr.right - Dpx(32), contentH, SWP_NOZORDER | SWP_SHOWWINDOW);
+            SetWindowPos(g_hwndFileGrid, NULL, kPadX, listY,
+                         cr.right - kPadX * 2, contentH, SWP_NOZORDER | SWP_SHOWWINDOW);
         } else {
             if (IsWindowVisible(g_hwndFileGrid)) ShowWindow(g_hwndFileGrid, SW_HIDE);
             if (rows == 0)
                 ShowWindow(g_hwndList, SW_HIDE); // bar-only: no list at all
             else
-                SetWindowPos(g_hwndList, NULL, Dpx(16), listY, cr.right - Dpx(32),
+                SetWindowPos(g_hwndList, NULL, kPadX, listY, cr.right - kPadX * 2,
                              contentH, SWP_NOZORDER | SWP_SHOWWINDOW);
         }
     }
@@ -1073,8 +1147,8 @@ static void RebuildListControl() {
     {
         RECT cr; GetClientRect(g_hwndPalette, &cr);
         if (showBar)
-            SetWindowPos(g_hwndFileBar, NULL, Dpx(16), listY + contentH,
-                         cr.right - Dpx(32), barH, SWP_NOZORDER | SWP_SHOWWINDOW);
+            SetWindowPos(g_hwndFileBar, NULL, kPadX, listY + contentH,
+                         cr.right - kPadX * 2, barH, SWP_NOZORDER | SWP_SHOWWINDOW);
         else if (g_hwndFileBar)
             ShowWindow(g_hwndFileBar, SW_HIDE);
     }
@@ -1477,9 +1551,7 @@ static void EnsureVisible(int sel) {
         return;
     }
     int top = (int)SendMessageW(g_hwndList, LB_GETTOPINDEX, 0, 0);
-    RECT lr; GetClientRect(g_hwndList, &lr);
-    int vis = (lr.bottom - lr.top) / kItemH;
-    if (vis < 1) vis = 1;
+    int vis = VisibleRowCount();
     if (sel < top)
         SendMessageW(g_hwndList, LB_SETTOPINDEX, sel, 0);
     else if (sel >= top + vis)
@@ -1527,9 +1599,7 @@ static void WheelScrollList(int delta) {
         return;
     }
     if (!g_hwndList || !IsWindowVisible(g_hwndList)) return;
-    RECT lr; GetClientRect(g_hwndList, &lr);
-    int vis = (lr.bottom - lr.top) / kItemH;
-    if (vis < 1) vis = 1;
+    int vis = VisibleRowCount();
     if ((int)g_results.size() <= vis) return; // nothing to scroll
     int notches = delta / WHEEL_DELTA;
     int move = -notches * 3; // wheel up = toward first row
@@ -1560,6 +1630,34 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
     }
     if (m == WM_MOUSEWHEEL) {
         WheelScrollList(GET_WHEEL_DELTA_WPARAM(w));
+        return 0;
+    }
+    if (m == WM_PASTE) {
+        // Wrapping is display-only for one logical query: collapse pasted
+        // line breaks to spaces so a multiline paste can't hide text or
+        // force extra wrapped lines.
+        if (!OpenClipboard(h)) return 0;
+        HANDLE hd = GetClipboardData(CF_UNICODETEXT);
+        std::wstring t;
+        if (hd) {
+            const wchar_t* p = (const wchar_t*)GlobalLock(hd);
+            if (p) t = p;
+            GlobalUnlock(hd);
+        }
+        CloseClipboard();
+        for (auto& c : t)
+            if (c == L'\r' || c == L'\n' || c == L'\t') c = L' ';
+        // Collapse runs of spaces (keeps the box to one logical line).
+        std::wstring flat;
+        flat.reserve(t.size());
+        bool sp = true; // skip leading spaces
+        for (wchar_t c : t) {
+            if (c == L' ') { if (!sp) { flat.push_back(c); sp = true; } }
+            else { flat.push_back(c); sp = false; }
+        }
+        if (!flat.empty() && flat.back() == L' ') flat.pop_back();
+        if (!flat.empty())
+            SendMessageW(h, EM_REPLACESEL, TRUE, (LPARAM)flat.c_str());
         return 0;
     }
     if (m == WM_KEYDOWN) {
@@ -1946,7 +2044,7 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             const ResultItem& ri = g_results[i];
             if (ri.kind == ResultKind::Header) continue; // safety
             if ((int)i == sel) FillRect(dc, &tile, g_brSel);
-            int gz = Dpx(40);
+            int gz = Dpx(32);
             int gx = tile.left + (tile.right - tile.left - gz) / 2;
             RECT gcell{gx, tile.top + Dpx(8), gx + gz, tile.top + Dpx(8) + gz};
             FileGlyph fg = GlyphForResult(ri.kind, ri.title, ri.action, ri.color);
@@ -1989,9 +2087,13 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_CREATE: {
         // WS_CLIPSIBLINGS everywhere: the edit must never paint over the chip.
+        // The edit is multiline word-wrap (no ES_AUTOHSCROLL): overflow wraps
+        // to a second line and the input area grows (capped, then scrolls).
+        // The listbox is OWNERDRAWVARIABLE so section headers stay slim.
         g_hwndEdit = CreateWindowExW(0, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | ES_LEFT | ES_AUTOHSCROLL,
-            16, 9, kWidth - 32, 30,
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | ES_LEFT | ES_MULTILINE |
+            ES_AUTOVSCROLL,
+            kPadX, Dpx(9), kWidth - kPadX * 2, kInputH - Dpx(14),
             hwnd, (HMENU)1, g_hInst, NULL);
         SendMessageW(g_hwndEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search");
         if (g_fontInput) // fonts are lazy now: applied in EnsureAppFonts on first show
@@ -2002,28 +2104,28 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
 
         g_hwndChip = CreateWindowExW(0, kChipClass, L"",
             WS_CHILD | WS_CLIPSIBLINGS,
-            16, 9, 10, kChipH,
+            kPadX, Dpx(9), 10, kChipH,
             hwnd, (HMENU)3, g_hInst, NULL);
 
         g_hwndChipRow = CreateWindowExW(0, kChipRowClass, L"",
             WS_CHILD | WS_CLIPSIBLINGS,
-            16, kInputH, kWidth - 32, kChipRowH,
+            kPadX, kInputH, kWidth - kPadX * 2, kChipRowH,
             hwnd, (HMENU)4, g_hInst, NULL);
 
         g_hwndFileBar = CreateWindowExW(0, kFileBarClass, L"",
             WS_CHILD | WS_CLIPSIBLINGS,
-            16, kInputH, kWidth - 32, kBottomBarH,
+            kPadX, kInputH, kWidth - kPadX * 2, kBottomBarH,
             hwnd, (HMENU)5, g_hInst, NULL);
 
         g_hwndFileGrid = CreateWindowExW(0, kFileGridClass, L"",
             WS_CHILD | WS_CLIPSIBLINGS,
-            16, kInputH, kWidth - 32, kItemH,
+            kPadX, kInputH, kWidth - kPadX * 2, kItemH,
             hwnd, (HMENU)6, g_hInst, NULL);
 
         g_hwndList = CreateWindowExW(0, L"LISTBOX", L"",
-            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | LBS_NOTIFY | LBS_OWNERDRAWFIXED |
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | LBS_NOTIFY | LBS_OWNERDRAWVARIABLE |
             LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
-            16, kInputH, kWidth - 32, kItemH,
+            kPadX, kInputH, kWidth - kPadX * 2, kItemH,
             hwnd, (HMENU)2, g_hInst, NULL);
         SetWindowSubclass(g_hwndList, ListSubclass, 2, 0);
         break;
@@ -2105,7 +2207,11 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_MEASUREITEM: {
         MEASUREITEMSTRUCT* mi = (MEASUREITEMSTRUCT*)l;
-        mi->itemHeight = kItemH;
+        // Items are added in g_results order, so the listbox index matches
+        // the results index at measure time. Headers stay slim.
+        size_t id = (mi->itemID == (UINT)-1) ? (size_t)-1 : (size_t)mi->itemID;
+        mi->itemHeight = (id < g_results.size() &&
+                          g_results[id].kind == ResultKind::Header) ? kHeadH : kItemH;
         return TRUE;
     }
     case WM_DRAWITEM: {
@@ -2173,7 +2279,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     case WM_DPICHANGED: {
         g_dpi = HIWORD(w);
         UpdateLayoutMetrics();
-        if (g_appFontsReady) CreateAppFonts(); // lazy: nothing to rebuild pre-first-show
+        if (g_appFontsReady) { CreateAppFonts(); RefreshEditLineH(); } // lazy: nothing pre-first-show
         RECT* pr = (RECT*)l; // system-suggested rect for the new DPI
         SetWindowPos(hwnd, HWND_TOPMOST, pr->left, pr->top,
                      pr->right - pr->left, pr->bottom - pr->top,
