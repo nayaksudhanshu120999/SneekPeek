@@ -19,7 +19,8 @@ if %ERRORLEVEL%==0 (
         if exist src\app.res set RES_OBJS=src\app.res
     )
     cl /std:c++17 /O1 /Os /EHsc /utf-8 /DUNICODE /D_UNICODE /MT %SRC% %RES_OBJS% ^
-       /link user32.lib shell32.lib gdi32.lib advapi32.lib shlwapi.lib comctl32.lib comdlg32.lib powrprof.lib ole32.lib gdiplus.lib ^
+       /link user32.lib shell32.lib gdi32.lib advapi32.lib shlwapi.lib comctl32.lib comdlg32.lib powrprof.lib ole32.lib gdiplus.lib delayimp.lib ^
+       /DELAYLOAD:gdiplus.dll /DELAYLOAD:comdlg32.dll /DELAYLOAD:powrprof.dll /DELAYLOAD:comctl32.dll ^
        /SUBSYSTEM:WINDOWS /MANIFEST:NO /OUT:%OUT%
     if %ERRORLEVEL%==0 echo [build] OK -^> %OUT%
     exit /b %ERRORLEVEL%

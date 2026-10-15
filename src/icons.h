@@ -1,9 +1,11 @@
 #pragma once
 // SneekPeek - predefined kind/extension glyphs, drawn not loaded.
 // Header-only. No icon extraction anywhere (no SHGetFileInfo, no ExtractIcon,
-// no image files): every glyph is a few GDI shapes painted in WM_DRAWITEM,
+// no image files): every glyph is GDI shapes painted in WM_DRAWITEM,
 // so cost is ~9 visible rows x a handful of calls per repaint — no disk I/O,
-// no cache, no RAM growth. Mapping helpers are pure and unit-tested.
+// no cache, no RAM growth. The language is rounded 3D: soft drop shade,
+// saturated body, light top gloss, bright crest line. Mapping helpers are
+// pure and unit-tested.
 #include <windows.h>
 #include <string>
 #include "results.h"
@@ -225,6 +227,44 @@ inline void GlyphFillPoly(HDC dc, POINT* pts, int n, COLORREF c) {
     SelectObject(dc, o);
     DeleteObject(h);
 }
+inline void GlyphArc(HDC dc, int l, int t, int r, int b,
+                     int x1, int y1, int x2, int y2, int w, COLORREF c) {
+    HPEN p = CreatePen(PS_SOLID, w, c);
+    HGDIOBJ o = SelectObject(dc, p);
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Arc(dc, l, t, r, b, x1, y1, x2, y2);
+    SelectObject(dc, ob);
+    SelectObject(dc, o);
+    DeleteObject(p);
+}
+
+// ------------------------------------------------------- rounded 3D language
+// All 3D comes from lighter-toward-top shading (drop shadows would vanish on
+// the black rows): each solid shape gets a dark drop shade, a saturated body,
+// a light top gloss and a bright crest line. Geometry derives from the cell
+// so DPI scaling follows automatically. Callers precompute lite/base/dark.
+inline COLORREF GlyphLighten(COLORREF c, int amt) {
+    int r = GetRValue(c) + amt; if (r > 255) r = 255;
+    int g = GetGValue(c) + amt; if (g > 255) g = 255;
+    int b = GetBValue(c) + amt; if (b > 255) b = 255;
+    return RGB(r, g, b);
+}
+// Glossy rounded tile: (l,t,r,b) body rect, rad corner diameter.
+inline void GlyphTile3D(HDC dc, int l, int t, int r, int b, int rad,
+                        COLORREF lite, COLORREF base, COLORREF dark) {
+    GlyphFillRound(dc, l + 1, t + 2, r + 1, b + 1, rad, dark); // drop shade
+    GlyphFillRound(dc, l, t, r, b, rad, base);                 // body
+    int mid = t + (b - t) * 42 / 100;
+    if (mid > t + 2)
+        GlyphFillRound(dc, l + 2, t + 1, r - 2, mid, rad > 2 ? rad - 2 : 1, lite);
+    if (r - l > 10)
+        GlyphLine(dc, l + 4, t + 1, r - 4, t + 1, 1, GlyphLighten(base, 110));
+}
+// Bright top-left arc highlight for rings and rims (globe, disc, button).
+inline void GlyphHiArc(HDC dc, int l, int t, int r, int b, COLORREF base) {
+    int cx = (l + r) / 2, cy = (t + b) / 2;
+    GlyphArc(dc, l, t, r, b, l, cy, cx, t, 2, GlyphLighten(base, 110));
+}
 
 // ------------------------------------------------------- the painter
 // cell is a ~20px square. title supplies the Bang letter.
@@ -240,20 +280,30 @@ inline void PaintGlyph(HDC dc, const RECT& cell, const FileGlyph& g,
     if (s < 12) return;
     int cx = x + s / 2, cy = y + s / 2;
     switch (g.style) {
-    case GlyphStyle::Folder:
-        GlyphFillRect(dc, x + 1, y + 3, x + 8, y + 6, base); // tab
-        GlyphFillRect(dc, x + 1, y + 5, x + s - 1, y + s - 2, base); // body
+    case GlyphStyle::Folder: {
+        COLORREF lite = GlyphLighten(base, 45);
+        GlyphFillRound(dc, x + 1, y + 4, x + 8, y + 7, 2, dark); // tab shade
+        GlyphFillRound(dc, x + 1, y + 3, x + 8, y + 6, 2, base); // tab
+        GlyphTile3D(dc, x + 1, y + 5, x + s - 2, y + s - 3, 3, lite, base, dark);
         break;
-    case GlyphStyle::Drive:
-        GlyphFillRect(dc, x + 1, y + 7, x + s - 1, y + s - 3, base);
-        GlyphLine(dc, x + 4, y + s - 7, x + s - 6, y + s - 7, 2, dark); // slot
-        GlyphFillRect(dc, x + s - 5, y + 9, x + s - 3, y + 11, W); // LED
+    }
+    case GlyphStyle::Drive: {
+        COLORREF lite = GlyphLighten(base, 45);
+        GlyphTile3D(dc, x + 1, y + 7, x + s - 2, y + s - 4, 3, lite, base, dark);
+        GlyphLine(dc, x + 4, y + s - 8, x + s - 6, y + s - 8, 2, dark); // slot
+        GlyphLine(dc, x + 4, y + s - 9, x + s - 6, y + s - 9, 1, lite); // slot sheen
+        GlyphFillEllipse(dc, x + s - 6, y + 9, x + s - 4, y + 11, W); // LED
         break;
+    }
     case GlyphStyle::FilePage:
     case GlyphStyle::DocLines: {
+        POINT sh[5] = {{x + 6, y + 3}, {x + 13, y + 3}, {x + 16, y + 6},
+                       {x + 16, y + s - 1}, {x + 6, y + s - 1}};
+        GlyphFillPoly(dc, sh, 5, RGB(18, 18, 22)); // drop shade
         POINT pg[5] = {{x + 5, y + 2}, {x + 12, y + 2}, {x + 15, y + 5},
                        {x + 15, y + s - 2}, {x + 5, y + s - 2}};
         GlyphFillPoly(dc, pg, 5, base);
+        GlyphLine(dc, x + 6, y + 3, x + 11, y + 3, 1, GlyphLighten(base, 110));
         POINT fd[3] = {{x + 12, y + 2}, {x + 15, y + 5}, {x + 12, y + 5}};
         GlyphFillPoly(dc, fd, 3, dark);
         GlyphLine(dc, x + 7, y + 9, x + 13, y + 9, 1, dark);
@@ -267,68 +317,106 @@ inline void PaintGlyph(HDC dc, const RECT& cell, const FileGlyph& g,
     case GlyphStyle::Sheet:
     case GlyphStyle::Slide:
     case GlyphStyle::Book: {
+        POINT sh[5] = {{x + 6, y + 3}, {x + 13, y + 3}, {x + 16, y + 6},
+                       {x + 16, y + s - 1}, {x + 6, y + s - 1}};
+        GlyphFillPoly(dc, sh, 5, RGB(18, 18, 22)); // drop shade
         POINT pg[5] = {{x + 5, y + 2}, {x + 12, y + 2}, {x + 15, y + 5},
                        {x + 15, y + s - 2}, {x + 5, y + s - 2}};
         GlyphFillPoly(dc, pg, 5, PAGE);
+        GlyphLine(dc, x + 6, y + 3, x + 11, y + 3, 1, W); // top crest
         POINT fd[3] = {{x + 12, y + 2}, {x + 15, y + 5}, {x + 12, y + 5}};
         GlyphFillPoly(dc, fd, 3, FOLD);
         GlyphLine(dc, x + 7, y + 8, x + 13, y + 8, 1, FOLD);
         GlyphFillRect(dc, x + 5, y + s - 6, x + 15, y + s - 2, base); // band
+        GlyphLine(dc, x + 6, y + s - 5, x + 14, y + s - 5, 1, GlyphLighten(base, 90));
         break;
     }
-    case GlyphStyle::Picture:
-        GlyphFillRect(dc, x + 3, y + 4, x + s - 3, y + s - 4, base);
-        GlyphFillRect(dc, x + 12, y + 7, x + 14, y + 9, W); // sun
-        {
-            POINT m[5] = {{x + 3, y + s - 4}, {x + 9, y + 9},
-                          {x + 12, y + 12}, {x + 14, y + 10}, {x + s - 3, y + s - 4}};
-            GlyphFillPoly(dc, m, 5, dark); // mountains
-        }
+    case GlyphStyle::Picture: {
+        COLORREF lite = GlyphLighten(base, 45);
+        GlyphTile3D(dc, x + 3, y + 4, x + s - 4, y + s - 5, 3, lite, base, dark);
+        GlyphFillEllipse(dc, x + 11, y + 6, x + 15, y + 10, lite); // sun glow
+        GlyphFillRect(dc, x + 12, y + 7, x + 14, y + 9, W); // sun core
+        POINT m[5] = {{x + 4, y + s - 5}, {x + 9, y + 9},
+                      {x + 12, y + 12}, {x + 14, y + 10}, {x + s - 4, y + s - 5}};
+        GlyphFillPoly(dc, m, 5, dark); // mountains
+        GlyphLine(dc, x + 5, y + 12, x + 8, y + 9, 1, lite); // ridge light
         break;
+    }
     case GlyphStyle::Audio:
+        GlyphLine(dc, x + 10, y + 5, x + 10, y + 14, 2, dark); // depth offsets
+        GlyphLine(dc, x + 10, y + 5, x + 15, y + 7, 2, dark);
+        GlyphFillEllipse(dc, x + 5, y + 13, x + 11, y + 18, dark);
         GlyphLine(dc, x + 9, y + 4, x + 9, y + 13, 2, base); // stem
         GlyphLine(dc, x + 9, y + 4, x + 14, y + 6, 2, base); // flag
         GlyphFillEllipse(dc, x + 4, y + 12, x + 10, y + 17, base); // head
+        GlyphFillEllipse(dc, x + 5, y + 13, x + 7, y + 15, GlyphLighten(base, 120));
         break;
     case GlyphStyle::Video: {
-        GlyphFillRound(dc, x + 2, y + 5, x + s - 2, y + s - 5, 6, base);
+        COLORREF lite = GlyphLighten(base, 45);
+        GlyphTile3D(dc, x + 2, y + 5, x + s - 4, y + s - 6, 6, lite, base, dark);
+        POINT sh[3] = {{x + 9, y + 9}, {x + 9, y + s - 9}, {x + 14, cy}};
+        GlyphFillPoly(dc, sh, 3, dark);
         POINT p[3] = {{x + 8, y + 8}, {x + 8, y + s - 8}, {x + 13, cy}};
         GlyphFillPoly(dc, p, 3, W);
         break;
     }
-    case GlyphStyle::Archive:
-        GlyphFillRect(dc, x + 4, y + 7, x + s - 4, y + s - 3, base);
-        GlyphLine(dc, x + 4, y + 9, x + s - 4, y + 9, 1, dark); // lid
-        GlyphLine(dc, cx, y + 7, cx, y + s - 3, 2, dark); // strap
+    case GlyphStyle::Archive: {
+        COLORREF lite = GlyphLighten(base, 45);
+        GlyphTile3D(dc, x + 4, y + 7, x + s - 5, y + s - 4, 2, lite, base, dark);
+        GlyphLine(dc, cx - 1, y + 7, cx - 1, y + s - 4, 2, dark); // strap
+        GlyphLine(dc, cx + 1, y + 7, cx + 1, y + s - 4, 1, lite); // strap sheen
         break;
-    case GlyphStyle::Disc:
+    }
+    case GlyphStyle::Disc: {
+        COLORREF lite = GlyphLighten(base, 90);
         GlyphFrameEllipse(dc, x + 2, y + 2, x + s - 2, y + s - 2, 2, base);
+        GlyphHiArc(dc, x + 2, y + 2, x + s - 2, y + s - 2, base);
         GlyphFrameEllipse(dc, x + 8, y + 8, x + s - 8, y + s - 8, 1, base);
+        GlyphFillEllipse(dc, cx - 1, cy - 1, cx + 1, cy + 1, lite); // hub glint
         break;
-    case GlyphStyle::Code:
-        GlyphLine(dc, x + 7, y + 6, x + 3, y + 10, 2, base); // <
+    }
+    case GlyphStyle::Code: {
+        COLORREF halo = GlyphLighten(base, 30);
+        GlyphLine(dc, x + 7, y + 6, x + 3, y + 10, 3, halo); // glow pass
+        GlyphLine(dc, x + 3, y + 10, x + 7, y + 14, 3, halo);
+        GlyphLine(dc, x + 11, y + 5, x + 9, y + 15, 3, halo);
+        GlyphLine(dc, x + 13, y + 6, x + 17, y + 10, 3, halo);
+        GlyphLine(dc, x + 17, y + 10, x + 13, y + 14, 3, halo);
+        GlyphLine(dc, x + 7, y + 6, x + 3, y + 10, 2, base); // core <
         GlyphLine(dc, x + 3, y + 10, x + 7, y + 14, 2, base);
-        GlyphLine(dc, x + 11, y + 5, x + 9, y + 15, 2, base); // /
-        GlyphLine(dc, x + 13, y + 6, x + 17, y + 10, 2, base); // >
+        GlyphLine(dc, x + 11, y + 5, x + 9, y + 15, 2, base); // core /
+        GlyphLine(dc, x + 13, y + 6, x + 17, y + 10, 2, base); // core >
         GlyphLine(dc, x + 17, y + 10, x + 13, y + 14, 2, base);
         break;
+    }
     case GlyphStyle::Exe: {
-        GlyphFillRound(dc, x + 2, y + 2, x + s - 2, y + s - 2, 5, base);
+        COLORREF lite = GlyphLighten(base, 45);
+        GlyphTile3D(dc, x + 2, y + 2, x + s - 4, y + s - 4, 5, lite, base, dark);
+        POINT sh[3] = {{x + 9, y + 7}, {x + 9, y + 15}, {x + 15, y + 11}};
+        GlyphFillPoly(dc, sh, 3, dark);
         POINT p[3] = {{x + 8, y + 6}, {x + 8, y + 14}, {x + 14, y + 10}};
         GlyphFillPoly(dc, p, 3, W);
         break;
     }
-    case GlyphStyle::Terminal:
-        GlyphFillRound(dc, x + 2, y + 2, x + s - 2, y + s - 2, 5, base);
+    case GlyphStyle::Terminal: {
+        COLORREF lite = GlyphLighten(base, 45);
+        GlyphTile3D(dc, x + 2, y + 2, x + s - 4, y + s - 4, 5, lite, base, dark);
         GlyphLine(dc, x + 5, y + 7, x + 9, y + 10, 2, W); // >
         GlyphLine(dc, x + 9, y + 10, x + 5, y + 13, 2, W);
         GlyphLine(dc, x + 11, y + 13, x + 15, y + 13, 2, W); // _
+        GlyphFillEllipse(dc, x + 11, y + 12, x + 13, y + 14, GlyphLighten(base, 120));
         break;
+    }
     case GlyphStyle::Shortcut: {
+        COLORREF lite = GlyphLighten(base, 45);
+        POINT sh[5] = {{x + 4, y + 3}, {x + 10, y + 3}, {x + 12, y + 5},
+                       {x + 12, y + 13}, {x + 4, y + 13}};
+        GlyphFillPoly(dc, sh, 5, RGB(18, 18, 22)); // page shade
         POINT pg[5] = {{x + 3, y + 2}, {x + 9, y + 2}, {x + 11, y + 4},
                        {x + 11, y + 12}, {x + 3, y + 12}};
         GlyphFillPoly(dc, pg, 5, PAGE);
-        GlyphFillRound(dc, x + 8, y + 10, x + s - 1, y + s - 1, 4, base);
+        GlyphLine(dc, x + 4, y + 3, x + 8, y + 3, 1, W); // page crest
+        GlyphTile3D(dc, x + 8, y + 10, x + s - 2, y + s - 2, 4, lite, base, dark);
         GlyphLine(dc, x + 10, y + 14, x + 15, y + 14, 2, W); // arrow
         GlyphLine(dc, x + 13, y + 12, x + 15, y + 14, 2, W);
         GlyphLine(dc, x + 15, y + 14, x + 13, y + 16, 2, W);
@@ -336,28 +424,39 @@ inline void PaintGlyph(HDC dc, const RECT& cell, const FileGlyph& g,
     }
     case GlyphStyle::Calc:
         GlyphFrameEllipse(dc, x + 3, y + 3, x + s - 3, y + s - 3, 2, base);
+        GlyphHiArc(dc, x + 3, y + 3, x + s - 3, y + s - 3, base);
         GlyphLine(dc, x + 7, y + 8, x + 13, y + 8, 2, base); // =
+        GlyphLine(dc, x + 7, y + 9, x + 13, y + 9, 1, GlyphLighten(base, 110));
         GlyphLine(dc, x + 7, y + 12, x + 13, y + 12, 2, base);
         break;
-    case GlyphStyle::Setting:
+    case GlyphStyle::Setting: {
+        COLORREF lite = GlyphLighten(base, 60);
         GlyphLine(dc, x + 3, y + 7, x + s - 3, y + 7, 1, GlyphDim(W, 65)); // rails
         GlyphLine(dc, x + 3, y + 13, x + s - 3, y + 13, 1, GlyphDim(W, 65));
-        GlyphFillRect(dc, x + 6, y + 6, x + 8, y + 8, base); // knobs
-        GlyphFillRect(dc, x + 12, y + 12, x + 14, y + 14, base);
+        GlyphFillEllipse(dc, x + 5, y + 5, x + 9, y + 9, base); // knobs
+        GlyphFillEllipse(dc, x + 5, y + 5, x + 7, y + 7, lite);
+        GlyphFillEllipse(dc, x + 11, y + 11, x + 15, y + 15, base);
+        GlyphFillEllipse(dc, x + 11, y + 11, x + 13, y + 13, lite);
         break;
+    }
     case GlyphStyle::Web:
         GlyphFrameEllipse(dc, x + 3, y + 3, x + s - 3, y + s - 3, 2, base);
+        GlyphHiArc(dc, x + 3, y + 3, x + s - 3, y + s - 3, base);
         GlyphFrameEllipse(dc, x + 7, y + 3, x + s - 7, y + s - 3, 1, base); // meridian
         GlyphLine(dc, x + 3, cy, x + s - 3, cy, 1, base); // equator
         break;
     case GlyphStyle::Bang: {
-        GlyphFillRound(dc, x + 1, y + 1, x + s - 1, y + s - 1, 5, base);
+        COLORREF lite = GlyphLighten(base, 45);
+        GlyphTile3D(dc, x + 1, y + 1, x + s - 2, y + s - 2, 5, lite, base, dark);
         if (tagFont) {
             wchar_t b[2] = {title.empty() ? L'?' : title[0], 0};
             HGDIOBJ old = SelectObject(dc, tagFont);
-            COLORREF ot = SetTextColor(dc, W);
             int ob = SetBkMode(dc, TRANSPARENT);
-            RECT tr{cell.left, cell.top, cell.right, cell.bottom};
+            RECT tr{cell.left + 1, cell.top + 1, cell.right + 1, cell.bottom + 1};
+            COLORREF ot = SetTextColor(dc, dark); // letter drop shade
+            DrawTextW(dc, b, 1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            tr.left--; tr.top--; tr.right--; tr.bottom--;
+            SetTextColor(dc, W);
             DrawTextW(dc, b, 1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             SetBkMode(dc, ob);
             SetTextColor(dc, ot);
@@ -366,18 +465,28 @@ inline void PaintGlyph(HDC dc, const RECT& cell, const FileGlyph& g,
         break;
     }
     case GlyphStyle::FontTag: {
+        POINT sh[5] = {{x + 6, y + 3}, {x + 13, y + 3}, {x + 16, y + 6},
+                       {x + 16, y + s - 1}, {x + 6, y + s - 1}};
+        GlyphFillPoly(dc, sh, 5, RGB(18, 18, 22)); // drop shade
         POINT pg[5] = {{x + 5, y + 2}, {x + 12, y + 2}, {x + 15, y + 5},
                        {x + 15, y + s - 2}, {x + 5, y + s - 2}};
         GlyphFillPoly(dc, pg, 5, PAGE);
+        GlyphLine(dc, x + 6, y + 3, x + 11, y + 3, 1, W); // top crest
         GlyphLine(dc, x + 7, y + 15, x + 10, y + 8, 2, base); // A
         GlyphLine(dc, x + 10, y + 8, x + 13, y + 15, 2, base);
         GlyphLine(dc, x + 8, y + 13, x + 12, y + 13, 2, base);
+        GlyphLine(dc, x + 8, y + 14, x + 12, y + 14, 1, GlyphLighten(base, 60));
         break;
     }
-    case GlyphStyle::Database:
-        GlyphFillRect(dc, x + 5, y + 6, x + 15, y + s - 3, base); // body
-        GlyphFillEllipse(dc, x + 5, y + 3, x + 15, y + 8, base); // top rim
-        GlyphFrameEllipse(dc, x + 5, y + 3, x + 15, y + 8, 1, dark);
+    case GlyphStyle::Database: {
+        COLORREF lite = GlyphLighten(base, 45);
+        GlyphFillRound(dc, x + 6, y + 7, x + 16, y + s - 2, 3, dark); // body shade
+        GlyphFillRound(dc, x + 5, y + 6, x + 15, y + s - 3, 3, base); // body
+        GlyphLine(dc, x + 6, y + 7, x + 14, y + 7, 1, lite); // body sheen
+        GlyphFillEllipse(dc, x + 5, y + 3, x + 15, y + 8, lite); // rim light
+        GlyphFillEllipse(dc, x + 6, y + 4, x + 14, y + 8, dark); // opening
+        GlyphHiArc(dc, x + 5, y + 3, x + 15, y + 8, base);
         break;
+    }
     }
 }

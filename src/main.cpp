@@ -65,7 +65,9 @@
 #pragma comment(lib, "powrprof.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "gdiplus.lib")
-#pragma comment(lib, "gdiplus.lib")
+#ifdef _MSC_VER
+#pragma comment(lib, "delayimp.lib")
+#endif
 
 // ---------------------------------------------------------------- constants
 static const wchar_t* kPaletteClass  = L"SneekPeekPalette";
@@ -83,6 +85,10 @@ static const UINT ID_TRAY_REFRESH  = 1002;
 static const UINT ID_TRAY_STARTUP   = 1003;
 static const UINT ID_TRAY_QUIT      = 1004;
 static const UINT ID_TRAY_AWAKE     = 1005;
+// Deferred post-boot refresh: fired once via SetTimer so logon does no
+// scan work inside Windows' startup measurement window.
+static const UINT_PTR IDT_DEFERRED_REFRESH = 9001;
+static const UINT DEFERRED_REFRESH_MS = 90000; // 90s: boot settles first
 
 static int g_dpi = 96; // refreshed on WM_DPICHANGED
 static int Dpx(int px) { return MulDiv(px, g_dpi, 96); }
@@ -237,6 +243,15 @@ static void CreateAppFonts() {
     g_fontUI = CreateFontW(-MulDiv(9, dpiY, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    g_appFontsReady = true;
+}
+static void EnsureAppFonts() {
+    if (g_appFontsReady) return;
+    CreateAppFonts(); // sets g_appFontsReady
+    if (g_hwndEdit && g_fontInput)
+        SendMessageW(g_hwndEdit, WM_SETFONT, (WPARAM)g_fontInput, TRUE);
+    if (g_hwndList && g_fontTitle)
+        SendMessageW(g_hwndList, WM_SETFONT, (WPARAM)g_fontTitle, TRUE);
 }
 static HBRUSH      g_brBg = NULL;
 static HBRUSH      g_brInput = NULL;
@@ -249,6 +264,48 @@ static std::unordered_set<std::wstring> g_hidden; // lowercased app names
 static std::vector<BrowserOpt> g_browsers;        // parallel to browser combo
 static std::atomic<bool> g_indexReady{false};
 static std::atomic<bool> g_indexing{false};
+
+// Lazy boot state: the startup path avoids file/GDI/DLL work so Windows'
+// startup-impact accounting sees a near-idle process. Heavy pieces load on
+// first interactive use instead.
+static bool g_settingsListsLoaded = false; // hidden + bangs + quicks
+static bool g_gdiplusStarted = false;
+static bool g_appFontsReady = false;
+static bool g_comCtlReady = false;
+static bool g_startupDeferredArmed = false; // 90s light-refresh timer pending
+
+static void RebuildHiddenSet(); // forward: used by EnsureSettingsLists
+// (CreateAppFonts is defined above; EnsureAppFonts wraps it.)
+
+// Loads hidden/bangs/quicks once. Must precede any SaveSettings (which
+// rewrites those sections) and any palette search / Settings fill.
+static void EnsureSettingsLists() {
+    if (g_settingsListsLoaded) return;
+    LoadSettingsLists(g_settings);
+    RebuildHiddenSet();
+    g_settingsListsLoaded = true;
+}
+
+// GDI+ is only needed to paint chip pills. Starting it on first show keeps
+// gdiplus.dll out of the logon path.
+static void EnsureGdiplus() {
+    if (g_gdiplusStarted) return;
+    Gdiplus::GdiplusStartupInput input;
+    if (Gdiplus::GdiplusStartup(&g_gdiplusToken, &input, NULL) == 0)
+        g_gdiplusStarted = true;
+}
+
+// Segoe UI faces map font files; creating them on first show (not at logon)
+// keeps that disk I/O out of the startup window.
+// (EnsureAppFonts is defined above, next to CreateAppFonts.)
+
+// comctl32 (listview/tab for Settings) loads on first Settings open.
+static void EnsureComCtl() {
+    if (g_comCtlReady) return;
+    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES};
+    InitCommonControlsEx(&icc);
+    g_comCtlReady = true;
+}
 
 // Bang-chip mode: -1 = off, else index into g_settings.bangs.
 static int  g_activeBang = -1;
@@ -328,7 +385,7 @@ static void HidePalette();
 static void UpdateResults();
 static void ExecuteSelected(bool forceWeb);
 static void ExecuteChip(int idx);
-static void BuildIndexAsync();
+static void BuildIndexAsync(bool full = true);
 static void AddTrayIcon(HWND hwnd);
 static void RemoveTrayIcon(HWND hwnd);
 static void ShowTrayMenu(HWND hwnd);
@@ -373,16 +430,19 @@ static std::atomic<bool> g_indexStop{false};
 static std::atomic<bool> g_quitting{false}; // set at teardown: deferred work stands down
 static std::thread g_indexThread; // guarded by g_indexing: join before reuse
 static const UINT WM_APP_INDEX = WM_APP + 22; // background index published
-static void BuildIndexAsync() {
+// full=true runs every phase incl. PowerShell Get-StartApps (manual Refresh,
+// F5, cache-miss). full=false is the light pass for the automatic post-boot
+// refresh: .lnk + primary Store enum only, no child process.
+static void BuildIndexAsync(bool full) {
     bool expected = false;
     if (!g_indexing.compare_exchange_strong(expected, true)) return; // already running
     if (g_indexThread.joinable()) g_indexThread.join(); // reap finished worker
     g_indexStop.store(false);
     bool pathExes = g_settings.includePathExes; // captured on the UI thread
-    g_indexThread = std::thread([pathExes]{
+    g_indexThread = std::thread([pathExes, full]{
         SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
         std::vector<AppEntry> fresh;
-        BuildAppIndex(fresh, pathExes, &g_indexStop);
+        BuildAppIndex(fresh, pathExes, &g_indexStop, /*skipHeavy=*/!full);
         if (!g_indexStop.load()) {
             auto* old = g_pendingIndex.exchange(
                 new std::vector<AppEntry>(std::move(fresh)));
@@ -495,8 +555,12 @@ static void PlacePalette() {
 }
 
 static void ShowPalette() {
+    EnsureSettingsLists();
+    EnsureGdiplus();
+    EnsureAppFonts();
+    EnableRoundCorners(g_hwndPalette);
     if (!g_indexReady.load() && !g_indexing.load())
-        BuildIndexAsync();
+        BuildIndexAsync(true); // cache miss during use: full scan now
     DeactivateBang();
     DeactivateFileMode();
     g_chips.clear();
@@ -1182,6 +1246,7 @@ static void ExecuteChip(int idx) {
         g_awakeOn = !g_awakeOn;
         ApplyAwake();
         g_settings.awakeOn = g_awakeOn;
+        EnsureSettingsLists(); // palette shown => loaded, but guard pre-save anyway
         SaveSettings(g_settings);
         UpdateResults(); // refresh the chip title, stay open
         return;
@@ -1639,7 +1704,7 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
             }
             break;
         case VK_F5:
-            BuildIndexAsync();
+            BuildIndexAsync(true); // manual rescan: full pass incl. PowerShell
             return 0;
         }
     }
@@ -1927,7 +1992,8 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             16, 9, kWidth - 32, 30,
             hwnd, (HMENU)1, g_hInst, NULL);
         SendMessageW(g_hwndEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search");
-        SendMessageW(g_hwndEdit, WM_SETFONT, (WPARAM)g_fontInput, TRUE);
+        if (g_fontInput) // fonts are lazy now: applied in EnsureAppFonts on first show
+            SendMessageW(g_hwndEdit, WM_SETFONT, (WPARAM)g_fontInput, TRUE);
         SendMessageW(g_hwndEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
                      MAKELPARAM(Dpx(10), Dpx(10)));
         SetWindowSubclass(g_hwndEdit, EditSubclass, 1, 0);
@@ -2105,7 +2171,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     case WM_DPICHANGED: {
         g_dpi = HIWORD(w);
         UpdateLayoutMetrics();
-        CreateAppFonts();
+        if (g_appFontsReady) CreateAppFonts(); // lazy: nothing to rebuild pre-first-show
         RECT* pr = (RECT*)l; // system-suggested rect for the new DPI
         SetWindowPos(hwnd, HWND_TOPMOST, pr->left, pr->top,
                      pr->right - pr->left, pr->bottom - pr->top,
@@ -2152,6 +2218,17 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         if (IsWindowVisible(hwnd)) UpdateResults();
         break;
     }
+    case WM_TIMER:
+        if (w == IDT_DEFERRED_REFRESH) {
+            KillTimer(hwnd, IDT_DEFERRED_REFRESH);
+            g_startupDeferredArmed = false;
+            // Single light refresh after boot settles. Skipped if the user
+            // already triggered a scan (hotkey cache-miss / manual refresh).
+            if (!g_quitting.load() && !g_indexing.load() && g_indexReady.load())
+                BuildIndexAsync(false);
+            break;
+        }
+        break;
     case WM_TRAYICON:
         if (LOWORD(l) == WM_RBUTTONUP || LOWORD(l) == WM_CONTEXTMENU)
             ShowTrayMenu(hwnd);
@@ -2376,6 +2453,9 @@ static void DarkTitleBar(HWND hwnd) {
 
 static void OpenSettings() {
     if (g_hwndSettings) { ShowWindow(g_hwndSettings, SW_SHOW); SetForegroundWindow(g_hwndSettings); return; }
+    EnsureSettingsLists();
+    EnsureAppFonts();
+    EnsureComCtl(); // listview/tab classes needed below; deferred past boot
     int W = 600, H = 590;
     POINT pt{}; GetCursorPos(&pt); // open on the monitor being used
     HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
@@ -2424,6 +2504,7 @@ static void ReadHiddenFromList() {
 
 // Every change persists immediately: there is no Save button.
 static void SaveNow() {
+    EnsureSettingsLists(); // never persist defaults over real lists
     SaveSettings(g_settings);
     RebuildHiddenSet();
     if (g_hwndSavedLabel) {
@@ -3024,7 +3105,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             ListView_EditLabel(g_hwndQuickList, row);
         } else if (id == IDC_RESCAN) {
             g_indexReady.store(false);
-            BuildIndexAsync();
+            BuildIndexAsync(true); // manual rescan: full pass
             MessageBoxW(hwnd, L"Rescanning Start Menu in the background.",
                         L"SneekPeek", MB_OK | MB_ICONINFORMATION);
         } else if (id == IDC_CLOSE) {
@@ -3056,16 +3137,18 @@ static void OnTrayCommand(UINT id) {
     case ID_TRAY_SETTINGS: OpenSettings(); break;
     case ID_TRAY_REFRESH:
         g_indexReady.store(false);
-        BuildIndexAsync();
+        BuildIndexAsync(true); // manual refresh: full pass incl. PowerShell
         break;
     case ID_TRAY_AWAKE:
         g_awakeOn = !g_awakeOn;
         ApplyAwake();
         g_settings.awakeOn = g_awakeOn;
+        EnsureSettingsLists();
         SaveSettings(g_settings);
         break;
     case ID_TRAY_STARTUP:
         g_settings.runAtStartup = !g_settings.runAtStartup;
+        EnsureSettingsLists();
         SaveSettings(g_settings);
         ApplyRunAtStartup(g_settings.runAtStartup);
         break;
@@ -3079,8 +3162,13 @@ static void OnTrayCommand(UINT id) {
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     g_hInst = hInst;
     srand((unsigned)GetTickCount()); // random bang colors for new entries
-    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
-    Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, NULL);
+    // NOTE: GDI+ startup is lazy (EnsureGdiplus on first show) so gdiplus.dll
+    // stays out of the logon path. comctl32 init is lazy too (OpenSettings).
+
+    // Autostart launches with --tray (see ApplyRunAtStartup in settings.h).
+    // A startup launch must do almost nothing: no scan, no font/GDI/DLL work.
+    bool launchedAtStartup = (cmd != NULL &&
+        (wcsstr(cmd, L"--tray") != NULL || wcsstr(cmd, L"/tray") != NULL));
 
     // Single instance: forward to the running copy.
     HANDLE mutex = CreateMutexW(NULL, FALSE, kMutexName);
@@ -3097,30 +3185,26 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
             f((DPI_AWARENESS_CONTEXT)-4 /* PER_MONITOR_AWARE_V2 */);
         FreeLibrary(u);
     }
-    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES};
-    InitCommonControlsEx(&icc);
 
-    LoadSettings(g_settings);
-    RebuildHiddenSet();
+    // Boot-cheap settings: General section only (~10 INI reads). Lists
+    // (hidden/bangs/quicks) load on first interactive use via EnsureSettingsLists.
+    LoadSettingsCore(g_settings);
+    RebuildHiddenSet(); // empty until lists load; rebuilt by EnsureSettingsLists
     g_awakeOn = g_settings.awakeOn;
     if (g_awakeOn) ApplyAwake(); // restore the held-awake state silently
-    if (LoadAppCache(AppCachePath(), g_apps)) {
-        g_indexReady.store(true); // instant results; a refresh follows shortly
-        std::thread([] { // deferred: let cold start settle first
-            Sleep(5000);
-            if (!g_quitting.load()) BuildIndexAsync();
-        }).detach();
-    }
+    // Disk cache serves instant results with zero scan cost at logon.
+    bool cacheLoaded = LoadAppCache(AppCachePath(), g_apps);
+    if (cacheLoaded)
+        g_indexReady.store(true);
 
-    // Fonts scale with the monitor DPI (rebuilt on WM_DPICHANGED); brushes
-    // are solid colors, DPI-independent.
+    // Fonts are lazy (EnsureAppFonts on first show); brushes are solid
+    // colors, DPI-independent. DPI read itself is one cached query.
     {
         HDC screen = GetDC(NULL);
         g_dpi = GetDeviceCaps(screen, LOGPIXELSY);
         ReleaseDC(NULL, screen);
     }
     UpdateLayoutMetrics();
-    CreateAppFonts();
     g_brBg = CreateSolidBrush(kBg);
     g_brInput = CreateSolidBrush(kInput);
     g_brSel = CreateSolidBrush(kSel);
@@ -3195,7 +3279,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
         0, 0, kWidth, kInputH + kItemH,
         NULL, NULL, hInst, NULL);
     if (!g_hwndPalette) return 1;
-    EnableRoundCorners(g_hwndPalette);
+    // NOTE: no EnableRoundCorners here (dwmapi load deferred to first show).
 
     if (!RegisterHotKey(g_hwndPalette, HOTKEY_ID, MOD_CONTROL | MOD_NOREPEAT, VK_SPACE)) {
         MessageBoxW(NULL,
@@ -3205,9 +3289,18 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     }
     AddTrayIcon(g_hwndPalette);
 
-    // Warm the index in the background so the first Ctrl+Space is instant.
-    // Costs one short burst; afterwards the thread exits (0% CPU).
-    BuildIndexAsync();
+    if (launchedAtStartup && cacheLoaded) {
+        // Startup + warm cache: serve everything from cache, do zero scan
+        // work inside the startup window. One light refresh (no PowerShell
+        // child) fires after boot settles; the WM_TIMER handler skips it if
+        // the user already triggered a scan meanwhile.
+        SetTimer(g_hwndPalette, IDT_DEFERRED_REFRESH, DEFERRED_REFRESH_MS, NULL);
+        g_startupDeferredArmed = true;
+    } else {
+        // Interactive launch, or cold cache: full scan now so the first
+        // Ctrl+Space is complete. Manual Refresh / F5 always use this path.
+        BuildIndexAsync(true);
+    }
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
@@ -3219,6 +3312,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     }
 
     g_quitting.store(true); // deferred startup work must stand down too
+    if (g_hwndPalette) KillTimer(g_hwndPalette, IDT_DEFERRED_REFRESH);
     g_indexStop.store(true); // stop the indexer, then join it (bounded: ~2s)
     if (g_indexThread.joinable()) g_indexThread.join();
     delete g_pendingIndex.exchange(nullptr); // published but never consumed
@@ -3229,7 +3323,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     DeleteObject(g_brBg); DeleteObject(g_brInput); DeleteObject(g_brSel);
     if (g_hIconBig) DestroyIcon(g_hIconBig);
     if (g_hIconSmall) DestroyIcon(g_hIconSmall);
-    Gdiplus::GdiplusShutdown(g_gdiplusToken);
+    if (g_gdiplusStarted) Gdiplus::GdiplusShutdown(g_gdiplusToken);
     CloseHandle(mutex);
     return (int)msg.wParam;
 }

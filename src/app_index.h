@@ -21,8 +21,13 @@ struct ScoredApp {
 // Scan Start Menu + Store apps + optional PATH exes. Runs once, on first hotkey.
 // Initializes COM on the calling thread (needed for .lnk resolve + Store enum).
 // `stop`, when set mid-scan, abandons remaining phases promptly.
+// `skipHeavy`, when true, runs the light pass only (.lnk + primary Store
+// enum): the PowerShell Get-StartApps phase and the fallback Store enum are
+// skipped. Used for the automatic post-boot refresh so logon stays cheap;
+// manual Refresh / F5 / cache-miss scans run the full pass.
 void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes,
-                   const std::atomic<bool>* stop = nullptr);
+                   const std::atomic<bool>* stop = nullptr,
+                   bool skipHeavy = false);
 
 // Build a double-null-terminated Unicode child environment block: the parent
 // block plus name=value (replacing any same-named entry), sorted

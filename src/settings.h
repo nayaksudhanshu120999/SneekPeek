@@ -97,8 +97,15 @@ inline std::wstring JoinPipe(const std::vector<std::wstring>& v) {
     return s;
 }
 
-inline void LoadSettings(Settings& s) {
+// Boot-cheap core: General section only (a handful of INI reads) plus
+// in-memory defaults for the lists, so the palette works before the full
+// lists are loaded. Call LoadSettingsLists() (via EnsureSettingsLists in
+// main.cpp) on first interactive use.
+inline void LoadSettingsCore(Settings& s) {
     s.bangs = DefaultBangs();
+    // Seed one example so the feature is discoverable until lists load.
+    s.quicks = {{L"Gmail", L"https://mail.google.com"}};
+    s.hiddenApps.clear();
     std::wstring ini = SettingsPath();
     wchar_t buf[4096];
     GetPrivateProfileStringW(L"General", L"EngineUrl", s.engineUrl.c_str(),
@@ -109,6 +116,19 @@ inline void LoadSettings(Settings& s) {
     if (buf[0]) s.engineName = buf;
     GetPrivateProfileStringW(L"General", L"BrowserPath", L"", buf, 4096, ini.c_str());
     s.browserPath = buf;
+    s.includePathExes = GetPrivateProfileIntW(L"General", L"IncludePathExes", 0, ini.c_str()) != 0;
+    s.runAtStartup = GetPrivateProfileIntW(L"General", L"RunAtStartup", 0, ini.c_str()) != 0;
+    s.awakeOn = GetPrivateProfileIntW(L"General", L"Awake", 0, ini.c_str()) != 0;
+    s.fileGrid = GetPrivateProfileIntW(L"General", L"FileGrid", 1, ini.c_str()) != 0;
+    s.gridRows = ClampGridRows(GetPrivateProfileIntW(L"General", L"GridRows", 3, ini.c_str()));
+    s.gridCols = ClampGridCols(GetPrivateProfileIntW(L"General", L"GridCols", 5, ini.c_str()));
+}
+
+// Deferred lists: hidden apps + bangs + quick links (dozens of INI reads).
+// Runs once on first palette show / Settings open / pre-save, never at boot.
+inline void LoadSettingsLists(Settings& s) {
+    std::wstring ini = SettingsPath();
+    wchar_t buf[4096];
     int hcount = GetPrivateProfileIntW(L"General", L"HiddenCount", -1, ini.c_str());
     if (hcount >= 0) {
         s.hiddenApps.clear();
@@ -122,12 +142,6 @@ inline void LoadSettings(Settings& s) {
         GetPrivateProfileStringW(L"General", L"HiddenApps", L"", buf, 4096, ini.c_str());
         s.hiddenApps = SplitPipe(buf); // legacy single-value format
     }
-    s.includePathExes = GetPrivateProfileIntW(L"General", L"IncludePathExes", 0, ini.c_str()) != 0;
-    s.runAtStartup = GetPrivateProfileIntW(L"General", L"RunAtStartup", 0, ini.c_str()) != 0;
-    s.awakeOn = GetPrivateProfileIntW(L"General", L"Awake", 0, ini.c_str()) != 0;
-    s.fileGrid = GetPrivateProfileIntW(L"General", L"FileGrid", 1, ini.c_str()) != 0;
-    s.gridRows = ClampGridRows(GetPrivateProfileIntW(L"General", L"GridRows", 3, ini.c_str()));
-    s.gridCols = ClampGridCols(GetPrivateProfileIntW(L"General", L"GridCols", 5, ini.c_str()));
 
     int count = GetPrivateProfileIntW(L"Bangs", L"Count", 0, ini.c_str());
     count = ClampCustomCount(count); // clamp, never drop all
@@ -144,21 +158,27 @@ inline void LoadSettings(Settings& s) {
         if (!custom.empty()) s.bangs = std::move(custom);
     }
 
-    // -1 = never configured: seed one example so the feature is discoverable.
+    // -1 = never configured: keep the seeded example from LoadSettingsCore.
     int qcount = GetPrivateProfileIntW(L"Quick", L"Count", -1, ini.c_str());
-    if (qcount < 0) {
-        s.quicks = {{L"Gmail", L"https://mail.google.com"}};
-    } else if (qcount > 0) {
+    if (qcount > 0) {
         qcount = ClampCustomCount(qcount);
+        s.quicks.clear();
         wchar_t key[32];
         for (int i = 0; i < qcount; i++) {
-            swprintf_s(key, 32, L"Quick%d", i);
+            swprintf_s(key, 32, L"Quick%d", (int)i);
             GetPrivateProfileStringW(L"Quick", key, L"", buf, 4096, ini.c_str());
             if (!buf[0]) continue;
             QuickLink q;
             if (ParseQuickLine(buf, q)) s.quicks.push_back(std::move(q));
         }
+    } else if (qcount == 0) {
+        s.quicks.clear();
     }
+}
+
+inline void LoadSettings(Settings& s) {
+    LoadSettingsCore(s);
+    LoadSettingsLists(s);
 }
 
 inline void SaveSettings(const Settings& s) {

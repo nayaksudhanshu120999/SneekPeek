@@ -407,7 +407,7 @@ static void ScanStartAppsPS(std::vector<AppEntry>& out, const std::atomic<bool>*
 }
 
 void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes,
-                   const std::atomic<bool>* stop) {
+                   const std::atomic<bool>* stop, bool skipHeavy) {
     out.clear();
     out.reserve(900);
 
@@ -422,10 +422,12 @@ void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes,
         ScanLnkDir(buf, out);
     ScanStoreApps(out);
     if (stop && stop->load()) { if (com) CoUninitialize(); return; }
-    ScanStoreAppsFallback(out); // second COM route; dedupe merges overlaps
-    if (stop && stop->load()) { if (com) CoUninitialize(); return; }
-    ScanStartAppsPS(out, stop); // PowerShell Start list; dedupe merges
-    if (stop && stop->load()) { if (com) CoUninitialize(); return; }
+    if (!skipHeavy) {
+        ScanStoreAppsFallback(out); // second COM route; dedupe merges overlaps
+        if (stop && stop->load()) { if (com) CoUninitialize(); return; }
+        ScanStartAppsPS(out, stop); // PowerShell Start list; dedupe merges
+        if (stop && stop->load()) { if (com) CoUninitialize(); return; }
+    }
     if (includePathExes)
         ScanPathExes(out);
 

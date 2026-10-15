@@ -30,11 +30,26 @@ if(MINGW)
     target_link_options(SneekPeek PRIVATE -static -mwindows -municode)
 endif()
 
+# MSVC: delay-load rarely-used DLLs so the loader maps less at logon
+# (gdiplus paints chips, comdlg32 is Browse-only, powrprof/comctl32 load on
+# first use). Needs delayimp.lib; MinGW keeps eager linking.
+if(MSVC)
+    target_link_libraries(SneekPeek PRIVATE delayimp)
+    target_link_options(SneekPeek PRIVATE
+        "/DELAYLOAD:gdiplus.dll"
+        "/DELAYLOAD:comdlg32.dll"
+        "/DELAYLOAD:powrprof.dll"
+        "/DELAYLOAD:comctl32.dll"
+    )
+endif()
+
 # MSVC: Windows GUI subsystem, no console window. /MANIFEST:NO because our
 # own manifest (visual styles) comes from src/app.rc — otherwise the linker's
 # auto-generated manifest collides with it (CVT1100 duplicate resource).
+# NOTE: target_link_options (append), not set_target_properties LINK_OPTIONS
+# (replace), so the /DELAYLOAD flags above survive.
 if(MSVC)
-    set_target_properties(SneekPeek PROPERTIES LINK_OPTIONS "/SUBSYSTEM:WINDOWS;/MANIFEST:NO")
+    target_link_options(SneekPeek PRIVATE "/SUBSYSTEM:WINDOWS" "/MANIFEST:NO")
 endif()
 
 # Predictable output path so CI can upload it: build/bin/SneekPeek.exe
