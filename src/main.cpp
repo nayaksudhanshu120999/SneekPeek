@@ -53,6 +53,7 @@
 #include "settings.h"
 #include "syspages.h"
 #include "results.h"
+#include "verbs.h"
 #include "resource.h"
 
 #pragma comment(lib, "user32.lib")
@@ -157,6 +158,25 @@ static std::wstring GetWindowString(HWND h) {
     GetWindowTextW(h, s.data(), n + 1);
     s.resize((size_t)n);
     return s;
+}
+// Clipboard write shared by calc-copy, menu Copy verbs, and drag helpers.
+// (NULL owner: placed before the globals; equivalent for task clipboard.)
+static void CopyTextToClipboard(const std::wstring& t) {
+    if (t.empty()) return;
+    if (!OpenClipboard(NULL)) return;
+    EmptyClipboard();
+    size_t bytes = (t.size() + 1) * sizeof(wchar_t);
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (h) {
+        if (void* p = GlobalLock(h)) {
+            memcpy(p, t.c_str(), bytes);
+            GlobalUnlock(h);
+            SetClipboardData(CF_UNICODETEXT, h);
+        } else {
+            GlobalFree(h); // lock failed: don't leak, nothing copied
+        }
+    }
+    CloseClipboard();
 }
 static COLORREF Darken(COLORREF c, int pct) {
     return RGB(GetRValue(c) * pct / 100,
@@ -428,6 +448,10 @@ static std::wstring LVGetCell(HWND lv, int row, int col);
 static void ApplyRoundCorners();
 static void EnableRoundCorners(HWND hwnd);
 static void RunPower(PowerOp op);
+static void EnsureOle();
+static void ArmRowDrag(int resultsIdx, POINT pt);
+static void MoveRowDrag(HWND h, POINT pt);
+static void CancelRowDrag();
 
 // ------------------------------------------------------------- index thread
 // Publish pattern: the worker builds into a fresh vector, swaps it into an
@@ -624,6 +648,7 @@ static void ShowPalette() {
     EnsureSettingsLists();
     EnsureGdiplus();
     EnsureAppFonts();
+    EnsureOle(); // drag-out / drop-in need UI-thread OLE, lazily past boot
     EnableRoundCorners(g_hwndPalette);
     if (!g_indexReady.load() && !g_indexing.load())
         BuildIndexAsync(true); // cache miss during use: full scan now
@@ -1365,22 +1390,7 @@ static void ExecuteSelected(bool forceWeb) {
         if (!typed.empty()) q = typed;
     }
 
-    auto CopyText = [](const std::wstring& t) {
-        if (!OpenClipboard(g_hwndPalette)) return;
-        EmptyClipboard();
-        size_t bytes = (t.size() + 1) * sizeof(wchar_t);
-        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if (h) {
-            if (void* p = GlobalLock(h)) {
-                memcpy(p, t.c_str(), bytes);
-                GlobalUnlock(h);
-                SetClipboardData(CF_UNICODETEXT, h);
-            } else {
-                GlobalFree(h); // lock failed: don't leak, nothing copied
-            }
-        }
-        CloseClipboard();
-    };
+    auto CopyText = [](const std::wstring& t) { CopyTextToClipboard(t); };
 
     // Bang-chip mode: the armed site always wins (Shift+Enter = engine instead).
     if (const Bang* b = ActiveBang()) {
@@ -1612,6 +1622,29 @@ static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
     if (m == WM_MOUSEWHEEL) {
         WheelScrollList(GET_WHEEL_DELTA_WPARAM(w));
         return 0;
+    }
+    // Drag-out arming: default click selection first, then track moves past
+    // the system drag threshold (files, folders, drives, classic app targets).
+    if (m == WM_LBUTTONDOWN) {
+        LRESULT r = DefSubclassProc(h, m, w, l);
+        int idx = (int)SendMessageW(h, LB_ITEMFROMPOINT, 0, l);
+        if (HIWORD(idx) == 0) {
+            LRESULT data = SendMessageW(h, LB_GETITEMDATA, LOWORD(idx), 0);
+            POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+            ArmRowDrag((data >= 0 && data < (LRESULT)g_results.size())
+                           ? (int)data : -1, pt);
+        } else {
+            CancelRowDrag();
+        }
+        return r;
+    }
+    if (m == WM_MOUSEMOVE) {
+        POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+        MoveRowDrag(h, pt);
+        return DefSubclassProc(h, m, w, l);
+    }
+    if (m == WM_LBUTTONUP) {
+        CancelRowDrag();
     }
     return DefSubclassProc(h, m, w, l);
 }
@@ -2069,17 +2102,646 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             EnsureVisible(idx);
             InvalidateRect(hwnd, NULL, FALSE);
         }
+        POINT dpt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+        ArmRowDrag(idx, dpt); // files/folders/drives arm a drag-out
         SetFocus(g_hwndEdit);
         return 0;
     }
     case WM_LBUTTONDBLCLK:
+        CancelRowDrag();
         ExecuteSelected(false);
         return 0;
+    case WM_MOUSEMOVE: {
+        POINT dpt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+        MoveRowDrag(hwnd, dpt);
+        break;
+    }
     case WM_MOUSEWHEEL: // wheel over tiles moves through them
         WheelScrollList(GET_WHEEL_DELTA_WPARAM(w));
         return 0;
     }
     return DefWindowProcW(hwnd, m, w, l);
+}
+
+// ------------------------------------------------------- context menus
+// Dark owner-drawn popup menus (same black/rounded language as the palette:
+// kBg rows, kSel highlight, kText/kSub text, g_fontUI, category accent bar).
+// One builder serves row menus, the palette menu, and the tray menu.
+// Row target rides in g_menuRow; menu item data carries the g_menuItems index.
+struct DarkMenuItem {
+    std::wstring text;
+    COLORREF accent = RGB(150, 150, 155);
+    UINT wID = 0; // 0 = separator (never returned)
+    bool separator = false;
+    bool checked = false;
+    bool disabled = false;
+};
+static std::vector<DarkMenuItem> g_menuItems;
+static int g_menuW = 200;
+static bool g_inMenu = false;  // suppress dismiss-while-menu-open
+static bool g_dragging = false; // suppress dismiss-while-dragging
+static int g_menuRow = -1;
+static const UINT kMenuVerbBase = 3000;   // wID = base + (int)VerbId
+static const UINT kMenuEngineBase = 3200; // wID = base + engine index
+static void ShowPaletteMenu(int x, int y); // defined below ShowRowMenu
+
+struct EnginePreset { const wchar_t* name; const wchar_t* url; };
+static const EnginePreset kEnginePresets[] = {
+    {L"DuckDuckGo", L"https://duckduckgo.com/?q=%s"},
+    {L"Google", L"https://www.google.com/search?q=%s"},
+    {L"Bing", L"https://www.bing.com/search?q=%s"},
+    {L"Brave", L"https://search.brave.com/search?q=%s"},
+};
+
+static void SizeMenuItems() {
+    g_menuW = Dpx(120);
+    if (g_menuItems.empty() || !g_fontUI) return;
+    HDC dc = GetDC(NULL);
+    if (!dc) return;
+    HGDIOBJ old = SelectObject(dc, g_fontUI);
+    for (const auto& it : g_menuItems) {
+        if (it.separator) continue;
+        RECT r{0, 0, 0, 0};
+        DrawTextW(dc, it.text.c_str(), -1, &r, DT_SINGLELINE | DT_CALCRECT);
+        int w = (r.right - r.left) + kPadX * 2 + Dpx(40);
+        if (w > g_menuW) g_menuW = w;
+    }
+    SelectObject(dc, old);
+    ReleaseDC(NULL, dc);
+    if (g_menuW > Dpx(320)) g_menuW = Dpx(320);
+}
+
+static HMENU BuildMenuPopup(size_t begin, size_t end) {
+    HMENU m = CreatePopupMenu();
+    if (!m) return NULL;
+    for (size_t i = begin; i < end && i < g_menuItems.size(); i++) {
+        MENUITEMINFOW mi{};
+        mi.cbSize = sizeof(mi);
+        mi.fMask = MIIM_FTYPE | MIIM_ID | MIIM_DATA | MIIM_STATE;
+        mi.fType = MFT_OWNERDRAW; // separators too: system lines are light-themed
+        mi.wID = g_menuItems[i].wID;
+        mi.dwItemData = (ULONG_PTR)i;
+        mi.fState = g_menuItems[i].disabled ? MFS_GRAYED : MFS_ENABLED;
+        InsertMenuItemW(m, (UINT)(i - begin), TRUE, &mi);
+    }
+    return m;
+}
+
+static void DrawDarkMenuItem(const DRAWITEMSTRUCT* d) {
+    size_t ix = (size_t)d->itemData;
+    HDC dc = d->hDC;
+    bool sel = (d->itemState & ODS_SELECTED) != 0;
+    if (ix >= g_menuItems.size()) { FillRect(dc, &d->rcItem, g_brBg); return; }
+    const DarkMenuItem& it = g_menuItems[ix];
+    bool dis = it.disabled;
+    FillRect(dc, &d->rcItem, (sel && !dis) ? g_brSel : g_brBg);
+    if (it.separator) {
+        int y = (d->rcItem.top + d->rcItem.bottom) / 2;
+        GlyphLine(dc, d->rcItem.left + kPadX, y, d->rcItem.right - kPadX, y,
+                  1, RGB(44, 44, 46));
+        return;
+    }
+    // Category accent bar, like the result rows.
+    int bx = d->rcItem.left + kPadX;
+    HBRUSH bar = CreateSolidBrush(dis ? Darken(it.accent, 40) : it.accent);
+    RECT br{bx, d->rcItem.top + Dpx(7), bx + Dpx(2), d->rcItem.bottom - Dpx(7)};
+    FillRect(dc, &br, bar);
+    DeleteObject(bar);
+    // Check tick (engine choice, startup toggle): two strokes, no glyph font.
+    int tx = bx + Dpx(10);
+    if (it.checked) {
+        COLORREF tc = dis ? kSub : it.accent;
+        int cy = (d->rcItem.top + d->rcItem.bottom) / 2;
+        GlyphLine(dc, tx, cy, tx + Dpx(4), cy + Dpx(4), 2, tc);
+        GlyphLine(dc, tx + Dpx(4), cy + Dpx(4), tx + Dpx(10), cy - Dpx(4), 2, tc);
+    }
+    RECT tr = d->rcItem; tr.left = tx + Dpx(16);
+    SetBkMode(dc, TRANSPARENT);
+    if (g_fontUI) SelectObject(dc, g_fontUI);
+    SetTextColor(dc, dis ? kSub : (sel ? kText : RGB(218, 218, 226)));
+    DrawTextW(dc, it.text.c_str(), -1, &tr,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+static int TrackDarkMenu(HMENU m, int x, int y) {
+    if (!m || !g_hwndPalette) return 0;
+    SetForegroundWindow(g_hwndPalette); // menu dismisses correctly
+    g_inMenu = true;
+    int cmd = (int)TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                    x, y, g_hwndPalette, NULL);
+    g_inMenu = false;
+    PostMessageW(g_hwndPalette, WM_NULL, 0, 0); // restore focus hygiene
+    return cmd;
+}
+
+// Row -> verb context (drive/removable resolved here, registry-free).
+static VerbCtx CtxForRow(const ResultItem& r) {
+    VerbCtx c;
+    c.kind = r.kind;
+    if (r.kind == ResultKind::App) {
+        c.isStore = r.isStore;
+        c.hasPath = !r.action.empty();
+    } else if (r.kind == ResultKind::File) {
+        c.glyph = FileGlyphFor(r.title, false).style;
+        c.hasPath = !r.action.empty();
+    } else if (r.kind == ResultKind::Folder) {
+        c.hasPath = !r.action.empty();
+        c.isDrive = IsDriveRootDir(r.action);
+        if (c.isDrive) {
+            UINT t = GetDriveTypeW(r.action.c_str());
+            c.isRemovable = (t == DRIVE_REMOVABLE || t == DRIVE_CDROM);
+        }
+    }
+    return c;
+}
+
+static bool ShellVerbOn(const std::wstring& path, const wchar_t* verb, bool hideFirst) {
+    if (path.empty()) return false;
+    if (hideFirst) HidePalette(); // hide first: never wait for the target
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_DEFAULT;
+    sei.lpVerb = verb;
+    sei.lpFile = path.c_str();
+    sei.nShow = SW_SHOWNORMAL;
+    return ShellExecuteExW(&sei) != FALSE;
+}
+
+static void HideAppRow(const ResultItem& r) {
+    EnsureSettingsLists(); // SaveSettings rewrites every section
+    std::wstring low = ToLower(r.title);
+    for (const auto& n : g_settings.hiddenApps)
+        if (ToLower(n) == low) { UpdateResults(); return; } // already hidden
+    g_settings.hiddenApps.push_back(r.title);
+    SaveSettings(g_settings);
+    RebuildHiddenSet();
+    RefreshAppsListPreservingChecks();
+    UpdateResults(); // stay open, list refreshes without the app
+}
+
+static void ApplyEnginePreset(int idx) {
+    if (idx < 0 || idx >= (int)(sizeof(kEnginePresets) / sizeof(kEnginePresets[0])))
+        return;
+    EnsureSettingsLists(); // SaveSettings rewrites every section
+    g_settings.engineName = kEnginePresets[(size_t)idx].name;
+    g_settings.engineUrl = kEnginePresets[(size_t)idx].url;
+    SaveSettings(g_settings);
+    UpdateResults();
+}
+
+static void RunRowVerb(int rowIdx, VerbId verb) {
+    if (rowIdx < 0 || rowIdx >= (int)g_results.size()) return;
+    ResultItem r = g_results[(size_t)rowIdx]; // copy: some verbs rebuild results
+    g_chipsFocus = false;
+    switch (verb) {
+    case VerbId::Open:
+        SendMessageW(g_hwndList, LB_SETCURSEL, rowIdx, 0);
+        ExecuteSelected(false);
+        return;
+    case VerbId::CopyPath:
+        CopyTextToClipboard(r.action);
+        return;
+    case VerbId::CopyName:
+        CopyTextToClipboard(r.title);
+        return;
+    case VerbId::CopyUrl:
+        CopyTextToClipboard(r.action);
+        return;
+    case VerbId::CopyResult:
+        CopyTextToClipboard(r.action);
+        return;
+    case VerbId::RunAsAdmin: {
+        HidePalette();
+        SHELLEXECUTEINFOW sei{};
+        sei.cbSize = sizeof(sei);
+        sei.lpVerb = L"runas";
+        sei.lpFile = r.action.c_str();
+        sei.nShow = SW_SHOWNORMAL;
+        if (!ShellExecuteExW(&sei) && GetLastError() != ERROR_CANCELLED)
+            NotifyLaunchFailed(L"Could not launch as administrator");
+        return;
+    }
+    case VerbId::OpenLocation: {
+        HidePalette();
+        std::wstring params = L"/select,\"" + r.action + L"\"";
+        if ((UINT_PTR)ShellExecuteW(NULL, L"open", L"explorer.exe", params.c_str(),
+                                    NULL, SW_SHOWNORMAL) <= 32)
+            NotifyLaunchFailed(L"Could not reveal the file");
+        return;
+    }
+    case VerbId::OpenNewWindow:
+        HidePalette();
+        if ((UINT_PTR)ShellExecuteW(NULL, L"open", r.action.c_str(), NULL, NULL,
+                                    SW_SHOWNORMAL) <= 32)
+            NotifyLaunchFailed(L"Could not open the folder");
+        return;
+    case VerbId::OpenWith: {
+        HidePalette();
+        std::wstring args = L"shell32.dll,OpenAs_RunDLL \"" + r.action + L"\"";
+        if ((UINT_PTR)ShellExecuteW(NULL, L"open", L"rundll32.exe", args.c_str(),
+                                    NULL, SW_SHOWNORMAL) <= 32)
+            NotifyLaunchFailed(L"Could not open the picker");
+        return;
+    }
+    case VerbId::Print:
+        if (!ShellVerbOn(r.action, L"print", true))
+            NotifyLaunchFailed(L"Could not print");
+        return;
+    case VerbId::SetWallpaper:
+        HidePalette();
+        SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, (PVOID)r.action.c_str(),
+                              SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+        return;
+    case VerbId::ExtractAll: {
+        HidePalette();
+        SHELLEXECUTEINFOW sei{};
+        sei.cbSize = sizeof(sei);
+        sei.lpVerb = L"ExtractAll";
+        sei.lpFile = r.action.c_str();
+        sei.nShow = SW_SHOWNORMAL;
+        if (!ShellExecuteExW(&sei)) // no handler: just open the archive
+            ShellExecuteW(NULL, L"open", r.action.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        return;
+    }
+    case VerbId::Eject:
+        HidePalette(); // Safely-Remove dialog; always present, no failure mode
+        ShellExecuteW(NULL, L"open", L"rundll32.exe",
+                      L"shell32.dll,Control_RunDLL hotplug.dll", NULL, SW_SHOWNORMAL);
+        return;
+    case VerbId::Properties: {
+        SHELLEXECUTEINFOW sei{};
+        sei.cbSize = sizeof(sei);
+        sei.fMask = SEE_MASK_INVOKEIDLIST;
+        sei.lpVerb = L"properties";
+        sei.lpFile = r.action.c_str();
+        sei.nShow = SW_SHOWNORMAL;
+        ShellExecuteExW(&sei); // modeless dialog: palette dismissal is automatic
+        return;
+    }
+    case VerbId::HideApp:
+        HideAppRow(r);
+        return;
+    case VerbId::ManageBangs:
+    case VerbId::OpenSettings:
+        OpenSettings();
+        return;
+    case VerbId::RefreshApps:
+        g_indexReady.store(false);
+        BuildIndexAsync(true);
+        return;
+    case VerbId::ToggleStartup:
+        g_settings.runAtStartup = !g_settings.runAtStartup;
+        EnsureSettingsLists();
+        SaveSettings(g_settings);
+        ApplyRunAtStartup(g_settings.runAtStartup);
+        return;
+    case VerbId::Quit:
+        DestroyWindow(g_hwndPalette);
+        return;
+    default:
+        return; // SwitchEngine is a submenu parent, never dispatched
+    }
+}
+
+static void ShowRowMenu(int row, int x, int y) {
+    if (row < 0 || row >= (int)g_results.size()) return;
+    const ResultItem& rr = g_results[(size_t)row];
+    auto verbs = VerbsFor(CtxForRow(rr));
+    if (verbs.empty()) { /* fall through to palette menu below */ }
+    else {
+        // Highlight the target without mirroring it into the box:
+        // right-click must never rewrite the query.
+        SendMessageW(g_hwndList, LB_SETCURSEL, row, 0);
+        InvalidateRect(g_hwndList, NULL, FALSE);
+        if (!g_chips.empty()) InvalidateRect(g_hwndChipRow, NULL, FALSE);
+        g_menuRow = row;
+        g_menuItems.clear();
+        size_t subAt = (size_t)-1;
+        for (VerbId v : verbs) {
+            DarkMenuItem it;
+            if (v == VerbId::Open && rr.kind == ResultKind::File) {
+                GlyphStyle gs = FileGlyphFor(rr.title, false).style;
+                it.text = (gs == GlyphStyle::Audio || gs == GlyphStyle::Video)
+                    ? L"Play" : VerbLabel(v);
+            } else {
+                it.text = VerbLabel(v);
+            }
+            it.accent = rr.color;
+            it.wID = kMenuVerbBase + (UINT)v;
+            if (v == VerbId::SwitchEngine) subAt = g_menuItems.size();
+            g_menuItems.push_back(std::move(it));
+        }
+        size_t parentEnd = g_menuItems.size(); // sub-items append after this
+        HMENU hSub = NULL;
+        if (subAt != (size_t)-1) {
+            size_t base = g_menuItems.size();
+            for (size_t i = 0; i < sizeof(kEnginePresets) / sizeof(kEnginePresets[0]); i++) {
+                DarkMenuItem it;
+                it.text = kEnginePresets[i].name;
+                it.accent = kWebCol;
+                it.wID = kMenuEngineBase + (UINT)i;
+                it.checked = (g_settings.engineName == kEnginePresets[i].name);
+                g_menuItems.push_back(std::move(it));
+            }
+            hSub = BuildMenuPopup(base, g_menuItems.size());
+        }
+        SizeMenuItems();
+        HMENU hMenu = CreatePopupMenu();
+        for (size_t i = 0; i < parentEnd; i++) {
+            MENUITEMINFOW mi{};
+            mi.cbSize = sizeof(mi);
+            mi.fMask = MIIM_FTYPE | MIIM_ID | MIIM_DATA | MIIM_STATE;
+            mi.fType = MFT_OWNERDRAW;
+            mi.wID = g_menuItems[i].wID;
+            mi.dwItemData = (ULONG_PTR)i;
+            mi.fState = MFS_ENABLED;
+            if (i == subAt && hSub) { mi.fMask |= MIIM_SUBMENU; mi.hSubMenu = hSub; }
+            InsertMenuItemW(hMenu, (UINT)i, TRUE, &mi);
+        }
+        int cmd = TrackDarkMenu(hMenu, x, y);
+        DestroyMenu(hMenu); // owned submenu goes with it
+        if (cmd >= (int)kMenuEngineBase && cmd < (int)kMenuEngineBase + 16)
+            ApplyEnginePreset(cmd - (int)kMenuEngineBase);
+        else if (cmd >= (int)kMenuVerbBase && cmd < (int)kMenuVerbBase + 256)
+            RunRowVerb(g_menuRow, (VerbId)(cmd - (int)kMenuVerbBase));
+        g_menuRow = -1;
+        return;
+    }
+    // No verbs (headers): palette menu instead.
+    ShowPaletteMenu(x, y);
+}
+
+static void ShowPaletteMenu(int x, int y) {
+    DarkMenuItem rf{L"Refresh apps", kAppCol, ID_TRAY_REFRESH};
+    DarkMenuItem st{L"Settings...", kSetCol, ID_TRAY_SETTINGS};
+    DarkMenuItem su{L"Run at startup", kCalcCol, ID_TRAY_STARTUP};
+    su.checked = g_settings.runAtStartup;
+    DarkMenuItem qu{L"Quit", RGB(255, 90, 90), ID_TRAY_QUIT};
+    g_menuRow = -1;
+    g_menuItems.clear();
+    g_menuItems.push_back(std::move(rf));
+    g_menuItems.push_back(std::move(st));
+    g_menuItems.push_back(std::move(su));
+    g_menuItems.push_back(std::move(qu));
+    SizeMenuItems();
+    HMENU hMenu = BuildMenuPopup(0, g_menuItems.size());
+    int cmd = TrackDarkMenu(hMenu, x, y);
+    DestroyMenu(hMenu);
+    if (cmd >= (int)ID_TRAY_SETTINGS && cmd <= (int)ID_TRAY_AWAKE)
+        OnTrayCommand((UINT)cmd);
+}
+
+#include <objidl.h> // IDataObject for file drag-out
+#include <oleidl.h> // IDropSource/IDropTarget, DoDragDrop, RegisterDragDrop
+
+// ------------------------------------------------------- OLE drag and drop
+// Lazy OleInitialize on the UI thread (first palette show): drag-out ships
+// files as CF_HDROP, drop-in browses dropped folders / pastes file paths.
+// Copy-only: the source is never deleted.
+static bool g_oleInit = false;
+static IDropTarget* g_dropTarget = nullptr;
+static bool g_dragArmed = false;
+static POINT g_dragPt{};
+static int g_dragRow = -1;
+
+class HdropDataObject : public IDataObject {
+    LONG m_ref = 1;
+    std::wstring m_path;
+public:
+    explicit HdropDataObject(const std::wstring& p) : m_path(p) {}
+    STDMETHODIMP QueryInterface(REFIID riid, void** pp) {
+        if (!pp) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDataObject) {
+            *pp = static_cast<IDataObject*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *pp = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() { return (ULONG)InterlockedIncrement(&m_ref); }
+    STDMETHODIMP_(ULONG) Release() {
+        LONG r = InterlockedDecrement(&m_ref);
+        if (!r) delete this;
+        return (ULONG)r;
+    }
+    STDMETHODIMP GetData(FORMATETC* f, STGMEDIUM* m) {
+        if (!f || !m) return E_INVALIDARG;
+        if (f->cfFormat != CF_HDROP || !(f->tymed & TYMED_HGLOBAL))
+            return DV_E_FORMATETC;
+        size_t chars = m_path.size() + 2; // path + double null
+        HGLOBAL h = GlobalAlloc(GHND | GMEM_SHARE, sizeof(DROPFILES) +
+                                                     chars * sizeof(wchar_t));
+        if (!h) return E_OUTOFMEMORY;
+        DROPFILES* df = (DROPFILES*)GlobalLock(h);
+        if (!df) { GlobalFree(h); return E_OUTOFMEMORY; }
+        df->pFiles = sizeof(DROPFILES);
+        df->fWide = TRUE;
+        wchar_t* dst = (wchar_t*)((BYTE*)df + sizeof(DROPFILES));
+        memcpy(dst, m_path.c_str(), (m_path.size() + 1) * sizeof(wchar_t));
+        dst[m_path.size() + 1] = L'\0';
+        GlobalUnlock(h);
+        m->tymed = TYMED_HGLOBAL;
+        m->hGlobal = h;
+        m->pUnkForRelease = nullptr;
+        return S_OK;
+    }
+    STDMETHODIMP GetDataHere(FORMATETC*, STGMEDIUM*) { return E_NOTIMPL; }
+    STDMETHODIMP QueryGetData(FORMATETC* f) {
+        if (!f) return E_INVALIDARG;
+        return (f->cfFormat == CF_HDROP && (f->tymed & TYMED_HGLOBAL))
+            ? S_OK : DV_E_FORMATETC;
+    }
+    STDMETHODIMP GetCanonicalFormatEtc(FORMATETC*, FORMATETC* out) {
+        if (!out) return E_INVALIDARG;
+        return DATA_S_SAMEFORMATETC;
+    }
+    STDMETHODIMP SetData(FORMATETC*, STGMEDIUM*, BOOL) { return E_NOTIMPL; }
+    STDMETHODIMP EnumFormatEtc(DWORD, IEnumFORMATETC**) { return E_NOTIMPL; }
+    STDMETHODIMP DAdvise(FORMATETC*, DWORD, IAdviseSink*, DWORD*) {
+        return OLE_E_ADVISENOTSUPPORTED;
+    }
+    STDMETHODIMP DUnadvise(DWORD) { return OLE_E_ADVISENOTSUPPORTED; }
+    STDMETHODIMP EnumDAdvise(IEnumSTATDATA**) { return OLE_E_ADVISENOTSUPPORTED; }
+};
+
+class DropSource : public IDropSource {
+    LONG m_ref = 1;
+public:
+    STDMETHODIMP QueryInterface(REFIID riid, void** pp) {
+        if (!pp) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDropSource) {
+            *pp = static_cast<IDropSource*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *pp = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() { return (ULONG)InterlockedIncrement(&m_ref); }
+    STDMETHODIMP_(ULONG) Release() {
+        LONG r = InterlockedDecrement(&m_ref);
+        if (!r) delete this;
+        return (ULONG)r;
+    }
+    STDMETHODIMP QueryContinueDrag(BOOL esc, DWORD keyState) {
+        if (esc) return DRAGDROP_S_CANCEL;
+        if (!(keyState & MK_LBUTTON)) return DRAGDROP_S_DROP;
+        return S_OK;
+    }
+    STDMETHODIMP GiveFeedback(DWORD) { return DRAGDROP_S_USEDEFAULTCURSORS; }
+};
+
+static bool HasHdrop(IDataObject* o) {
+    if (!o) return false;
+    FORMATETC f{};
+    f.cfFormat = CF_HDROP;
+    f.dwAspect = DVASPECT_CONTENT;
+    f.lindex = -1;
+    f.tymed = TYMED_HGLOBAL;
+    return o->QueryGetData(&f) == S_OK;
+}
+
+static void DropPathsOnPalette(HDROP h) {
+    if (!h || !g_hwndPalette || !IsWindowVisible(g_hwndPalette)) return;
+    if (DragQueryFileW(h, 0xFFFFFFFF, NULL, 0) < 1) return;
+    std::vector<wchar_t> buf(32768);
+    if (!DragQueryFileW(h, 0, buf.data(), (UINT)buf.size())) return;
+    std::wstring path = buf.data();
+    if (path.empty()) return;
+    DWORD attr = GetFileAttributesW(path.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        ActivateFileMode(path); // browse the dropped folder
+        return;
+    }
+    g_changingEdit = true; // paste the path as the query (no refilter yet)
+    SetWindowTextW(g_hwndEdit, path.c_str());
+    SendMessageW(g_hwndEdit, EM_SETSEL, (WPARAM)path.size(), (LPARAM)path.size());
+    g_changingEdit = false;
+    UpdateResults();
+}
+
+class PaletteDropTarget : public IDropTarget {
+    LONG m_ref = 1;
+public:
+    STDMETHODIMP QueryInterface(REFIID riid, void** pp) {
+        if (!pp) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDropTarget) {
+            *pp = static_cast<IDropTarget*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *pp = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() { return (ULONG)InterlockedIncrement(&m_ref); }
+    STDMETHODIMP_(ULONG) Release() {
+        LONG r = InterlockedDecrement(&m_ref);
+        if (!r) delete this;
+        return (ULONG)r;
+    }
+    STDMETHODIMP DragEnter(IDataObject* o, DWORD, POINTL, DWORD* eff) {
+        if (!eff) return E_INVALIDARG;
+        *eff = HasHdrop(o) ? (*eff & DROPEFFECT_COPY) : DROPEFFECT_NONE;
+        return S_OK;
+    }
+    STDMETHODIMP DragOver(DWORD, POINTL, DWORD* eff) {
+        if (!eff) return E_INVALIDARG;
+        // Effect was validated on DragEnter; keep offering copy.
+        *eff = DROPEFFECT_COPY;
+        return S_OK;
+    }
+    STDMETHODIMP DragLeave() { return S_OK; }
+    STDMETHODIMP Drop(IDataObject* o, DWORD, POINTL, DWORD* eff) {
+        if (!eff) return E_INVALIDARG;
+        *eff = DROPEFFECT_NONE;
+        if (!HasHdrop(o)) return E_FAIL;
+        FORMATETC f{};
+        f.cfFormat = CF_HDROP;
+        f.dwAspect = DVASPECT_CONTENT;
+        f.lindex = -1;
+        f.tymed = TYMED_HGLOBAL;
+        STGMEDIUM m{};
+        if (FAILED(o->GetData(&f, &m))) return E_FAIL;
+        DropPathsOnPalette((HDROP)m.hGlobal);
+        ReleaseStgMedium(&m);
+        *eff = DROPEFFECT_COPY;
+        return S_OK;
+    }
+};
+
+static void EnsureOle() {
+    if (g_oleInit) return;
+    if (FAILED(OleInitialize(NULL))) return;
+    g_oleInit = true;
+    if (!g_dropTarget && g_hwndPalette) {
+        PaletteDropTarget* t = new (std::nothrow) PaletteDropTarget();
+        if (!t) return;
+        if (FAILED(RegisterDragDrop(g_hwndPalette, t))) {
+            t->Release();
+            return;
+        }
+        g_dropTarget = t; // RegisterDragDrop holds its own reference
+    }
+}
+
+// Only real filesystem paths start drags: files, folders, drive roots, and
+// classic (non-Store) app targets (.lnk/.exe). Everything else ignores moves.
+static bool DragPathForRow(int idx, std::wstring& out) {
+    if (idx < 0 || idx >= (int)g_results.size()) return false;
+    const ResultItem& r = g_results[(size_t)idx];
+    if (r.action.empty()) return false;
+    if (r.kind == ResultKind::File || r.kind == ResultKind::Folder) {
+        out = r.action;
+        return true;
+    }
+    if (r.kind == ResultKind::App && !r.isStore) {
+        out = r.action;
+        return true;
+    }
+    return false;
+}
+
+static void ArmRowDrag(int resultsIdx, POINT pt) {
+    CancelRowDrag();
+    std::wstring dummy;
+    if (!DragPathForRow(resultsIdx, dummy)) return;
+    g_dragArmed = true;
+    g_dragPt = pt;
+    g_dragRow = resultsIdx;
+}
+
+static void MoveRowDrag(HWND, POINT pt) {
+    if (!g_dragArmed) return;
+    if (!(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) { CancelRowDrag(); return; }
+    int dx = GetSystemMetrics(SM_CXDRAG), dy = GetSystemMetrics(SM_CYDRAG);
+    int mx = pt.x - g_dragPt.x; if (mx < 0) mx = -mx;
+    int my = pt.y - g_dragPt.y; if (my < 0) my = -my;
+    if (mx < dx && my < dy) return;
+    int row = g_dragRow;
+    CancelRowDrag();
+    std::wstring path;
+    if (!DragPathForRow(row, path)) return;
+    EnsureOle(); // belt-and-braces: ShowPalette already called it
+    if (!g_oleInit) return;
+    HdropDataObject* data = new (std::nothrow) HdropDataObject(path);
+    DropSource* src = new (std::nothrow) DropSource();
+    if (!data || !src) {
+        if (data) data->Release();
+        if (src) src->Release();
+        return;
+    }
+    g_dragging = true; // modal loop activates other apps: don't dismiss
+    DWORD eff = 0;
+    DoDragDrop(data, src, DROPEFFECT_COPY, &eff);
+    g_dragging = false;
+    data->Release();
+    src->Release();
+}
+
+static void CancelRowDrag() {
+    g_dragArmed = false;
+    g_dragRow = -1;
 }
 
 // ------------------------------------------------------------- palette wndproc
@@ -2207,6 +2869,14 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_MEASUREITEM: {
         MEASUREITEMSTRUCT* mi = (MEASUREITEMSTRUCT*)l;
+        if (mi->CtlType == ODT_MENU) {
+            // Dark popup menu (tray + context): separators slim, verbs compact.
+            size_t ix = (size_t)mi->itemData;
+            bool sep = ix < g_menuItems.size() && g_menuItems[ix].separator;
+            mi->itemHeight = (UINT)(sep ? Dpx(9) : Dpx(30));
+            mi->itemWidth = (UINT)g_menuW;
+            return TRUE;
+        }
         // Items are added in g_results order, so the listbox index matches
         // the results index at measure time. Headers stay slim.
         size_t id = (mi->itemID == (UINT)-1) ? (size_t)-1 : (size_t)mi->itemID;
@@ -2216,6 +2886,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_DRAWITEM: {
         DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)l;
+        if (d->CtlType == ODT_MENU) { DrawDarkMenuItem(d); return TRUE; }
         if (d->CtlID != 2) break;
         bool sel = (d->itemState & ODS_SELECTED) != 0;
         HDC dc = d->hDC;
@@ -2264,7 +2935,9 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_ACTIVATE:
         // Click-outside-to-dismiss. Child focus keeps the top-level active,
-        // so typing never hides. Settings is exempt.
+        // so typing never hides. Settings is exempt. Open menus and modal
+        // drag loops own their activation: never dismiss under them.
+        if (g_inMenu || g_dragging) break;
         if (LOWORD(w) == WA_INACTIVE) {
             HWND now = (HWND)l;
             if (now != g_hwndSettings && !IsChild(g_hwndSettings, now))
@@ -2273,7 +2946,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         break;
     case WM_ACTIVATEAPP:
         // App switch / click onto another app always dismisses.
-        if (!w && IsWindowVisible(hwnd))
+        if (!w && IsWindowVisible(hwnd) && !g_inMenu && !g_dragging)
             HidePalette();
         break;
     case WM_DPICHANGED: {
@@ -2314,6 +2987,41 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     case WM_APP_SHOW:
         ShowPalette();
         break;
+    case WM_CONTEXTMENU: {
+        // Right-click anywhere on the palette: row menu on a result,
+        // palette menu on headers and empty areas. (The edit box shows its
+        // native Cut/Copy/Paste menu via its own proc and never reaches here.)
+        POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+        if (pt.x == -1 && pt.y == -1) GetCursorPos(&pt); // keyboard: use cursor
+        POINT cl = pt;
+        ScreenToClient(hwnd, &cl);
+        int row = -1;
+        if (GridActive() && g_hwndFileGrid && IsWindowVisible(g_hwndFileGrid)) {
+            RECT gr; GetWindowRect(g_hwndFileGrid, &gr);
+            MapWindowPoints(NULL, hwnd, (POINT*)&gr, 2);
+            if (PtInRect(&gr, cl))
+                row = GridHitTest(cl.x - gr.left, cl.y - gr.top);
+        }
+        if (row < 0 && g_hwndList && IsWindowVisible(g_hwndList)) {
+            RECT lr; GetWindowRect(g_hwndList, &lr);
+            MapWindowPoints(NULL, hwnd, (POINT*)&lr, 2);
+            if (PtInRect(&lr, cl)) {
+                LPARAM lp = MAKELPARAM(cl.x - lr.left, cl.y - lr.top);
+                LRESULT hit = SendMessageW(g_hwndList, LB_ITEMFROMPOINT, 0, lp);
+                if (HIWORD(hit) == 0) {
+                    LRESULT data = SendMessageW(g_hwndList, LB_GETITEMDATA,
+                                                LOWORD(hit), 0);
+                    if (data >= 0 && data < (LRESULT)g_results.size())
+                        row = (int)data;
+                }
+            }
+        }
+        if (row >= 0 && g_results[(size_t)row].kind != ResultKind::Header)
+            ShowRowMenu(row, pt.x, pt.y);
+        else
+            ShowPaletteMenu(pt.x, pt.y);
+        return 0;
+    }
     case WM_APP_INDEX: { // background index published: adopt on the UI thread
         auto* p = g_pendingIndex.exchange(nullptr);
         if (p) {
@@ -2346,6 +3054,11 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             ShowPalette(); // retry after a launch-failure balloon
         break;
     case WM_DESTROY:
+        if (g_dropTarget) { // revoke while the window still exists
+            RevokeDragDrop(hwnd);
+            g_dropTarget->Release();
+            g_dropTarget = nullptr;
+        }
         RemoveTrayIcon(hwnd);
         PostQuitMessage(0);
         break;
@@ -2388,19 +3101,38 @@ static void RemoveTrayIcon(HWND hwnd) {
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 static void ShowTrayMenu(HWND hwnd) {
-    HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, ID_TRAY_SETTINGS, L"Settings...");
-    AppendMenuW(menu, MF_STRING, ID_TRAY_REFRESH, L"Refresh apps");
-    AppendMenuW(menu, MF_STRING | (g_awakeOn ? MF_CHECKED : MF_UNCHECKED),
-                ID_TRAY_AWAKE, L"Keep screen awake");
-    AppendMenuW(menu, MF_STRING | (g_settings.runAtStartup ? MF_CHECKED : MF_UNCHECKED),
-                ID_TRAY_STARTUP, L"Run at startup");
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, ID_TRAY_QUIT, L"Quit");
+    // Same dark owner-drawn language as the in-palette menus (the stock
+    // system menu was light and off-theme). Identifiers stay ID_TRAY_* so
+    // OnTrayCommand dispatch is unchanged.
+    EnsureAppFonts(); // tray can open before the palette ever shows
+    DarkMenuItem st{L"Settings...", kSetCol, ID_TRAY_SETTINGS};
+    DarkMenuItem rf{L"Refresh apps", kAppCol, ID_TRAY_REFRESH};
+    DarkMenuItem aw{L"Keep screen awake", kAwakeCol, ID_TRAY_AWAKE};
+    aw.checked = g_awakeOn;
+    DarkMenuItem su{L"Run at startup", kCalcCol, ID_TRAY_STARTUP};
+    su.checked = g_settings.runAtStartup;
+    DarkMenuItem sep; sep.separator = true;
+    DarkMenuItem qu{L"Quit", RGB(255, 90, 90), ID_TRAY_QUIT};
+    g_menuRow = -1;
+    g_menuItems.clear();
+    g_menuItems.push_back(std::move(st));
+    g_menuItems.push_back(std::move(rf));
+    g_menuItems.push_back(std::move(aw));
+    g_menuItems.push_back(std::move(su));
+    g_menuItems.push_back(std::move(sep));
+    g_menuItems.push_back(std::move(qu));
+    SizeMenuItems();
+    HMENU menu = BuildMenuPopup(0, g_menuItems.size());
     POINT pt; GetCursorPos(&pt);
     SetForegroundWindow(hwnd); // required for the menu to dismiss correctly
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, NULL);
+    g_inMenu = true;
+    int cmd = (int)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON |
+                                    TPM_BOTTOMALIGN, pt.x, pt.y, hwnd, NULL);
+    g_inMenu = false;
+    PostMessageW(hwnd, WM_NULL, 0, 0);
     DestroyMenu(menu);
+    if (cmd >= (int)ID_TRAY_SETTINGS && cmd <= (int)ID_TRAY_AWAKE)
+        OnTrayCommand((UINT)cmd);
 }
 
 // ------------------------------------------------------------- settings UI
@@ -3425,6 +4157,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     if (g_indexThread.joinable()) g_indexThread.join();
     delete g_pendingIndex.exchange(nullptr); // published but never consumed
     UnregisterHotKey(g_hwndPalette, HOTKEY_ID);
+    if (g_oleInit) OleUninitialize(); // drop-target revoked in WM_DESTROY
+    g_oleInit = false;
     SetThreadExecutionState(ES_CONTINUOUS); // release any Awake hold
     DeleteObject(g_fontInput); DeleteObject(g_fontTitle);
     DeleteObject(g_fontSub); DeleteObject(g_fontChip); DeleteObject(g_fontGrid); DeleteObject(g_fontUI);

@@ -13,6 +13,7 @@
 #include "minjson.h"
 #include "settings.h"
 #include "results.h"
+#include "verbs.h"
 #include "app_index.h"
 
 static int g_fail = 0;
@@ -314,6 +315,47 @@ int main() {
             };
             SortDrivesByRank(d, L"");
             CHECK(d.size() == 2 && d[0].root == L"F:\\" && d[1].root == L"G:\\");
+        }
+        // context-menu verbs: pure mapping per area and file type
+        {
+            auto has = [](const std::vector<VerbId>& vv, VerbId id) {
+                for (auto x : vv) if (x == id) return true;
+                return false;
+            };
+            VerbCtx app; app.kind = ResultKind::App; app.hasPath = true;
+            auto va = VerbsFor(app);
+            CHECK(has(va, VerbId::Open) && has(va, VerbId::RunAsAdmin));
+            CHECK(has(va, VerbId::HideApp) && !has(va, VerbId::Eject));
+            VerbCtx store = app; store.isStore = true;
+            auto vs = VerbsFor(store);
+            CHECK(has(vs, VerbId::Open) && !has(vs, VerbId::RunAsAdmin) &&
+                  !has(vs, VerbId::CopyPath));
+            VerbCtx drv; drv.kind = ResultKind::Folder; drv.isDrive = true;
+            drv.hasPath = true;
+            CHECK(!has(VerbsFor(drv), VerbId::Eject));
+            drv.isRemovable = true;
+            CHECK(has(VerbsFor(drv), VerbId::Eject));
+            VerbCtx exe; exe.kind = ResultKind::File; exe.glyph = GlyphStyle::Exe;
+            exe.hasPath = true;
+            CHECK(has(VerbsFor(exe), VerbId::RunAsAdmin));
+            VerbCtx pic = exe; pic.glyph = GlyphStyle::Picture;
+            CHECK(has(VerbsFor(pic), VerbId::SetWallpaper) &&
+                  !has(VerbsFor(pic), VerbId::RunAsAdmin));
+            VerbCtx au = exe; au.glyph = GlyphStyle::Audio;
+            auto vau = VerbsFor(au);
+            CHECK(has(vau, VerbId::Open) && has(vau, VerbId::OpenWith) &&
+                  !has(vau, VerbId::SetWallpaper));
+            VerbCtx doc = exe; doc.glyph = GlyphStyle::Pdf;
+            CHECK(has(VerbsFor(doc), VerbId::Print));
+            VerbCtx web; web.kind = ResultKind::Web;
+            CHECK(has(VerbsFor(web), VerbId::SwitchEngine));
+            VerbCtx calc; calc.kind = ResultKind::Calc;
+            auto vc = VerbsFor(calc);
+            CHECK(vc.size() == 1 && vc[0] == VerbId::CopyResult);
+            VerbCtx head; head.kind = ResultKind::Header;
+            CHECK(VerbsFor(head).empty());
+            CHECK(VerbLabel(VerbId::Open)[0] != L'\0' &&
+                  VerbLabel(VerbId::Quit)[0] != L'\0');
         }
         // app search already ranks by position (regression pin)
         CHECK(FuzzyScore(L"c++ projects", L"++") > FuzzyScore(L"c file dev c++", L"++"));

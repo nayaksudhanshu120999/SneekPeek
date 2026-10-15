@@ -27,6 +27,8 @@ Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 | `12*8` | calculator (Enter copies result; undefined math like `1/0` shows nothing) |
 | `:` + `Space` | names-only file browser (hidden items excluded): drives show as `Name (C:)` — type to filter, `Space`/`Enter` on a folder drills in (stays open), `Space`/`Enter` on a file opens it; slim bottom bar + `Shift+Enter` opens the current folder in Explorer; long lists scroll with `↑` `↓` or mouse wheel (no scrollbar); grid view by default; `..` / empty-box `Backspace` goes up, `x` or drive-level `Backspace` exits — one folder scanned at a time, no sizes/icons/recursion |
 | `↑` `↓` | move selection (mirrors into the box without refiltering; wraps past either end back to your typed text; Up from the first row jumps back to the chips), `Enter` open, `Shift+Enter` force web search, `Esc` dismiss, `F5` rescan apps |
+| Right-click | dark context menu on any row (Open / Run as administrator / Open file location / Copy path / Properties / Hide app…, per-type: Play, Open with…, Eject, Extract all…, engine switch), palette menu on headers and empty areas, same theme as the tray menu |
+| Drag & drop | drag files, folders, drives, or classic app targets out of the list/grid into Explorer (copy-only); drop a folder onto the palette to browse it, drop a file to paste its path |
 
 Bang aliases are editable in Settings (default: `yt`/`youtube`, `gh`/`github`, `w`/`wiki`, `r`, `m`, `t`, `a`, `x`, `so`, `d`, `g` — each with its own color).
 
