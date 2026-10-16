@@ -526,6 +526,8 @@ static void UpdateFileResults(const std::wstring& filter);
 static void ExecuteFileSelected(bool inExplorer);
 static void OpenPathList(const std::vector<std::wstring>& paths);
 static void MultiClear();
+static bool MultiHas(int idx);
+static std::vector<int> MultiRows();
 static std::wstring SystemExe(const wchar_t* name);
 static void RebuildListControl();
 static int CurrentSelection();
