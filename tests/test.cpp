@@ -484,6 +484,47 @@ int main() {
         CHECK(!LoadAppCache(L"Z:\\no\\such\\file.bin", c));
         DeleteFileW(f.c_str());
     }
+    // theme defaults + auto-fit grid columns + multi-select membership
+    {
+        Theme d = DefaultTheme();
+        CHECK(d.bg == RGB(0, 0, 0) && d.text == RGB(240, 240, 240));
+        CHECK(d.sel == RGB(28, 28, 30) && d.folder == RGB(251, 191, 36));
+        CHECK(d == DefaultTheme() && !(d != DefaultTheme()));
+        Theme other = d;
+        other.text = RGB(0, 0, 0);
+        CHECK(other != d);
+        // auto-widen: setting is a maximum, narrow clients drop columns
+        CHECK(EffectiveGridCols(496, 5, 110) == 4);
+        CHECK(EffectiveGridCols(496, 2, 110) == 2);
+        CHECK(EffectiveGridCols(600, 5, 110) == 5);
+        CHECK(EffectiveGridCols(100, 5, 110) == 1);
+        CHECK(EffectiveGridCols(0, 5, 110) == 5);
+        CHECK(EffectiveGridCols(496, 0, 110) == 1);
+        // multi-select membership: files/folders/drives yes, ".."/headers/apps no
+        ResultItem f{ResultKind::File, L"a.txt", L"", L"C:\\a.txt", RGB(0, 0, 0)};
+        ResultItem d2{ResultKind::Folder, L"docs", L"", L"C:\\docs", RGB(0, 0, 0)};
+        ResultItem drv{ResultKind::Folder, L"Win (C:)", L"", L"C:\\", RGB(0, 0, 0)};
+        ResultItem up{ResultKind::Folder, L"..", L"", L"C:\\", RGB(0, 0, 0)};
+        ResultItem hd{ResultKind::Header, L"C:\\ - 3 items", L"", L"", RGB(0, 0, 0)};
+        ResultItem ap{ResultKind::App, L"Notepad", L"", L"C:\\n.lnk", RGB(0, 0, 0)};
+        CHECK(MultiKeySelectable(f) && MultiKeySelectable(d2) && MultiKeySelectable(drv));
+        CHECK(!MultiKeySelectable(up) && !MultiKeySelectable(hd) && !MultiKeySelectable(ap));
+        std::vector<ResultItem> items = {hd, f, d2, up, drv};
+        std::set<std::wstring> sel;
+        MultiToggle(sel, f.action);
+        CHECK(sel.size() == 1);
+        MultiToggle(sel, f.action); // toggles off
+        CHECK(sel.empty());
+        MultiRangeAdd(sel, items, 1, 4); // file + folder + drive, skips ".."
+        CHECK(sel.size() == 3 && sel.count(L"C:\\a.txt") && sel.count(L"C:\\docs") &&
+              sel.count(L"C:\\"));
+        auto rows = MultiMemberRows(sel, items);
+        CHECK(rows.size() == 3 && rows[0] == 1 && rows[1] == 2 && rows[2] == 4);
+        MultiRangeAdd(sel, items, 99, -5); // clamped to the same range
+        CHECK(sel.size() == 3);
+        std::set<std::wstring> empty;
+        CHECK(MultiMemberRows(empty, items).empty());
+    }
     if (g_fail == 0) printf("ALL TESTS PASSED\n");
     return g_fail ? 1 : 0;
 }

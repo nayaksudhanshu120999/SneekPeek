@@ -34,6 +34,49 @@ inline int ClampGridCols(int n) {
     return n > 7 ? 7 : n;
 }
 
+// Effective grid columns: the Settings value is a maximum, auto-widened down
+// when tiles would get too narrow for their labels (drive names like
+// "APPLICATION (E:)" must never clip mid-glyph). Pure, unit-tested.
+inline int EffectiveGridCols(int clientW, int wantCols, int minTileW) {
+    if (wantCols < 1) wantCols = 1;
+    if (clientW <= 0 || minTileW <= 0) return wantCols;
+    int fit = clientW / minTileW;
+    if (fit < 1) fit = 1;
+    return fit < wantCols ? fit : wantCols;
+}
+
+// ------------------------------------------------- palette theme (Settings > Theme)
+// Every palette color is user-editable: background, search field, selection,
+// text, secondary text, plus all category accents. Stored in [Theme] as
+// #RRGGBB; anything malformed falls back to the default below.
+struct Theme {
+    COLORREF bg    = RGB(0, 0, 0);
+    COLORREF input = RGB(0, 0, 0);
+    COLORREF sel   = RGB(28, 28, 30);
+    COLORREF text  = RGB(240, 240, 240);
+    COLORREF sub   = RGB(130, 130, 135);
+    COLORREF app   = RGB(96, 165, 250);
+    COLORREF web   = RGB(46, 224, 158);
+    COLORREF calc  = RGB(251, 191, 36);
+    COLORREF hint  = RGB(110, 110, 115);
+    COLORREF set   = RGB(45, 212, 191);
+    COLORREF awake = RGB(45, 212, 191);
+    COLORREF file  = RGB(96, 165, 250);
+    COLORREF folder = RGB(251, 191, 36);
+    COLORREF quick = RGB(255, 95, 170);
+};
+
+inline Theme DefaultTheme() { return Theme(); }
+
+inline bool operator==(const Theme& a, const Theme& b) {
+    return a.bg == b.bg && a.input == b.input && a.sel == b.sel &&
+           a.text == b.text && a.sub == b.sub && a.app == b.app &&
+           a.web == b.web && a.calc == b.calc && a.hint == b.hint &&
+           a.set == b.set && a.awake == b.awake && a.file == b.file &&
+           a.folder == b.folder && a.quick == b.quick;
+}
+inline bool operator!=(const Theme& a, const Theme& b) { return !(a == b); }
+
 inline bool ParseQuickLine(const std::wstring& line, QuickLink& out) {
     size_t p = line.find(L'|');
     if (p == std::wstring::npos) return false;
@@ -57,6 +100,7 @@ struct Settings {
     int gridCols = 5;              // grid tile columns, 2-7 (file grid only)
     bool includePathExes = false;
     bool runAtStartup = false;
+    Theme theme = DefaultTheme();
 };
 
 inline std::wstring SettingsPath() {
@@ -122,6 +166,27 @@ inline void LoadSettingsCore(Settings& s) {
     s.fileGrid = GetPrivateProfileIntW(L"General", L"FileGrid", 1, ini.c_str()) != 0;
     s.gridRows = ClampGridRows(GetPrivateProfileIntW(L"General", L"GridRows", 3, ini.c_str()));
     s.gridCols = ClampGridCols(GetPrivateProfileIntW(L"General", L"GridCols", 5, ini.c_str()));
+    // Theme: every key falls back to its default when missing or malformed,
+    // so a hand-edited or older INI can never produce an unreadable palette.
+    {
+        Theme d = DefaultTheme();
+        struct Key { const wchar_t* name; COLORREF* field; COLORREF def; };
+        Key keys[] = {
+            {L"Bg", &s.theme.bg, d.bg}, {L"Input", &s.theme.input, d.input},
+            {L"Sel", &s.theme.sel, d.sel}, {L"Text", &s.theme.text, d.text},
+            {L"Sub", &s.theme.sub, d.sub}, {L"App", &s.theme.app, d.app},
+            {L"Web", &s.theme.web, d.web}, {L"Calc", &s.theme.calc, d.calc},
+            {L"Hint", &s.theme.hint, d.hint}, {L"Set", &s.theme.set, d.set},
+            {L"Awake", &s.theme.awake, d.awake}, {L"File", &s.theme.file, d.file},
+            {L"Folder", &s.theme.folder, d.folder}, {L"Quick", &s.theme.quick, d.quick},
+        };
+        for (const auto& k : keys) {
+            GetPrivateProfileStringW(L"Theme", k.name, SerializeColor(k.def).c_str(),
+                                     buf, 4096, ini.c_str());
+            COLORREF c;
+            *k.field = (buf[0] && ParseColor(buf, c)) ? c : k.def;
+        }
+    }
 }
 
 // Deferred lists: hidden apps + bangs + quick links (dozens of INI reads).
@@ -208,6 +273,21 @@ inline void SaveSettings(const Settings& s) {
         swprintf_s(nc, 16, L"%d", s.gridCols);
         WritePrivateProfileStringW(L"General", L"GridRows", nr, ini.c_str());
         WritePrivateProfileStringW(L"General", L"GridCols", nc, ini.c_str());
+    }
+    {
+        struct Key { const wchar_t* name; COLORREF field; };
+        Key keys[] = {
+            {L"Bg", s.theme.bg}, {L"Input", s.theme.input},
+            {L"Sel", s.theme.sel}, {L"Text", s.theme.text},
+            {L"Sub", s.theme.sub}, {L"App", s.theme.app},
+            {L"Web", s.theme.web}, {L"Calc", s.theme.calc},
+            {L"Hint", s.theme.hint}, {L"Set", s.theme.set},
+            {L"Awake", s.theme.awake}, {L"File", s.theme.file},
+            {L"Folder", s.theme.folder}, {L"Quick", s.theme.quick},
+        };
+        for (const auto& k : keys)
+            WritePrivateProfileStringW(L"Theme", k.name, SerializeColor(k.field).c_str(),
+                                       ini.c_str());
     }
     size_t nbangs = s.bangs.size() < (size_t)kMaxCustomEntries
         ? s.bangs.size() : (size_t)kMaxCustomEntries;

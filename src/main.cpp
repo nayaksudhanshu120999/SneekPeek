@@ -38,6 +38,7 @@
 #include <wchar.h>
 #include <string>
 #include <vector>
+#include <set>
 #include <unordered_set>
 #include <unordered_map>
 #include <algorithm>
@@ -133,7 +134,11 @@ enum {
     IDC_VIEW_LIST = 204, IDC_VIEW_GRID = 205,
     IDC_ROWS_DEC = 206, IDC_ROWS_INC = 207,
     IDC_COLS_DEC = 208, IDC_COLS_INC = 209,
-    IDC_PAGE_0 = 301, IDC_PAGE_1, IDC_PAGE_2, IDC_PAGE_3, IDC_PAGE_4,
+    IDC_PAGE_0 = 301, IDC_PAGE_1, IDC_PAGE_2, IDC_PAGE_3, IDC_PAGE_4, IDC_PAGE_5,
+    IDC_THEME_BG = 401, IDC_THEME_INPUT, IDC_THEME_SEL, IDC_THEME_TEXT,
+    IDC_THEME_SUB, IDC_THEME_APP, IDC_THEME_WEB, IDC_THEME_CALC,
+    IDC_THEME_HINT, IDC_THEME_SET, IDC_THEME_AWAKE, IDC_THEME_FILE,
+    IDC_THEME_FOLDER, IDC_THEME_QUICK, IDC_THEME_RESET,
 };
 
 // ------------------------------------------------------------- small helpers
@@ -234,8 +239,13 @@ static HWND        g_hwndCellEdit = NULL; // in-place table cell editor
 static int         g_cellLv = 0;   // 1 = bangs table, 2 = quick table
 static int         g_cellRow = -1;
 static int         g_cellCol = 0;
-static std::vector<HWND> g_pageGeneral, g_pageApps, g_pageBangs, g_pageQuick, g_pageFiles;
+static std::vector<HWND> g_pageGeneral, g_pageApps, g_pageBangs, g_pageQuick, g_pageFiles,
+    g_pageTheme;
 static bool        g_fillingSettings = false;
+// Theme swatches (Settings > Theme), one button per Theme color, same order
+// as kThemeFields below. Custom Colors dialog memory for ChooseColor.
+static HWND        g_themeBtn[14] = {};
+static DWORD       g_themeCustom[16] = {};
 static HFONT       g_fontInput = NULL;
 static HFONT       g_fontTitle = NULL;
 static HFONT       g_fontSub = NULL;
@@ -278,6 +288,32 @@ static void CreateAppFonts() {
     g_fontUI = CreateFontW(-MulDiv(9, dpiY, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    // Row-height floor from the real font metrics: at any DPI the title text
+    // must fit its row with padding, so glyphs can never clip vertically or
+    // overlap. UpdateLayoutMetrics() owns the DPI base; this only raises it.
+    {
+        HDC dc = GetDC(NULL);
+        if (dc) {
+            TEXTMETRICW tm{};
+            if (g_fontTitle) {
+                HGDIOBJ old = SelectObject(dc, g_fontTitle);
+                if (GetTextMetricsW(dc, &tm)) {
+                    int need = tm.tmHeight + Dpx(16);
+                    if (need > kItemH) kItemH = need;
+                }
+                SelectObject(dc, old);
+            }
+            if (g_fontSub) {
+                HGDIOBJ old = SelectObject(dc, g_fontSub);
+                if (GetTextMetricsW(dc, &tm)) {
+                    int need = tm.tmHeight + Dpx(10);
+                    if (need > kHeadH) kHeadH = need;
+                }
+                SelectObject(dc, old);
+            }
+            ReleaseDC(NULL, dc);
+        }
+    }
     g_appFontsReady = true;
 }
 static void RefreshEditLineH(); // defined with the layout helpers below
@@ -372,8 +408,6 @@ static const PowerDef kPowers[] = {
     {PowerOp::Hibernate, L"Hibernate", RGB(160, 110, 255),
         {L"hibernate", L"hibernation", NULL, NULL}},
 };
-static const COLORREF kQuickCol = RGB(255, 95, 170);
-
 enum class ChipKind { Power, Quick, Bang, Awake };
 struct ChipItem {
     ChipKind kind;
@@ -390,21 +424,80 @@ static int  g_confirmPower = -1;  // armed PowerOp awaiting a second Enter
 // Result model lives in results.h (shared with the unit tests).
 static std::vector<ResultItem> g_results;
 
-// Minimal black palette. Category accents: App blue, Web green, Calc amber,
-// Bang = per-site color, Hint = gray.
-static const COLORREF kBg     = RGB(0, 0, 0);
-static const COLORREF kInput  = RGB(0, 0, 0); // seamless with the bar: minimal
-static const COLORREF kSel    = RGB(28, 28, 30);
-static const COLORREF kText   = RGB(240, 240, 240);
-static const COLORREF kSub    = RGB(130, 130, 135);
-static const COLORREF kAppCol = RGB(96, 165, 250);
-static const COLORREF kWebCol = RGB(46, 224, 158);
-static const COLORREF kCalcCol= RGB(251, 191, 36);
-static const COLORREF kHintCol= RGB(110, 110, 115);
-static const COLORREF kSetCol = RGB(45, 212, 191);  // system settings pages
-static const COLORREF kAwakeCol = RGB(45, 212, 191);
-static const COLORREF kFileCol = RGB(96, 165, 250);   // files: blue
-static const COLORREF kFolderCol = RGB(251, 191, 36); // folders/drives: amber
+// Palette theme: mutable copies of Settings.theme (Settings > Theme edits
+// these live, ApplyThemeFromSettings pushes them out). Defaults match
+// DefaultTheme() so the first paint is correct even before settings load.
+static COLORREF kBg     = RGB(0, 0, 0);
+static COLORREF kInput  = RGB(0, 0, 0); // seamless with the bar: minimal
+static COLORREF kSel    = RGB(28, 28, 30);
+static COLORREF kText   = RGB(240, 240, 240);
+static COLORREF kSub    = RGB(130, 130, 135);
+static COLORREF kAppCol = RGB(96, 165, 250);
+static COLORREF kWebCol = RGB(46, 224, 158);
+static COLORREF kCalcCol= RGB(251, 191, 36);
+static COLORREF kHintCol= RGB(110, 110, 115);
+static COLORREF kSetCol = RGB(45, 212, 191);  // system settings pages
+static COLORREF kAwakeCol = RGB(45, 212, 191);
+static COLORREF kFileCol = RGB(96, 165, 250);   // files: blue
+static COLORREF kFolderCol = RGB(251, 191, 36); // folders/drives: amber
+static COLORREF kQuickCol = RGB(255, 95, 170);
+
+// Push Settings.theme into the live palette: colors, brushes, repaints.
+// Safe before windows exist (boot path): every handle use is guarded.
+static void ApplyThemeFromSettings() {
+    const Theme& t = g_settings.theme;
+    kBg = t.bg; kInput = t.input; kSel = t.sel; kText = t.text; kSub = t.sub;
+    kAppCol = t.app; kWebCol = t.web; kCalcCol = t.calc; kHintCol = t.hint;
+    kSetCol = t.set; kAwakeCol = t.awake; kFileCol = t.file;
+    kFolderCol = t.folder; kQuickCol = t.quick;
+    if (g_brBg) DeleteObject(g_brBg);
+    if (g_brInput) DeleteObject(g_brInput);
+    if (g_brSel) DeleteObject(g_brSel);
+    g_brBg = CreateSolidBrush(kBg);
+    g_brInput = CreateSolidBrush(kInput);
+    g_brSel = CreateSolidBrush(kSel);
+    // Open Settings tables follow the theme without a reopen.
+    HWND tables[] = {g_hwndAppsList, g_hwndBangsList, g_hwndQuickList};
+    for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
+        if (tables[i] && IsWindow(tables[i])) {
+            ListView_SetBkColor(tables[i], kBg);
+            ListView_SetTextColor(tables[i], kText);
+            ListView_SetTextBkColor(tables[i], kBg);
+            InvalidateRect(tables[i], NULL, TRUE);
+        }
+    }
+    if (g_hwndPalette && IsWindow(g_hwndPalette))
+        InvalidateRect(g_hwndPalette, NULL, TRUE);
+    if (g_hwndSettings && IsWindow(g_hwndSettings))
+        InvalidateRect(g_hwndSettings, NULL, TRUE);
+    // Window classes cache the background brush handle: point them at the
+    // new brush so a stale (deleted) handle is never referenced.
+    HWND themed[] = {g_hwndPalette, g_hwndChip, g_hwndChipRow,
+                     g_hwndFileBar, g_hwndFileGrid};
+    for (size_t i = 0; i < sizeof(themed) / sizeof(themed[0]); i++) {
+        if (themed[i] && IsWindow(themed[i]))
+            SetClassLongPtrW(themed[i], GCLP_HBRBACKGROUND, (LONG_PTR)g_brBg);
+    }
+}
+
+// Settings > Theme page: label + member pointer per editable color.
+struct ThemeField { const wchar_t* name; COLORREF Theme::*field; int btnId; };
+static const ThemeField kThemeFields[] = {
+    {L"Background",      &Theme::bg,     IDC_THEME_BG},
+    {L"Search field",    &Theme::input,  IDC_THEME_INPUT},
+    {L"Highlight",       &Theme::sel,    IDC_THEME_SEL},
+    {L"Text",            &Theme::text,   IDC_THEME_TEXT},
+    {L"Secondary text",  &Theme::sub,    IDC_THEME_SUB},
+    {L"Apps accent",     &Theme::app,    IDC_THEME_APP},
+    {L"Web accent",       &Theme::web,    IDC_THEME_WEB},
+    {L"Calculator",      &Theme::calc,   IDC_THEME_CALC},
+    {L"Hint",            &Theme::hint,   IDC_THEME_HINT},
+    {L"Settings accent", &Theme::set,    IDC_THEME_SET},
+    {L"Awake accent",    &Theme::awake,  IDC_THEME_AWAKE},
+    {L"Files accent",    &Theme::file,   IDC_THEME_FILE},
+    {L"Folders accent",  &Theme::folder, IDC_THEME_FOLDER},
+    {L"Quick links",     &Theme::quick,  IDC_THEME_QUICK},
+};
 
 // Awake state (see below).
 static bool g_awakeOn = false;
@@ -431,6 +524,8 @@ static void ActivateFileMode(const std::wstring& dir);
 static void DeactivateFileMode();
 static void UpdateFileResults(const std::wstring& filter);
 static void ExecuteFileSelected(bool inExplorer);
+static void OpenPathList(const std::vector<std::wstring>& paths);
+static void MultiClear();
 static std::wstring SystemExe(const wchar_t* name);
 static void RebuildListControl();
 static int CurrentSelection();
@@ -670,6 +765,7 @@ static void ShowPalette() {
 static void HidePalette() {
     DeactivateBang();
     DeactivateFileMode();
+    MultiClear(); // selections never leak into the next open
     g_chips.clear();
     g_chipsFocus = false;
     if (g_hwndChipRow) ShowWindow(g_hwndChipRow, SW_HIDE);
@@ -800,6 +896,7 @@ static void ActivateFileMode(const std::wstring& dir) {
     DeactivateBang(); // mutually exclusive with bang-chip mode
     g_fileActive = true;
     g_fileDir = dir.empty() ? L"" : EnsureTrailingSlash(dir);
+    MultiClear(); // fresh folder, fresh selection
     g_navigating = false;
     g_confirmPower = -1;
     RefreshDriveCache(); // labels once per entry, not per keystroke
@@ -815,6 +912,7 @@ static void DeactivateFileMode() {
     if (!g_fileActive) return; // don't hide an armed bang chip
     g_fileActive = false;
     g_fileDir.clear();
+    MultiClear();
     g_navigating = false;
     g_bangChipW = 0;
     if (g_hwndChip) ShowWindow(g_hwndChip, SW_HIDE);
@@ -951,12 +1049,25 @@ static void ExecuteFileSelected(bool inExplorer) {
         }
         return; // nothing picked: stay open
     }
+    // Multi-selection wins only when the cursor row is a member: Enter/Space
+    // opens every picked file + folder (folders open in Explorer), then
+    // closes. Otherwise the cursor row acts alone, exactly as before.
+    if (idx >= 0 && MultiHas(idx)) {
+        std::vector<int> rows = MultiRows();
+        std::vector<std::wstring> paths;
+        for (size_t k = 0; k < rows.size(); k++)
+            paths.push_back(g_results[(size_t)rows[k]].action);
+        MultiClear();
+        OpenPathList(paths); // hides first, toasts only on failures
+        return;
+    }
     if (idx < 0) return; // header or nothing: stay open
     ResultItem r = g_results[(size_t)idx]; // copy: HidePalette clears state
     if (r.kind == ResultKind::Folder) {
         g_fileDir = r.action.empty() ? L"" : EnsureTrailingSlash(r.action);
         if (g_fileDir.empty()) RefreshDriveCache(); // back at drives: re-read labels
         g_navigating = false;
+        MultiClear(); // drilled elsewhere: selection belonged to the old folder
         if (g_hwndEdit) {
             g_changingEdit = true;
             SetWindowTextW(g_hwndEdit, L"");
@@ -991,11 +1102,63 @@ static void ExecuteFileSelected(bool inExplorer) {
 static bool GridActive() { return InFileMode() && g_settings.fileGrid; }
 static int GridRows() { return ClampGridRows(g_settings.gridRows); }
 static int GridColumns() { return ClampGridCols(g_settings.gridCols); }
+// Effective columns: the setting is a maximum; fewer columns are used when
+// tiles would get too narrow for their labels. All tile math (paint,
+// hit-test, nav, content height) uses this so labels never clip mid-glyph.
+static int GridColsEff() {
+    return EffectiveGridCols(kWidth - kPadX * 2, GridColumns(), Dpx(110));
+}
+
+// ------------------------------------------------- file-mode multi-selection
+// Ctrl+Click toggles a row, Shift+Click extends from the anchor, plain
+// click/arrow keys collapse (Explorer rule). The set holds action paths, so
+// it survives refiltering within one folder; it clears on folder change,
+// mode exit, and palette hide. Enter opens the set only when the cursor row
+// itself is a member — a stale set can never hijack a plain Enter.
+static std::set<std::wstring> g_multiSel;
+static int g_multiAnchor = -1; // Shift-range anchor (results index)
+static bool MultiSelectable(int idx) {
+    return InFileMode() && idx >= 0 && idx < (int)g_results.size() &&
+           MultiKeySelectable(g_results[(size_t)idx]);
+}
+static bool MultiHas(int idx) {
+    return MultiSelectable(idx) &&
+           g_multiSel.count(g_results[(size_t)idx].action) != 0;
+}
+static void MultiClear() { g_multiSel.clear(); g_multiAnchor = -1; }
+static void MultiToggleIdx(int idx) {
+    if (!MultiSelectable(idx)) return;
+    MultiToggle(g_multiSel, g_results[(size_t)idx].action);
+    g_multiAnchor = idx;
+}
+static void MultiRangeTo(int idx) {
+    if (!InFileMode() || idx < 0 || idx >= (int)g_results.size()) return;
+    if (g_multiAnchor < 0 || g_multiAnchor >= (int)g_results.size())
+        g_multiAnchor = idx;
+    MultiRangeAdd(g_multiSel, g_results, g_multiAnchor, idx);
+}
+static void MultiSelectAll() {
+    if (!InFileMode()) return;
+    for (size_t i = 0; i < g_results.size(); i++)
+        if (MultiKeySelectable(g_results[i])) g_multiSel.insert(g_results[i].action);
+    g_multiAnchor = -1;
+}
+static std::vector<int> MultiRows() { return MultiMemberRows(g_multiSel, g_results); }
+static void MultiChanged() { // repaint everything that shows membership
+    if (g_hwndList && IsWindow(g_hwndList)) InvalidateRect(g_hwndList, NULL, FALSE);
+    if (g_hwndFileGrid && IsWindow(g_hwndFileGrid)) InvalidateRect(g_hwndFileGrid, NULL, FALSE);
+    if (g_hwndFileBar && IsWindow(g_hwndFileBar)) InvalidateRect(g_hwndFileBar, NULL, FALSE);
+}
+static void MultiCollapseUnlessMember(int idx) {
+    if (g_multiSel.empty()) { g_multiAnchor = idx; return; }
+    if (!MultiHas(idx)) MultiClear();
+    g_multiAnchor = idx;
+}
 static int GridContentH() {
     bool head = !g_results.empty() && g_results.front().kind == ResultKind::Header;
     size_t base = head ? 1 : 0;
     size_t tiles = g_results.size() > base ? g_results.size() - base : 0;
-    int cols = GridColumns();
+    int cols = GridColsEff();
     int gr = GridRows();
     int need = tiles ? (int)((tiles + (size_t)cols - 1) / (size_t)cols) : 0;
     int vis = need < gr ? need : gr;
@@ -1136,7 +1299,9 @@ static void RebuildListControl() {
     if (gridOn) contentH = GridContentH();
     else for (size_t i = 0; i < rows; i++) contentH += RowH(i);
     int barH = showBar ? kBottomBarH : 0;
-    int h = listY + contentH + barH + 4; // 4px bottom pad mirrors the top
+    // Bottom pad generously: the last row's descenders (e.g. "g") must clear
+    // the rounded window edge at every DPI, never sit on the boundary.
+    int h = listY + contentH + barH + Dpx(8);
 
     // Resize (window + region + children) only when the height changed:
     // this is what stops the per-keystroke blink.
@@ -1558,7 +1723,7 @@ static void EnsureVisible(int sel) {
         size_t base = (!g_results.empty() &&
                        g_results.front().kind == ResultKind::Header) ? 1 : 0;
         if ((size_t)sel < base || (size_t)sel >= g_results.size()) return;
-        int cols = GridColumns();
+        int cols = GridColsEff();
         if (cols < 1) cols = 1;
         int row = (sel - (int)base) / cols;
         int gr = GridRows();
@@ -1592,6 +1757,7 @@ static void MoveSelSteps(int steps) {
         SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
         SyncSelToBox(to);
         EnsureVisible(to);
+        MultiCollapseUnlessMember(to); // wheel re-anchors like arrows
     }
     InvalidateRect(g_hwndList, NULL, FALSE);
     if (!g_chips.empty()) InvalidateRect(g_hwndChipRow, NULL, FALSE);
@@ -1605,7 +1771,7 @@ static void WheelScrollList(int delta) {
         size_t base = (!g_results.empty() &&
                        g_results.front().kind == ResultKind::Header) ? 1 : 0;
         size_t tiles = g_results.size() > base ? g_results.size() - base : 0;
-        int cols = GridColumns();
+        int cols = GridColsEff();
         if (cols < 1) cols = 1;
         int gr = GridRows();
         int need = tiles ? (int)((tiles + (size_t)cols - 1) / (size_t)cols) : 0;
@@ -1634,13 +1800,24 @@ static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
     // Drag-out arming: default click selection first, then track moves past
     // the system drag threshold (files, folders, drives, classic app targets).
     if (m == WM_LBUTTONDOWN) {
+        bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         LRESULT r = DefSubclassProc(h, m, w, l);
         int idx = (int)SendMessageW(h, LB_ITEMFROMPOINT, 0, l);
         if (HIWORD(idx) == 0) {
             LRESULT data = SendMessageW(h, LB_GETITEMDATA, LOWORD(idx), 0);
+            int row = (data >= 0 && data < (LRESULT)g_results.size())
+                          ? (int)data : -1;
             POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
-            ArmRowDrag((data >= 0 && data < (LRESULT)g_results.size())
-                           ? (int)data : -1, pt);
+            ArmRowDrag(row, pt);
+            // File-mode multi-select: Ctrl toggles, Shift extends, plain
+            // click collapses to the cursor (Explorer rule).
+            if (InFileMode() && !GridActive() && row >= 0) {
+                if (ctrl && !shift) MultiToggleIdx(row);
+                else if (shift && !ctrl) MultiRangeTo(row);
+                else MultiCollapseUnlessMember(row);
+                MultiChanged();
+            }
         } else {
             CancelRowDrag();
         }
@@ -1747,7 +1924,7 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
             } else if (count > 0) {
                 EnsureNavStart();
                 // Grid mode jumps a full tile row; list mode steps one row.
-                int step = GridActive() ? GridColumns() : 1;
+                int step = GridActive() ? GridColsEff() : 1;
                 int to = sel;
                 bool moved = false;
                 for (int i = 0; i < step; i++) {
@@ -1760,6 +1937,7 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                     SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
                     SyncSelToBox(to);
                     EnsureVisible(to);
+                    MultiCollapseUnlessMember(to); // arrows collapse the set
                 } else {
                     RestoreOrigSel(); // past last: back to the typed text
                 }
@@ -1778,7 +1956,7 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
             } else if (count > 0) {
                 EnsureNavStart();
                 // Grid mode jumps a full tile row; list mode steps one row.
-                int step = GridActive() ? GridColumns() : 1;
+                int step = GridActive() ? GridColsEff() : 1;
                 int to = sel;
                 bool moved = false;
                 for (int i = 0; i < step; i++) {
@@ -1791,6 +1969,7 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                     SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
                     SyncSelToBox(to);
                     EnsureVisible(to);
+                    MultiCollapseUnlessMember(to); // arrows collapse the set
                 } else {
                     RestoreOrigSel(); // above first: back to the typed text
                 }
@@ -1809,6 +1988,7 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                     SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
                     SyncSelToBox(to);
                     EnsureVisible(to);
+                    MultiCollapseUnlessMember(to); // arrows collapse the set
                 } else {
                     RestoreOrigSel();
                 }
@@ -1999,8 +2179,17 @@ static LRESULT CALLBACK FileBarProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         SelectObject(dc, g_fontSub);
         SetTextColor(dc, kText);
         RECT tr = cl; tr.left += Dpx(34); tr.right -= Dpx(10);
-        DrawTextW(dc, L"Enter/Space open \u00B7 Shift+Enter folder", -1, &tr,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        size_t nm = g_multiSel.size();
+        if (InFileMode() && nm > 0) {
+            wchar_t b[128];
+            swprintf_s(b, 128, L"%u selected \u00B7 Enter opens all \u00B7 plain click clears",
+                       (unsigned)nm);
+            DrawTextW(dc, b, -1, &tr,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        } else {
+            DrawTextW(dc, L"Enter/Space open \u00B7 Shift+Enter folder \u00B7 Ctrl+Click selects",
+                      -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -2036,7 +2225,7 @@ static POINT RowScreenPoint(int resultsIdx) {
         size_t base = (!g_results.empty() &&
                        g_results.front().kind == ResultKind::Header) ? 1 : 0;
         if ((size_t)resultsIdx < base) return fb;
-        int cols = GridColumns();
+        int cols = GridColsEff();
         if (cols < 1) cols = 1;
         RECT gr;
         GetWindowRect(g_hwndFileGrid, &gr);
@@ -2067,6 +2256,29 @@ static POINT RowScreenPoint(int resultsIdx) {
 }
 
 // ------------------------------------------------------- file grid window
+// Fit a tile name into at most two wrapped lines with a real ellipsis.
+// (DT_END_ELLIPSIS has no effect combined with DT_WORDBREAK, so overlong
+// names would otherwise clip mid-glyph at the tile edge.)
+static std::wstring FitTileText(HDC dc, const std::wstring& s, int w, int maxH) {
+    if (s.empty() || w <= 0 || maxH <= 0) return s;
+    RECT r{0, 0, w, 0};
+    DrawTextW(dc, s.c_str(), -1, &r, DT_CALCRECT | DT_WORDBREAK | DT_CENTER | DT_TOP);
+    if (r.bottom - r.top <= maxH) return s;
+    std::wstring best = L"…";
+    size_t lo = 0, hi = s.size();
+    while (lo < hi) {
+        size_t mid = (lo + hi + 1) / 2;
+        std::wstring t = s.substr(0, mid) + L"…";
+        RECT r2{0, 0, w, 0};
+        DrawTextW(dc, t.c_str(), -1, &r2,
+                  DT_CALCRECT | DT_WORDBREAK | DT_CENTER | DT_TOP);
+        if (r2.bottom - r2.top <= maxH) { best = t; lo = mid; }
+        else if (mid == 0) break;
+        else hi = mid - 1;
+    }
+    return best;
+}
+
 // Explorer-like tiles, file grid-view only. Paints + hit-tests; selection
 // lives in the hidden listbox (same indices), so nav/execute are untouched.
 static int GridHitTest(int fx, int fy) {
@@ -2076,7 +2288,7 @@ static int GridHitTest(int fx, int fy) {
     if (!GetClientRect(g_hwndFileGrid, &cl)) return -1;
     int y = base ? kGridHeadH : 0;
     if (fy < y) return -1;
-    int cols = GridColumns();
+    int cols = GridColsEff();
     if (cols < 1) cols = 1;
     int tw = (cl.right - cl.left) / cols;
     if (tw <= 0) return -1;
@@ -2110,7 +2322,7 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             y = kGridHeadH;
             base = 1;
         }
-        int cols = GridColumns();
+        int cols = GridColsEff();
         if (cols < 1) cols = 1;
         int tw = (cl.right - cl.left) / cols;
         int sel = (int)SendMessageW(g_hwndList, LB_GETCURSEL, 0, 0);
@@ -2120,23 +2332,44 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             int r = (int)(t / (size_t)cols) - g_gridTopRow;
             if (r >= GridRows()) break;
             int c = (int)(t % (size_t)cols);
-            RECT tile{cl.left + c * tw, y + r * kGridTileH,
-                      cl.left + (c + 1) * tw, y + (r + 1) * kGridTileH};
+            // Inset tiles: a gutter between neighbors so labels can never
+            // touch or overlap, at any column count.
+            RECT tile{cl.left + c * tw + Dpx(2), y + r * kGridTileH,
+                      cl.left + (c + 1) * tw - Dpx(2), y + (r + 1) * kGridTileH};
             const ResultItem& ri = g_results[i];
             if (ri.kind == ResultKind::Header) continue; // safety
-            if ((int)i == sel) FillRect(dc, &tile, g_brSel);
+            bool isCur = ((int)i == sel);
+            bool isMem = MultiHas((int)i);
+            if (isCur) FillRect(dc, &tile, g_brSel);
+            if (isMem && !isCur) {
+                // Multi-selection frame in the row accent color (the cursor
+                // keeps the full highlight); drawn inside the tile so it
+                // never overlaps a neighbor's label.
+                HPEN pen = CreatePen(PS_SOLID, 2, ri.color);
+                HGDIOBJ oldP = SelectObject(dc, pen);
+                HGDIOBJ oldB = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                Rectangle(dc, tile.left, tile.top, tile.right, tile.bottom);
+                SelectObject(dc, oldP);
+                SelectObject(dc, oldB);
+                DeleteObject(pen);
+            }
             int gz = Dpx(32);
             int gx = tile.left + (tile.right - tile.left - gz) / 2;
             RECT gcell{gx, tile.top + Dpx(8), gx + gz, tile.top + Dpx(8) + gz};
             FileGlyph fg = GlyphForResult(ri.kind, ri.title, ri.action, ri.color);
-            PaintGlyph(dc, gcell, fg, (int)i == sel, ri.title, g_fontGrid);
+            PaintGlyph(dc, gcell, fg, isCur, ri.title, g_fontGrid);
             SetBkMode(dc, TRANSPARENT);
             SelectObject(dc, g_fontSub);
-            SetTextColor(dc, (int)i == sel ? kText : RGB(218, 218, 226));
+            SetTextColor(dc, isCur ? kText : RGB(218, 218, 226));
             RECT nr{tile.left + Dpx(4), gcell.bottom + Dpx(4),
                     tile.right - Dpx(4), tile.bottom - Dpx(2)};
-            DrawTextW(dc, ri.title.c_str(), -1, &nr,
-                      DT_CENTER | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS);
+            // Pre-fitted to two lines with a true ellipsis: long names
+            // shrink with "..." instead of clipping mid-glyph at the edge.
+            std::wstring shown = FitTileText(dc, ri.title,
+                                             nr.right - nr.left,
+                                             nr.bottom - nr.top);
+            DrawTextW(dc, shown.c_str(), -1, &nr,
+                      DT_CENTER | DT_TOP | DT_WORDBREAK);
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -2148,6 +2381,14 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             SendMessageW(g_hwndList, LB_SETCURSEL, idx, 0);
             SyncSelToBox(idx);
             EnsureVisible(idx);
+            // Same Explorer rule as the list: Ctrl toggles, Shift extends,
+            // plain click collapses to the cursor tile.
+            bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (ctrl && !shift) MultiToggleIdx(idx);
+            else if (shift && !ctrl) MultiRangeTo(idx);
+            else MultiCollapseUnlessMember(idx);
+            MultiChanged();
             InvalidateRect(hwnd, NULL, FALSE);
         }
         POINT dpt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
@@ -2191,6 +2432,7 @@ static bool g_dragging = false; // suppress dismiss-while-dragging
 static int g_menuRow = -1;
 static const UINT kMenuVerbBase = 3000;   // wID = base + (int)VerbId
 static const UINT kMenuEngineBase = 3200; // wID = base + engine index
+static const UINT kMenuMultiBase = 3260;  // wID = base + multi verb (0..3)
 static void ShowPaletteMenu(int x, int y); // defined below ShowRowMenu
 
 struct EnginePreset { const wchar_t* name; const wchar_t* url; };
@@ -2337,6 +2579,49 @@ static void ApplyEnginePreset(int idx) {
     UpdateResults();
 }
 
+// Open a batch of file/folder/drive paths (multi-select Enter + menu).
+// Hides first, opens each with ShellExecute, and toasts only on failures.
+static void OpenPathList(const std::vector<std::wstring>& paths) {
+    if (paths.empty()) return;
+    HidePalette(); // hide first: never wait for the targets
+    int failed = 0;
+    for (size_t k = 0; k < paths.size(); k++) {
+        if (paths[k].empty()) { failed++; continue; }
+        if ((UINT_PTR)ShellExecuteW(NULL, L"open", paths[k].c_str(), NULL, NULL,
+                                    SW_SHOWNORMAL) <= 32)
+            failed++;
+    }
+    if (failed > 0) {
+        wchar_t b[128];
+        swprintf_s(b, 128, L"Couldn't open %d of %u selected item%s", failed,
+                   (unsigned)paths.size(), paths.size() == 1 ? L"" : L"s");
+        NotifyLaunchFailed(b);
+    }
+}
+
+// File-mode multi-select menu verbs (kMenuMultiBase + id):
+// 0 = open all, 1 = copy all paths, 2 = clear, 3 = select all.
+static void RunMultiVerb(int which) {
+    if (which == 3) { MultiSelectAll(); MultiChanged(); return; }
+    if (which == 2) { MultiClear(); MultiChanged(); return; }
+    std::vector<int> rows = MultiRows();
+    if (rows.empty()) return;
+    if (which == 0) {
+        std::vector<std::wstring> paths;
+        for (size_t k = 0; k < rows.size(); k++)
+            paths.push_back(g_results[(size_t)rows[k]].action);
+        MultiClear();
+        OpenPathList(paths);
+        return;
+    }
+    std::wstring all;
+    for (size_t k = 0; k < rows.size(); k++) {
+        if (!all.empty()) all += L"\r\n";
+        all += g_results[(size_t)rows[k]].action;
+    }
+    CopyTextToClipboard(all);
+}
+
 static void RunRowVerb(int rowIdx, VerbId verb) {
     if (rowIdx < 0 || rowIdx >= (int)g_results.size()) return;
     ResultItem r = g_results[(size_t)rowIdx]; // copy: some verbs rebuild results
@@ -2464,6 +2749,29 @@ static void ShowRowMenu(int row, int x, int y) {
         if (!g_chips.empty()) InvalidateRect(g_hwndChipRow, NULL, FALSE);
         g_menuRow = row;
         g_menuItems.clear();
+        // File-mode multi-select actions ride above the row verbs.
+        if (InFileMode() && MultiKeySelectable(rr)) {
+            size_t nm = g_multiSel.size();
+            if (nm > 0) {
+                wchar_t b[64];
+                swprintf_s(b, 64, L"Open %u selected", (unsigned)nm);
+                DarkMenuItem it0; it0.text = b; it0.accent = kFolderCol;
+                it0.wID = kMenuMultiBase;
+                g_menuItems.push_back(std::move(it0));
+                swprintf_s(b, 64, L"Copy %u paths", (unsigned)nm);
+                DarkMenuItem it1; it1.text = b; it1.accent = kFolderCol;
+                it1.wID = kMenuMultiBase + 1;
+                g_menuItems.push_back(std::move(it1));
+                DarkMenuItem it2; it2.text = L"Clear selection"; it2.accent = kSub;
+                it2.wID = kMenuMultiBase + 2;
+                g_menuItems.push_back(std::move(it2));
+            }
+            DarkMenuItem it3; it3.text = L"Select all"; it3.accent = kFolderCol;
+            it3.wID = kMenuMultiBase + 3;
+            g_menuItems.push_back(std::move(it3));
+            DarkMenuItem sep; sep.separator = true; sep.wID = 0;
+            g_menuItems.push_back(std::move(sep));
+        }
         size_t subAt = (size_t)-1;
         for (VerbId v : verbs) {
             DarkMenuItem it;
@@ -2502,7 +2810,9 @@ static void ShowRowMenu(int row, int x, int y) {
         }
         int cmd = TrackDarkMenu(hMenu, x, y);
         DestroyMenu(hMenu); // owned submenu goes with it
-        if (cmd >= (int)kMenuEngineBase && cmd < (int)kMenuEngineBase + 16)
+        if (cmd >= (int)kMenuMultiBase && cmd < (int)kMenuMultiBase + 4)
+            RunMultiVerb(cmd - (int)kMenuMultiBase);
+        else if (cmd >= (int)kMenuEngineBase && cmd < (int)kMenuEngineBase + 16)
             ApplyEnginePreset(cmd - (int)kMenuEngineBase);
         else if (cmd >= (int)kMenuVerbBase && cmd < (int)kMenuVerbBase + 256)
             RunRowVerb(g_menuRow, (VerbId)(cmd - (int)kMenuVerbBase));
@@ -3047,10 +3357,20 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             if (isHead) { // section label: small gray, never highlights
                 SelectObject(dc, g_fontSub);
                 SetTextColor(dc, kSub);
-                RECT tr = d->rcItem; tr.left += 14;
+                RECT tr = d->rcItem; tr.left += 14; tr.right -= Dpx(10);
                 DrawTextW(dc, r.title.c_str(), -1, &tr,
-                          DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
                 return TRUE;
+            }
+            // Multi-selection member tick (file mode): accent bar at the far
+            // left, clear of the glyph cell, so membership never overlaps text.
+            if (MultiHas((int)ri)) {
+                HBRUSH mb = CreateSolidBrush(r.color);
+                RECT mr = d->rcItem;
+                mr.left += Dpx(6); mr.right = mr.left + Dpx(2);
+                mr.top += Dpx(7); mr.bottom -= Dpx(7);
+                FillRect(dc, &mr, mb);
+                DeleteObject(mb);
             }
             // App rows keep the original v1 look (slim category bar);
             // every other kind paints its glyph.
@@ -3415,9 +3735,9 @@ static void FillQuickList() {
 
 static void ShowSettingsPage(int page) {
     g_settingsPage = page;
-    const std::vector<HWND>* pages[5] = {&g_pageGeneral, &g_pageApps, &g_pageBangs, &g_pageQuick,
-                                         &g_pageFiles};
-    for (int i = 0; i < 5; i++)
+    const std::vector<HWND>* pages[6] = {&g_pageGeneral, &g_pageApps, &g_pageBangs, &g_pageQuick,
+                                         &g_pageFiles, &g_pageTheme};
+    for (int i = 0; i < 6; i++)
         for (HWND h : *pages[i])
             ShowWindow(h, (i == page) ? SW_SHOW : SW_HIDE);
 }
@@ -3670,19 +3990,41 @@ static LRESULT CALLBACK PlainEditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
     return DefSubclassProc(h, m, w, l);
 }
 
+// Color picker for one theme field: applies + saves instantly, repaints live.
+static void PickThemeColor(HWND owner, int fieldIdx) {
+    if (fieldIdx < 0 || fieldIdx >= (int)(sizeof(kThemeFields) / sizeof(kThemeFields[0])))
+        return;
+    COLORREF cur = g_settings.theme.*(kThemeFields[fieldIdx].field);
+    CHOOSECOLORW cc{};
+    cc.lStructSize = sizeof(cc);
+    cc.hwndOwner = owner;
+    cc.rgbResult = cur;
+    cc.lpCustColors = g_themeCustom;
+    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+    if (!ChooseColorW(&cc)) return; // cancelled: nothing changes
+    g_settings.theme.*(kThemeFields[fieldIdx].field) = cc.rgbResult;
+    SaveNow(); // instant save, like the rest of Settings
+    ApplyThemeFromSettings(); // live repaint: palette + Settings tables
+    if (g_themeBtn[fieldIdx] && IsWindow(g_themeBtn[fieldIdx]))
+        InvalidateRect(g_themeBtn[fieldIdx], NULL, FALSE);
+}
+
 static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_CREATE: {
         g_fillingSettings = true;
         g_pageGeneral.clear(); g_pageApps.clear();
         g_pageBangs.clear(); g_pageQuick.clear(); g_pageFiles.clear();
+        g_pageTheme.clear();
+        for (int i = 0; i < 14; i++) g_themeBtn[i] = NULL;
 
         // Page tabs: owner-drawn buttons matching the app theme (no tab
         // control, so there is no light-themed rim anywhere in Settings).
-        const wchar_t* tabs[] = {L"General", L"Hidden apps", L"Bangs", L"Quick links", L"Files"};
-        const int tabX[] = {16, 122, 248, 344, 460};
-        const int tabW[] = {100, 120, 90, 110, 100};
-        for (int i = 0; i < 5; i++)
+        const wchar_t* tabs[] = {L"General", L"Hidden apps", L"Bangs", L"Quick links",
+                                 L"Files", L"Theme"};
+        const int tabX[] = {16, 110, 224, 308, 412, 496};
+        const int tabW[] = {88, 108, 78, 98, 78, 78};
+        for (int i = 0; i < 6; i++)
             NewCtrl(L"BUTTON", tabs[i], WS_VISIBLE | WS_TABSTOP,
                     tabX[i], 12, tabW[i], 28, hwnd, IDC_PAGE_0 + i);
 
@@ -3812,6 +4154,27 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             SetWindowTextW(g_hwndColsVal, cv);
         }
 
+        // ---- Theme page (every palette color editable, applies instantly).
+        {
+            page(g_pageTheme, NewCtrl(L"STATIC",
+                L"Click a color to change it - everything applies instantly:",
+                WS_VISIBLE, 24, 52, 536, 20, hwnd, 0));
+            for (int i = 0; i < (int)(sizeof(kThemeFields) / sizeof(kThemeFields[0])); i++) {
+                int col = i % 2, row = i / 2;
+                g_themeBtn[i] = page(g_pageTheme,
+                    NewCtrl(L"BUTTON", kThemeFields[i].name,
+                            WS_VISIBLE | WS_TABSTOP,
+                            24 + col * 276, 78 + row * 36, 260, 30, hwnd,
+                            (UINT)kThemeFields[i].btnId));
+            }
+            page(g_pageTheme, NewCtrl(L"BUTTON", L"Reset to default",
+                WS_VISIBLE, 24, 78 + 7 * 36 + 8, 160, 28, hwnd, IDC_THEME_RESET));
+            page(g_pageTheme, NewCtrl(L"STATIC",
+                L"Background/Text/Highlight recolor the whole palette;\r\n"
+                L"accents recolor their result rows, chips, and tiles.",
+                WS_VISIBLE, 196, 78 + 7 * 36 + 6, 364, 40, hwnd, 0));
+        }
+
         // Shared bottom buttons (always visible).
         NewCtrl(L"BUTTON", L"Rescan apps", WS_VISIBLE,
                 16, 512, 120, 30, hwnd, IDC_RESCAN);
@@ -3883,12 +4246,54 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             return TRUE;
         }
         if (d->CtlType != ODT_BUTTON) break;
+        // Theme swatches: live color chip + field name (not the generic
+        // button paint, which would hide the color being edited).
+        if (d->CtlID >= (UINT)IDC_THEME_BG && d->CtlID <= (UINT)IDC_THEME_QUICK) {
+            size_t fi = (size_t)(d->CtlID - (UINT)IDC_THEME_BG);
+            size_t nf = sizeof(kThemeFields) / sizeof(kThemeFields[0]);
+            FillRect(dc, &d->rcItem, g_brBg);
+            COLORREF col = (fi < nf) ? (g_settings.theme.*(kThemeFields[fi].field)) : kBg;
+            RECT chip = d->rcItem;
+            chip.left += Dpx(8); chip.right = chip.left + Dpx(28);
+            chip.top += Dpx(5); chip.bottom -= Dpx(5);
+            if (chip.right > chip.left && chip.bottom > chip.top) {
+                HBRUSH cb = CreateSolidBrush(col);
+                HGDIOBJ oldB = SelectObject(dc, cb);
+                HPEN pen = CreatePen(PS_SOLID, 1, RGB(66, 66, 72));
+                HGDIOBJ oldP = SelectObject(dc, pen);
+                RoundRect(dc, chip.left, chip.top, chip.right, chip.bottom, 6, 6);
+                SelectObject(dc, oldB);
+                SelectObject(dc, oldP);
+                DeleteObject(cb);
+                DeleteObject(pen);
+            }
+            SetBkMode(dc, TRANSPARENT);
+            SelectObject(dc, g_fontUI);
+            SetTextColor(dc, kText);
+            RECT tr = d->rcItem; tr.left += Dpx(8) + Dpx(28) + Dpx(10);
+            tr.right -= Dpx(6);
+            const wchar_t* nm = (fi < nf) ? kThemeFields[fi].name : L"";
+            DrawTextW(dc, nm, -1, &tr,
+                      DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
+            bool pressed = (d->itemState & ODS_SELECTED) != 0;
+            bool focus = (d->itemState & ODS_FOCUS) != 0;
+            if (pressed || focus) {
+                HPEN fp = CreatePen(PS_SOLID, 1, kAppCol);
+                HGDIOBJ ofp = SelectObject(dc, fp);
+                SelectObject(dc, GetStockObject(NULL_BRUSH));
+                RoundRect(dc, d->rcItem.left, d->rcItem.top,
+                          d->rcItem.right, d->rcItem.bottom, 8, 8);
+                SelectObject(dc, ofp);
+                DeleteObject(fp);
+            }
+            return TRUE;
+        }
         SetBkMode(dc, TRANSPARENT);
         SelectObject(dc, g_fontUI);
         bool pressed = (d->itemState & ODS_SELECTED) != 0;
         bool focus = (d->itemState & ODS_FOCUS) != 0;
         bool isSave = d->CtlID == (UINT)IDC_SAVE;
-        bool isPage = d->CtlID >= (UINT)IDC_PAGE_0 && d->CtlID <= (UINT)IDC_PAGE_4;
+        bool isPage = d->CtlID >= (UINT)IDC_PAGE_0 && d->CtlID <= (UINT)IDC_PAGE_5;
         bool pageSel = isPage && (int)(d->CtlID - (UINT)IDC_PAGE_0) == g_settingsPage;
         bool isView = d->CtlID == (UINT)IDC_VIEW_LIST || d->CtlID == (UINT)IDC_VIEW_GRID;
         bool viewSel = isView && ((d->CtlID == (UINT)IDC_VIEW_GRID) == g_settings.fileGrid);
@@ -4005,9 +4410,9 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_COMMAND: {
         WORD id = LOWORD(w), code = HIWORD(w);
-        if (id >= IDC_PAGE_0 && id <= IDC_PAGE_4) {
+        if (id >= IDC_PAGE_0 && id <= IDC_PAGE_5) {
             ShowSettingsPage(id - IDC_PAGE_0);
-            for (int i = IDC_PAGE_0; i <= IDC_PAGE_4; i++) {
+            for (int i = IDC_PAGE_0; i <= IDC_PAGE_5; i++) {
                 HWND b = GetDlgItem(hwnd, i);
                 if (b) InvalidateRect(b, NULL, FALSE);
             }
@@ -4103,6 +4508,15 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             ListView_SetItemState(g_hwndQuickList, row, LVIS_SELECTED, LVIS_SELECTED);
             ListView_EnsureVisible(g_hwndQuickList, row, FALSE);
             ListView_EditLabel(g_hwndQuickList, row);
+        } else if (id >= IDC_THEME_BG && id <= IDC_THEME_QUICK) {
+            PickThemeColor(hwnd, (int)(id - IDC_THEME_BG));
+        } else if (id == IDC_THEME_RESET) {
+            g_settings.theme = DefaultTheme();
+            SaveNow();
+            ApplyThemeFromSettings();
+            for (int i = 0; i < 14; i++)
+                if (g_themeBtn[i] && IsWindow(g_themeBtn[i]))
+                    InvalidateRect(g_themeBtn[i], NULL, FALSE);
         } else if (id == IDC_RESCAN) {
             g_indexReady.store(false);
             BuildIndexAsync(true); // manual rescan: full pass
@@ -4124,8 +4538,10 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         g_hwndEngineCombo = g_hwndEngineUrl = g_hwndBrowserCombo = NULL;
         g_hwndRowsVal = g_hwndColsVal = NULL;
         g_hwndAppsList = g_hwndBangsList = g_hwndQuickList = NULL;
+        for (int i = 0; i < 14; i++) g_themeBtn[i] = NULL;
         g_pageGeneral.clear(); g_pageApps.clear();
         g_pageBangs.clear(); g_pageQuick.clear(); g_pageFiles.clear();
+        g_pageTheme.clear();
         break;
     }
     return DefWindowProcW(hwnd, m, w, l);
@@ -4205,9 +4621,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
         ReleaseDC(NULL, screen);
     }
     UpdateLayoutMetrics();
-    g_brBg = CreateSolidBrush(kBg);
-    g_brInput = CreateSolidBrush(kInput);
-    g_brSel = CreateSolidBrush(kSel);
+    ApplyThemeFromSettings(); // theme colors from disk; builds the brushes
 
     LoadAppIcons();
 
