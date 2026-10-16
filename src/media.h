@@ -35,8 +35,10 @@ inline std::wstring MediaExt(const std::wstring& path) {
     return e;
 }
 
-// Extension -> kind. The Image set is exactly what WIC decodes on
-// Windows 10 19045 (no HEIC/WebP codec present there); the Video set is
+// Extension -> kind. The Image set is exactly what stb_image decodes
+// (JPEG/PNG/BMP/GIF/TGA/PSD/HDR/PIC/PNM, vendored header-only): TIFF and ICO
+// are NOT in it and fall through to the default app, as do HEIC/WebP/AVIF
+// (marked Unsupported so the message names the gap). The Video set is
 // containers Media Foundation accepts (missing codecs fail gracefully at
 // playback time, never at startup). Pure, unit-tested.
 inline MediaKind ClassifyMedia(const std::wstring& path) {
@@ -44,8 +46,10 @@ inline MediaKind ClassifyMedia(const std::wstring& path) {
     if (e.empty()) return MediaKind::None;
     if (e == L"heic" || e == L"heif" || e == L"avif" || e == L"webp")
         return MediaKind::Unsupported; // no in-box codec on Win10 19045
-    if (e == L"jpg" || e == L"jpeg" || e == L"png" || e == L"bmp" ||
-        e == L"gif" || e == L"tif" || e == L"tiff" || e == L"ico")
+    if (e == L"jpg" || e == L"jpeg" || e == L"jpe" || e == L"jfif" ||
+        e == L"png" || e == L"bmp" || e == L"dib" || e == L"gif" ||
+        e == L"tga" || e == L"psd" || e == L"hdr" || e == L"pic" ||
+        e == L"pnm" || e == L"ppm" || e == L"pgm" || e == L"pbm")
         return MediaKind::Image;
     if (e == L"mp4" || e == L"m4v" || e == L"mov" || e == L"mkv" ||
         e == L"avi" || e == L"wmv" || e == L"asf" || e == L"mpg" ||

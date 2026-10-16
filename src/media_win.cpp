@@ -3,33 +3,25 @@
 // extends glass over everything) + WS_EX_TOOLWINDOW (no taskbar button).
 // Manual WM_NCHITTEST edge zones keep resizing working.
 //
-// Decoder policy: in-box OS components only (WIC for images, Media
-// Foundation + D3D11 for video). No FFmpeg, no bundled codecs. All media
-// DLLs are delay-loaded (MSVC): nothing maps until MediaOpen runs, so idle
-// RSS stays 1-3 MB. The image path is CPU-only (WIC decode + StretchDIBits);
-// video presents through its own DXGI swapchain with a D2D overlay second
-// pass (GDI cannot paint over a D3D swapchain).
-//
-// Adaptive decode (NOT a CPU/GPU toggle): once the D3D11 device manager is
-// handed to Media Foundation, MF picks hardware decode when the GPU offers
-// it and falls back to software otherwise. Software decode costs 10-30x the
-// CPU per frame plus surface-copy bandwidth, so there is deliberately no
-// way to force it. MFStartup runs once per process on first video open and
-// is never shut down; WIC/COM init per window.
+// Decoder policy: in-box OS components plus ONE vendored header (stb_image,
+// public domain, for photos). No FFmpeg, no bundled codecs, no shipped DLLs.
+// Images decode via stb_image from memory (Unicode-safe file read, RGBA,
+// swizzled once to BGRA for GDI). Video plays through Media Foundation:
+// Source Resolver -> partial topology (auto-inserted decoders) -> EVR video
+// + audio renderer, driven by deterministic session events. Hardware decode
+// engages automatically where the GPU offers it; there is deliberately no
+// CPU/GPU toggle (software decode costs 10-30x the CPU per frame). The
+// control bar is a plain GDI child window in the palette's visual language,
+// not a composited overlay. MFStartup runs once per process on first video
+// open and is never shut down; nothing media-related maps before first use,
+// so idle RSS stays 1-3 MB.
 #include <windows.h>
 #include <windowsx.h>
-#include <shlobj.h>   // SHFileOperationW (recycle-bin delete)
-#include <dwmapi.h>   // MARGINS struct only (dwmapi.dll loaded dynamically)
-#include <wincodec.h> // WIC image decode + scaler
-#include <d3d11.h>    // video device (VIDEO_SUPPORT, enumerated adapters)
-#include <dxgi.h>     // swapchain
-#include <mfapi.h>    // MFStartup (process-lifetime, first video open)
-#include <mfidl.h>    // MFT interface declarations
-#include <mftransform.h> // MFT category GUIDs
-#include <mfmediaengine.h> // IMFMediaEngine playback
-#include <d2d1.h>     // control overlay (same swapchain, second pass)
-#include <dwrite.h>   // overlay text
-#include <oleauto.h>  // SysAllocString for SetSource
+#include <shlobj.h> // SHFileOperationW (recycle-bin delete)
+#include <dwmapi.h> // MARGINS struct only (dwmapi.dll loaded dynamically)
+#include <mfapi.h>  // MFStartup, session, MFGetService
+#include <mfidl.h>  // session/topology interfaces
+#include <evr.h>    // video + audio renderer activates
 #include <new>
 #include <cstdio>  // swprintf_s
 #include <cstring> // memcpy
@@ -40,16 +32,29 @@
 #include "media.h"
 #include "files.h" // ListDirOneLevel: sibling prev/next reuses the one enumerator
 
+#ifdef _MSC_VER
+__pragma(warning(push, 0))
+#endif
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#ifdef _MSC_VER
+__pragma(warning(pop))
+#endif
+
 namespace {
 
 template <class T> void SafeRelease(T*& p) {
     if (p) { p->Release(); p = nullptr; }
 }
 
-enum : UINT_PTR { IDT_LOAD = 101, IDT_PUMP, IDT_HIDE, IDT_WATCHDOG };
+enum : UINT_PTR { IDT_UI = 101, IDT_HIDE, IDT_WATCHDOG };
+enum : UINT { WM_APP_SES = WM_APP + 32 }; // session event arrived
+static const int kBarH = 64;              // control bar height (video only)
+static const wchar_t* kMediaBarClass = L"SneekPeekMediaBar";
 
 struct MediaCtx {
     HWND hwnd = NULL;
+    HWND hBar = NULL;
     HINSTANCE hInst = NULL;
     int dpi = 96;
     MediaKind kind = MediaKind::None;
@@ -60,35 +65,29 @@ struct MediaCtx {
     std::wstring err;
     bool shown = false;
     bool comInit = false;
-    // image state (CPU path only)
-    std::vector<BYTE> dib;
-    int dibW = 0, dibH = 0;       // decoded buffer size
-    int imgW = 0, imgH = 0;       // native size (rotated)
+    // image state (stb RGBA buffer, swizzled once to BGRA for GDI)
+    unsigned char* px = nullptr;
+    int pxW = 0, pxH = 0; // buffer dims == native dims (full decode)
+    int imgW = 0, imgH = 0;
     double zoom = 1.0, fitZoom = 1.0;
     double offX = 0.0, offY = 0.0; // content origin in client coords
     int turns = 0;
     bool panning = false;
     POINT panAt{};
     double panOX = 0.0, panOY = 0.0;
-    // video state
-    ID3D11Device* d3d = nullptr;
-    ID3D11DeviceContext* dctx = nullptr;
-    IDXGIFactory1* dxgi = nullptr;
-    IDXGISwapChain* swap = nullptr;
-    IMFDXGIDeviceManager* mgr = nullptr;
-    IMFMediaEngine* engine = nullptr;
-    IMFMediaEngineEx* engineEx = nullptr;
-    ID2D1Factory* d2d = nullptr;
-    IDWriteFactory* dw = nullptr;
-    IDWriteTextFormat* tf = nullptr;
-    ID2D1RenderTarget* overlay = nullptr;
-    ID2D1SolidColorBrush* bWhite = nullptr;
-    ID2D1SolidColorBrush* bDim = nullptr;
-    ID2D1SolidColorBrush* bAccent = nullptr;
-    ID2D1SolidColorBrush* bTrack = nullptr;
-    double duration = 0.0;
+    // video state (session)
+    IMFMediaSession* session = nullptr;
+    IMFMediaSource* source = nullptr;
+    IMFPresentationDescriptor* pd = nullptr;
+    IMFTopology* topo = nullptr;
+    IMFPresentationClock* clock = nullptr;
+    IMFRateControl* rate = nullptr;
+    IMFSimpleAudioVolume* audio = nullptr;
+    SessionEvents* events = nullptr;
+    double duration = 0.0; // seconds, 0 = unknown
+    double segPos = 0.0;  // content position at segClock
+    LONGLONG segClock = 0;
     bool playing = false;
-    bool sizeKnown = false; // native size arrived (late sizes self-correct)
     bool muted = false;
     double volume = 1.0;
     int rateIdx = 3; // 1.0x
@@ -98,29 +97,31 @@ struct MediaCtx {
     int lastShownSec = -1;
     double lastTime = -1.0;
     DWORD lastAdvanceTick = 0;
+    HFONT barFont = NULL;
     // chrome state
     bool fullscreen = false;
     RECT savedRect{};
     // Safety net: windowless-failure paths delete the context without a
-    // WM_DESTROY. The windowed teardown releases everything first (SafeRelease
-    // nulls), so this is a no-op there. COM uninit stays explicit (ownership
-    // differs per path), never here.
+    // WM_DESTROY. The windowed teardown releases everything first
+    // (SafeRelease nulls), so this is a no-op there. COM uninit stays
+    // explicit (ownership differs per path), never here.
     ~MediaCtx() {
-        SafeRelease(overlay);
-        SafeRelease(bWhite);
-        SafeRelease(bDim);
-        SafeRelease(bAccent);
-        SafeRelease(bTrack);
-        SafeRelease(tf);
-        SafeRelease(dw);
-        SafeRelease(d2d);
-        SafeRelease(engineEx);
-        SafeRelease(engine);
-        SafeRelease(mgr);
-        SafeRelease(swap);
-        SafeRelease(dxgi);
-        SafeRelease(dctx);
-        SafeRelease(d3d);
+        if (px) {
+            stbi_image_free(px);
+            px = nullptr;
+        }
+        if (barFont) {
+            DeleteObject(barFont);
+            barFont = NULL;
+        }
+        SafeRelease(events);
+        SafeRelease(audio);
+        SafeRelease(rate);
+        SafeRelease(clock);
+        SafeRelease(topo);
+        SafeRelease(pd);
+        SafeRelease(source);
+        SafeRelease(session);
     }
 };
 
@@ -130,19 +131,87 @@ int g_hwProbe = -1; // -1 unknown, 0 software, 1 hardware (process cache)
 
 int DpxM(int px, int dpi) { return MulDiv(px, dpi, 96); }
 
-// (MediaHwnd/MediaHardwareDecode/MediaDecodeLabel live at global scope
-// below the namespace: media.h declares them with external linkage.)
-
-// ---- process helpers ------------------------------------------------
-
 bool MediaDllPresent(const wchar_t* name) {
-    // Existence probe without executing entry points: keeps N-edition
-    // machines (no mfplat.dll) on the graceful-failure path instead of a
-    // delay-load fault.
+    // Existence probe without executing entry points: a missing media DLL
+    // degrades to an honest message, never a delay-load fault.
     HMODULE m = LoadLibraryExW(name, NULL, LOAD_LIBRARY_AS_DATAFILE);
     if (m) FreeLibrary(m);
     return m != NULL;
 }
+
+} // namespace
+
+// ---- bridge implementations (external linkage to match media.h) ---------
+
+HWND MediaHwnd() { return (g_m && g_m->hwnd) ? g_m->hwnd : NULL; }
+
+int MediaHardwareDecode() {
+    // Answers "can THIS GPU decode video" via D3D11 decoder profiles,
+    // adapter by adapter. Runs only on first Settings open (cached); never
+    // at boot or idle. Fully dynamic (GetProcAddress): no D3D import library
+    // is linked, so nothing maps until this runs.
+    if (g_hwProbe >= 0) return g_hwProbe;
+    g_hwProbe = 0; // guilty until proven innocent
+    if (!MediaDllPresent(L"d3d11.dll") || !MediaDllPresent(L"dxgi.dll"))
+        return g_hwProbe;
+    bool uninit = false;
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED |
+                                      COINIT_DISABLE_OLE1DDE);
+    if (hr == S_OK) uninit = true;
+    else if (hr != S_FALSE && hr != RPC_E_CHANGED_MODE) return g_hwProbe;
+    HMODULE dxgiLib = LoadLibraryW(L"dxgi.dll");
+    HMODULE d3dLib = LoadLibraryW(L"d3d11.dll");
+    typedef HRESULT (WINAPI *CreateDxgiFn)(REFIID, void**);
+    typedef HRESULT (WINAPI *CreateDevFn)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE,
+        UINT, const D3D_FEATURE_LEVEL*, UINT, UINT, ID3D11Device**,
+        D3D_FEATURE_LEVEL*, ID3D11DeviceContext**);
+    CreateDxgiFn pCreateDxgi = dxgiLib
+        ? (CreateDxgiFn)GetProcAddress(dxgiLib, "CreateDXGIFactory1") : nullptr;
+    CreateDevFn pCreateDev = d3dLib
+        ? (CreateDevFn)GetProcAddress(d3dLib, "D3D11CreateDevice") : nullptr;
+    if (pCreateDxgi && pCreateDev) {
+        IDXGIFactory1* dxgi = nullptr;
+        if (SUCCEEDED(pCreateDxgi(IID_IDXGIFactory1, (void**)&dxgi)) && dxgi) {
+            static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1,
+                                                       D3D_FEATURE_LEVEL_11_0};
+            for (UINT i = 0;; i++) {
+                IDXGIAdapter1* ad = nullptr;
+                if (FAILED(dxgi->EnumAdapters1(i, &ad))) break;
+                ID3D11Device* dev = nullptr;
+                HRESULT hr2 = pCreateDev(ad, D3D_DRIVER_TYPE_UNKNOWN, NULL,
+                    D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    levels, 2, D3D11_SDK_VERSION, &dev, NULL, NULL);
+                SafeRelease(ad);
+                if (SUCCEEDED(hr2) && dev) {
+                    ID3D11VideoDevice* vd = nullptr;
+                    if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&vd))) && vd) {
+                        if (vd->GetVideoDecoderProfileCount() > 0)
+                            g_hwProbe = 1;
+                        SafeRelease(vd);
+                    }
+                    SafeRelease(dev);
+                    if (g_hwProbe > 0) break;
+                }
+            }
+            SafeRelease(dxgi);
+        }
+    }
+    if (dxgiLib) FreeLibrary(dxgiLib);
+    if (d3dLib) FreeLibrary(d3dLib);
+    if (uninit) CoUninitialize();
+    return g_hwProbe;
+}
+
+std::wstring MediaDecodeLabel() {
+    int hw = MediaHardwareDecode();
+    if (hw > 0) return L"Video decode: Hardware (GPU)";
+    if (hw == 0) return L"Video decode: Software (CPU)";
+    return L"Video decode: Unknown";
+}
+
+namespace {
+
+// ---- shared helpers -----------------------------------------------------
 
 void MediaExtendFrame(HWND hwnd) {
     if (HMODULE d = LoadLibraryW(L"dwmapi.dll")) {
@@ -161,95 +230,6 @@ bool WorkAreaFor(HWND hwnd, RECT& out) {
     if (!GetMonitorInfoW(mon, &mi)) return false;
     out = mi.rcWork;
     return true;
-}
-
-// ---- images (WIC, CPU only) ------------------------------------------
-
-// Decode at most maxW/maxH (aspect kept); native size used when smaller, so
-// a full-size image is never materialised unless the view needs it.
-bool DecodeImageAt(const std::wstring& path, int maxW, int maxH, int turns,
-                   std::vector<BYTE>& bits, int& outW, int& outH) {
-    bits.clear();
-    outW = outH = 0;
-    IWICImagingFactory* fac = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
-                                IID_PPV_ARGS(&fac))) || !fac)
-        return false;
-    bool ok = false;
-    IWICBitmapDecoder* dec = nullptr;
-    IWICBitmapFrameDecode* frame = nullptr;
-    IWICBitmapScaler* scaler = nullptr;
-    IWICBitmapFlipRotator* rot = nullptr;
-    IWICFormatConverter* conv = nullptr;
-    if (SUCCEEDED(fac->CreateDecoderFromFilename(path.c_str(), NULL, GENERIC_READ,
-                                                 WICDecodeMetadataCacheOnDemand, &dec)) && dec &&
-        SUCCEEDED(dec->GetFrame(0, &frame)) && frame) {
-        UINT nw = 0, nh = 0;
-        if (SUCCEEDED(frame->GetSize(&nw, &nh)) && nw > 0 && nh > 0 &&
-            nw <= 16384 && nh <= 16384) { // sanity: no OOM/overflow below
-            double s = 1.0;
-            if (maxW > 0 && maxH > 0) {
-                double sx = (double)maxW / (double)nw;
-                double sy = (double)maxH / (double)nh;
-                s = sx < sy ? sx : sy;
-                if (s > 1.0) s = 1.0; // never upscale at decode
-            }
-            UINT dw = (UINT)(nw * s + 0.5), dh = (UINT)(nh * s + 0.5);
-            if (dw < 1) dw = 1;
-            if (dh < 1) dh = 1;
-            IWICBitmapSource* src = frame;
-            // Scaler failure must fall back to NATIVE dims, never to a size
-            // mismatch: decoding native pixels into a smaller buffer would
-            // over-read the heap and paint garbage.
-            UINT sw = nw, sh = nh;
-            if (SUCCEEDED(fac->CreateBitmapScaler(&scaler)) && scaler &&
-                SUCCEEDED(scaler->Initialize(frame, dw, dh,
-                                             WICBitmapInterpolationModeFant))) {
-                src = scaler;
-                sw = dw;
-                sh = dh;
-            }
-            int tw = (int)(((turns & 1) ? sh : sw));
-            int th = (int)(((turns & 1) ? sw : sh));
-            if (turns & 3) {
-                WICBitmapTransformOptions opt = WICBitmapTransformRotate0;
-                int t = ((turns % 4) + 4) % 4;
-                if (t == 1) opt = WICBitmapTransformRotate90;
-                else if (t == 2) opt = WICBitmapTransformRotate180;
-                else if (t == 3) opt = WICBitmapTransformRotate270;
-                IWICBitmapFlipRotator* r2 = nullptr;
-                if (SUCCEEDED(fac->CreateBitmapFlipRotator(&r2)) && r2 &&
-                    SUCCEEDED(r2->Initialize(src, opt))) {
-                    rot = r2;
-                    src = rot;
-                } else if (r2) {
-                    r2->Release();
-                }
-            }
-            if (SUCCEEDED(fac->CreateFormatConverter(&conv)) && conv &&
-                SUCCEEDED(conv->Initialize(src, GUID_WICPixelFormat32bppBGRA,
-                                           WICBitmapDitherTypeNone, NULL, 0.0,
-                                           WICBitmapPaletteTypeCustom))) {
-                UINT stride = (UINT)tw * 4;
-                bits.resize((size_t)stride * (size_t)th);
-                if (SUCCEEDED(conv->CopyPixels(NULL, stride,
-                                              (UINT)bits.size(), bits.data()))) {
-                    outW = tw;
-                    outH = th;
-                    ok = true;
-                } else {
-                    bits.clear();
-                }
-            }
-        }
-    }
-    SafeRelease(conv);
-    SafeRelease(rot);
-    SafeRelease(scaler);
-    SafeRelease(frame);
-    SafeRelease(dec);
-    SafeRelease(fac);
-    return ok;
 }
 
 // Sibling media paths in one folder, Explorer logical order. Reuses the
@@ -284,63 +264,156 @@ int SiblingStep(const std::vector<std::wstring>& sibs, const std::wstring& cur, 
     return -1;
 }
 
+// ---- images (stb_image, CPU/GDI only) -----------------------------------
+// File bytes are read with CreateFileW (Unicode-safe; stb has no W variant)
+// and decoded from memory. stb has no scaler-at-decode: the full frame is
+// materialised transiently (~72 MB for 24 MP, released on close/navigate),
+// which the old WIC path avoided — documented tradeoff for zero new DLLs.
+
+bool ReadFileBytes(const std::wstring& path, std::vector<BYTE>& out) {
+    out.clear();
+    HANDLE hf = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    bool ok = false;
+    if (GetFileSizeEx(hf, &sz) && sz.QuadPart > 0 &&
+        sz.QuadPart <= (LONGLONG)256 * 1024 * 1024) {
+        out.resize((size_t)sz.QuadPart);
+        DWORD done = 0, total = 0;
+        ok = true;
+        while (total < out.size()) {
+            DWORD chunk = (DWORD)((out.size() - total) > 32 * 1024 * 1024
+                                      ? 32 * 1024 * 1024
+                                      : out.size() - total);
+            if (!ReadFile(hf, out.data() + total, chunk, &done, NULL) || done == 0) {
+                ok = false;
+                break;
+            }
+            total += done;
+        }
+        if (total != out.size()) ok = false;
+    }
+    CloseHandle(hf);
+    if (!ok) out.clear();
+    return ok;
+}
+
+// In-place RGBA -> BGRA swizzle (GDI DIBs are BGRA; alpha byte ignored).
+void SwizzleRB(unsigned char* px, int w, int h) {
+    for (int i = 0, n = w * h; i < n; i++, px += 4) {
+        unsigned char t = px[0];
+        px[0] = px[2];
+        px[2] = t;
+    }
+}
+
+// Decode + swizzle. Returns the buffer (caller frees with stbi_image_free).
+unsigned char* DecodeImage(const std::wstring& path, int& w, int& h) {
+    w = h = 0;
+    std::vector<BYTE> file;
+    if (!ReadFileBytes(path, file)) return nullptr;
+    int comp = 0;
+    unsigned char* px = stbi_load_from_memory(file.data(), (int)file.size(),
+                                              &w, &h, &comp, 4);
+    if (!px || w <= 0 || h <= 0 || w > 16384 || h > 16384) {
+        if (px) stbi_image_free(px);
+        return nullptr;
+    }
+    SwizzleRB(px, w, h);
+    return px;
+}
+
+// 90-degree clockwise transpose of an RGBA/BGRA buffer (rotation uses it).
+unsigned char* Rotate90CW(const unsigned char* src, int w, int h) {
+    if (!src || w <= 0 || h <= 0) return nullptr;
+    unsigned char* dst = (unsigned char*)malloc((size_t)w * (size_t)h * 4);
+    if (!dst) return nullptr;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            memcpy(dst + ((size_t)x * (size_t)h + (size_t)(h - 1 - y)) * 4,
+                   src + ((size_t)y * (size_t)w + (size_t)x) * 4, 4);
+    return dst;
+}
+
+void ImageCenter(MediaCtx* m) {
+    RECT cl{};
+    GetClientRect(m->hwnd, &cl);
+    int vw = cl.right - cl.left, vh = cl.bottom - cl.top;
+    int cw = (int)(m->pxW * m->zoom + 0.5);
+    int ch = (int)(m->pxH * m->zoom + 0.5);
+    m->offX = (vw - cw) / 2.0;
+    m->offY = (vh - ch) / 2.0;
+    MediaClampPan(m->offX, m->offY, cw, ch, vw, vh);
+}
+
+void ImageZoomAt(MediaCtx* m, int cx, int cy, double factor) {
+    double nz = MediaClampZoom(m->zoom * factor);
+    if (nz == m->zoom) return;
+    // Anchor the content point under the cursor.
+    double wx = (cx - m->offX) / m->zoom;
+    double wy = (cy - m->offY) / m->zoom;
+    m->zoom = nz;
+    m->offX = cx - wx * nz;
+    m->offY = cy - wy * nz;
+    RECT cl{};
+    GetClientRect(m->hwnd, &cl);
+    MediaClampPan(m->offX, m->offY, (int)(m->pxW * nz + 0.5),
+                  (int)(m->pxH * nz + 0.5), cl.right - cl.left, cl.bottom - cl.top);
+    InvalidateRect(m->hwnd, NULL, FALSE);
+}
+
+void ImagePaint(MediaCtx* m, HDC dc) {
+    RECT cl{};
+    GetClientRect(m->hwnd, &cl);
+    HBRUSH bg = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    FillRect(dc, &cl, bg);
+    if (!m->px || m->pxW <= 0 || m->pxH <= 0 || m->zoom <= 0.0) return;
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = m->pxW;
+    bmi.bmiHeader.biHeight = -m->pxH; // top-down DIB
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    int dw = (int)(m->pxW * m->zoom + 0.5);
+    int dh = (int)(m->pxH * m->zoom + 0.5);
+    int dx = (int)(m->offX + 0.5), dy = (int)(m->offY + 0.5);
+    SetStretchBltMode(dc, HALFTONE);
+    if (StretchDIBits(dc, dx, dy, dw, dh, 0, 0, m->pxW, m->pxH,
+                      m->px, &bmi, DIB_RGB_COLORS, SRCCOPY) == 0) {
+        // GDI refused the blit: an honest error beats a mystery blank window.
+        // WM_DESTROY reports these via the identical restore path.
+        m->failed = true;
+        m->err = L"This image couldn't be drawn on this PC.";
+        PostMessageW(m->hwnd, WM_CLOSE, 0, 0);
+    }
+}
+
+// (Re)load path into the live window. Resets the view; keeps the window.
+bool LoadImagePath(MediaCtx* m, const std::wstring& path) {
+    int w = 0, h = 0;
+    unsigned char* px = DecodeImage(path, w, h);
+    if (!px) return false;
+    if (m->px) stbi_image_free(m->px);
+    m->px = px;
+    m->pxW = m->imgW = w;
+    m->pxH = m->imgH = h;
+    m->path = path;
+    size_t sep = path.find_last_of(L"\\/");
+    m->folder = (sep == std::wstring::npos) ? L"" : path.substr(0, sep + 1);
+    m->turns = 0;
+    RECT cl{};
+    GetClientRect(m->hwnd, &cl);
+    m->fitZoom = MediaFitScale(w, h, cl.right - cl.left, cl.bottom - cl.top);
+    m->zoom = m->fitZoom;
+    ImageCenter(m);
+    return true;
+}
+
 } // namespace
 
 // ---- open / close lifecycle (bridge implementation) -------------------
-// External linkage to match media.h (main.cpp calls these). Everything
-// they touch lives in this TU.
-
-HWND MediaHwnd() { return (g_m && g_m->hwnd) ? g_m->hwnd : NULL; }
-
-int MediaHardwareDecode() {
-    // Answers "can THIS GPU decode video" by asking D3D11 itself for decoder
-    // profiles, adapter by adapter (same order as playback). This deliberately
-    // avoids MFTEnumEx: it reports registered MFTs, not what the active
-    // adapter supports, and its profile of the hybrid-GPU case is murky.
-    // Runs only on first Settings open (cached); never at boot or idle.
-    if (g_hwProbe >= 0) return g_hwProbe;
-    g_hwProbe = 0; // guilty until proven innocent
-    if (!MediaDllPresent(L"d3d11.dll")) return g_hwProbe;
-    bool uninit = false;
-    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED |
-                                      COINIT_DISABLE_OLE1DDE);
-    if (hr == S_OK) uninit = true;
-    else if (hr != S_FALSE && hr != RPC_E_CHANGED_MODE) return g_hwProbe;
-    IDXGIFactory1* dxgi = nullptr;
-    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&dxgi))) && dxgi) {
-        static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1,
-                                                   D3D_FEATURE_LEVEL_11_0};
-        for (UINT i = 0;; i++) {
-            IDXGIAdapter1* ad = nullptr;
-            if (FAILED(dxgi->EnumAdapters1(i, &ad))) break;
-            ID3D11Device* dev = nullptr;
-            HRESULT hr2 = D3D11CreateDevice(ad, D3D_DRIVER_TYPE_UNKNOWN, NULL,
-                D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                levels, 2, D3D11_SDK_VERSION, &dev, NULL, NULL);
-            SafeRelease(ad);
-            if (SUCCEEDED(hr2) && dev) {
-                ID3D11VideoDevice* vd = nullptr;
-                if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&vd))) && vd) {
-                    if (vd->GetVideoDecoderProfileCount() > 0)
-                        g_hwProbe = 1;
-                    SafeRelease(vd);
-                }
-                SafeRelease(dev);
-                if (g_hwProbe > 0) break;
-            }
-        }
-        SafeRelease(dxgi);
-    }
-    if (uninit) CoUninitialize();
-    return g_hwProbe;
-}
-
-std::wstring MediaDecodeLabel() {
-    int hw = MediaHardwareDecode();
-    if (hw > 0) return L"Video decode: Hardware (GPU)";
-    if (hw == 0) return L"Video decode: Software (CPU)";
-    return L"Video decode: Unknown";
-}
 
 static void MediaFail(const std::wstring& err) {
     // Failure before first frame: never show a black window. If the window
@@ -354,7 +427,6 @@ static void MediaFail(const std::wstring& err) {
     }
     std::wstring e = err;
     if (g_m) {
-        // Tear down COM init owned by this open (no window was created).
         if (g_m->comInit) CoUninitialize();
         delete g_m;
         g_m = nullptr;
@@ -364,26 +436,6 @@ static void MediaFail(const std::wstring& err) {
 
 static bool OpenImage(const std::wstring& path);
 static bool OpenVideo(const std::wstring& path);
-
-// All-or-nothing gate: a missing media DLL must degrade to an honest
-// message, never a delay-load fault (which would terminate the process).
-static bool MediaStackPresent(MediaKind mk, std::wstring& err) {
-    auto need = [&](const wchar_t* dll, const wchar_t* what) {
-        if (MediaDllPresent(dll)) return true;
-        err = std::wstring(L"Couldn't open this file (") + what +
-              L" missing on this Windows build).";
-        return false;
-    };
-    if (!need(L"windowscodecs.dll", L"image support")) return false;
-    if (mk == MediaKind::Video) {
-        if (!need(L"mfplat.dll", L"Media Feature Pack")) return false;
-        if (!need(L"d3d11.dll", L"video device support")) return false;
-        if (!need(L"dxgi.dll", L"video device support")) return false;
-        if (!need(L"d2d1.dll", L"video overlay support")) return false;
-        if (!need(L"dwrite.dll", L"video overlay support")) return false;
-    }
-    return true;
-}
 
 bool MediaOpen(HINSTANCE hInst, HWND owner, int dpi, const std::wstring& path,
                std::wstring& err) {
@@ -411,7 +463,6 @@ bool MediaOpen(HINSTANCE hInst, HWND owner, int dpi, const std::wstring& path,
     m->path = path;
     size_t sep = path.find_last_of(L"\\/");
     m->folder = (sep == std::wstring::npos) ? L"" : path.substr(0, sep + 1);
-    m->rateIdx = MediaSpeedDefaultIndex();
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED |
                                       COINIT_DISABLE_OLE1DDE);
     if (hr == S_OK) m->comInit = true;
@@ -436,162 +487,39 @@ bool MediaOpen(HINSTANCE hInst, HWND owner, int dpi, const std::wstring& path,
     return true;
 }
 
-// ---- image path ---------------------------------------------------------
-
 namespace {
 
-void ImageCenter(MediaCtx* m) {
-    RECT cl{};
-    GetClientRect(m->hwnd, &cl);
-    int vw = cl.right - cl.left, vh = cl.bottom - cl.top;
-    int cw = (int)(m->dibW * m->zoom + 0.5);
-    int ch = (int)(m->dibH * m->zoom + 0.5);
-    m->offX = (vw - cw) / 2.0;
-    m->offY = (vh - ch) / 2.0;
-    MediaClampPan(m->offX, m->offY, cw, ch, vw, vh);
-}
-
-// Decode enough pixels for the current view (never the full image unless
-// the zoom genuinely needs it).
-bool ImageEnsureRes(MediaCtx* m) {
-    RECT cl{};
-    GetClientRect(m->hwnd, &cl);
-    int vw = cl.right - cl.left, vh = cl.bottom - cl.top;
-    if (vw <= 0 || vh <= 0 || m->zoom <= 0.0) return true;
-    int needW = (int)(vw / m->zoom + 0.5) + 2;
-    int needH = (int)(vh / m->zoom + 0.5) + 2;
-    if (needW <= m->dibW && needH <= m->dibH) return true;
-    int boxW = needW > m->dibW ? needW : m->dibW;
-    int boxH = needH > m->dibH ? needH : m->dibH;
-    if (boxW > m->imgW) boxW = m->imgW;
-    if (boxH > m->imgH) boxH = m->imgH;
-    std::vector<BYTE> bits;
-    int w = 0, h = 0;
-    if (!DecodeImageAt(m->path, boxW, boxH, m->turns, bits, w, h)) return false;
-    m->dib.swap(bits);
-    m->dibW = w;
-    m->dibH = h;
+// All-or-nothing gate: a missing media DLL must degrade to an honest
+// message, never a delay-load fault (which would terminate the process).
+// stb_image needs no DLL at all; video needs the MF + EVR stack.
+bool MediaStackPresent(MediaKind mk, std::wstring& err) {
+    auto need = [&](const wchar_t* dll, const wchar_t* what) {
+        if (MediaDllPresent(dll)) return true;
+        err = std::wstring(L"Couldn't open this file (") + what +
+              L" missing on this Windows build).";
+        return false;
+    };
+    if (mk == MediaKind::Video) {
+        if (!need(L"mfplat.dll", L"Media Feature Pack")) return false;
+        if (!need(L"evr.dll", L"video renderer")) return false;
+    }
     return true;
 }
-
-void ImageZoomAt(MediaCtx* m, int cx, int cy, double factor) {
-    double nz = MediaClampZoom(m->zoom * factor);
-    if (nz == m->zoom) return;
-    // Anchor the content point under the cursor.
-    double wx = (cx - m->offX) / m->zoom;
-    double wy = (cy - m->offY) / m->zoom;
-    m->zoom = nz;
-    if (!ImageEnsureRes(m)) return;
-    m->offX = cx - wx * nz;
-    m->offY = cy - wy * nz;
-    RECT cl{};
-    GetClientRect(m->hwnd, &cl);
-    MediaClampPan(m->offX, m->offY, (int)(m->dibW * nz + 0.5),
-                  (int)(m->dibH * nz + 0.5), cl.right - cl.left, cl.bottom - cl.top);
-    InvalidateRect(m->hwnd, NULL, FALSE);
-}
-
-void ImagePaint(MediaCtx* m, HDC dc) {
-    RECT cl{};
-    GetClientRect(m->hwnd, &cl);
-    HBRUSH bg = (HBRUSH)GetStockObject(BLACK_BRUSH);
-    FillRect(dc, &cl, bg);
-    if (m->dib.empty() || m->dibW <= 0 || m->dibH <= 0 || m->zoom <= 0.0) return;
-    // Buffer/size mismatch (should be impossible): skip the blit rather than
-    // painting garbage.
-    if (m->dib.size() < (size_t)m->dibW * (size_t)m->dibH * 4) return;
-    BITMAPINFO bmi{};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = m->dibW;
-    bmi.bmiHeader.biHeight = -m->dibH; // top-down DIB
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-    int dw = (int)(m->dibW * m->zoom + 0.5);
-    int dh = (int)(m->dibH * m->zoom + 0.5);
-    int dx = (int)(m->offX + 0.5), dy = (int)(m->offY + 0.5);
-    SetStretchBltMode(dc, HALFTONE);
-    if (StretchDIBits(dc, dx, dy, dw, dh, 0, 0, m->dibW, m->dibH,
-                      m->dib.data(), &bmi, DIB_RGB_COLORS, SRCCOPY) == 0) {
-        // GDI refused the blit: an honest error beats a mystery blank window.
-        // WM_DESTROY reports these via the identical restore path.
-        m->failed = true;
-        m->err = L"This image couldn't be drawn on this PC.";
-        PostMessageW(m->hwnd, WM_CLOSE, 0, 0);
-    }
-}
-
-// Native pixel size via header read only (GetSize parses headers, never
-// decodes pixels). Lets zoom-in re-decode up to true native resolution even
-// when the first decode was work-area clamped.
-bool ImageNativeSize(const std::wstring& path, int& w, int& h) {
-    w = h = 0;
-    IWICImagingFactory* fac = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
-                                IID_PPV_ARGS(&fac))) || !fac)
-        return false;
-    bool ok = false;
-    IWICBitmapDecoder* dec = nullptr;
-    IWICBitmapFrameDecode* frame = nullptr;
-    if (SUCCEEDED(fac->CreateDecoderFromFilename(path.c_str(), NULL, GENERIC_READ,
-                                                 WICDecodeMetadataCacheOnDemand, &dec)) &&
-        dec && SUCCEEDED(dec->GetFrame(0, &frame)) && frame) {
-        UINT nw = 0, nh = 0;
-        if (SUCCEEDED(frame->GetSize(&nw, &nh)) && nw > 0 && nh > 0 &&
-            nw < 100000 && nh < 100000) {
-            w = (int)nw;
-            h = (int)nh;
-            ok = true;
-        }
-    }
-    SafeRelease(frame);
-    SafeRelease(dec);
-    SafeRelease(fac);
-    return ok;
-}
-
-bool LoadImagePath(MediaCtx* m, const std::wstring& path) {
-    RECT area{0, 0, 1024, 768};
-    WorkAreaFor(m->hwnd, area);
-    int aw = area.right - area.left, ah = area.bottom - area.top;
-    std::vector<BYTE> bits;
-    int w = 0, h = 0;
-    if (!DecodeImageAt(path, aw, ah, 0, bits, w, h) || w <= 0 || h <= 0)
-        return false;
-    m->path = path;
-    size_t sep = path.find_last_of(L"\\/");
-    m->folder = (sep == std::wstring::npos) ? L"" : path.substr(0, sep + 1);
-    m->dib.swap(bits);
-    m->dibW = w;
-    m->dibH = h;
-    int nw = 0, nh = 0; // true native size: zoom-in may exceed this decode
-    if (ImageNativeSize(path, nw, nh)) { m->imgW = nw; m->imgH = nh; }
-    else { m->imgW = w; m->imgH = h; }
-    m->turns = 0;
-    RECT cl{};
-    GetClientRect(m->hwnd, &cl);
-    m->fitZoom = MediaFitScale(w, h, cl.right - cl.left, cl.bottom - cl.top);
-    m->zoom = m->fitZoom;
-    ImageCenter(m);
-    return true;
-}
-
-} // namespace
 
 static bool OpenImage(const std::wstring& path) {
     MediaCtx* m = g_m;
     RECT area{0, 0, 1024, 768};
     WorkAreaFor(m->hwnd, area); // hwnd NULL: primary monitor work area
     int aw = area.right - area.left, ah = area.bottom - area.top;
-    std::vector<BYTE> bits;
-    int w = 0, h = 0;
-    if (!DecodeImageAt(path, aw, ah, 0, bits, w, h) || w <= 0 || h <= 0) {
-        m->err = L"This image couldn't be decoded on this Windows build.";
-        return false;
-    }
-    int ww = 0, wh = 0;
     // Initial window covers ~70% of the work area, centered (never
     // edge-to-edge); small images still open at native 1:1.
+    int ww = 0, wh = 0;
+    int w = 0, h = 0;
+    unsigned char* px = DecodeImage(path, w, h);
+    if (!px) {
+        m->err = L"This image couldn't be decoded on this PC.";
+        return false;
+    }
     MediaFitWindow(w, h, (aw * 7) / 10, (ah * 7) / 10, ww, wh);
     HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kMediaClass, L"SneekPeek",
                                 WS_POPUP | WS_THICKFRAME | WS_CLIPCHILDREN,
@@ -599,16 +527,14 @@ static bool OpenImage(const std::wstring& path) {
                                 (area.top + area.bottom - wh) / 2, ww, wh,
                                 NULL, NULL, m->hInst, NULL);
     if (!hwnd) {
+        stbi_image_free(px);
         m->err = L"Couldn't open this file";
         return false;
     }
     m->hwnd = hwnd;
-    m->dib.swap(bits);
-    m->dibW = w;
-    m->dibH = h;
-    int nw = 0, nh = 0; // true native size (see LoadImagePath)
-    if (ImageNativeSize(path, nw, nh)) { m->imgW = nw; m->imgH = nh; }
-    else { m->imgW = w; m->imgH = h; }
+    m->px = px;
+    m->pxW = m->imgW = w;
+    m->pxH = m->imgH = h;
     m->turns = 0;
     RECT cl{};
     GetClientRect(hwnd, &cl);
@@ -623,160 +549,262 @@ static bool OpenImage(const std::wstring& path) {
     return true;
 }
 
-// ---- video path (Media Foundation + D3D11) ------------------------------
+// ---- video path (Media Foundation session + EVR) -----------------------
+// Source Resolver -> partial topology (decoder auto-inserted, hardware when
+// offered) -> EVR video + audio renderer, driven by session events. No
+// swapchain, no D3D device management, no overlay surfaces: EVR presents
+// itself and letterboxes internally; controls are a GDI child window.
 
-namespace {
-
-void VideoRevokeSwap(MediaCtx* m) {
-    // Outstanding surface refs must be gone before ResizeBuffers: surfaces
-    // are acquired per present and released right after, so nothing to do
-    // here beyond the overlay target (bound to the old buffers).
-    SafeRelease(m->overlay);
-    SafeRelease(m->bWhite);
-    SafeRelease(m->bDim);
-    SafeRelease(m->bAccent);
-    SafeRelease(m->bTrack);
-}
-
-bool VideoCreateSwap(MediaCtx* m) {
-    if (!m->dxgi || !m->d3d || !m->hwnd) return false;
-    SafeRelease(m->swap);
-    VideoRevokeSwap(m);
-    RECT cl{};
-    GetClientRect(m->hwnd, &cl);
-    int w = cl.right - cl.left, h = cl.bottom - cl.top;
-    if (w < 64) w = 64;
-    if (h < 64) h = 64;
-    DXGI_SWAP_CHAIN_DESC sd{};
-    sd.BufferCount = 1;
-    sd.BufferDesc.Width = (UINT)w;
-    sd.BufferDesc.Height = (UINT)h;
-    sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    sd.BufferDesc.RefreshRate.Numerator = 60;
-    sd.BufferDesc.RefreshRate.Denominator = 1;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow = m->hwnd;
-    sd.SampleDesc.Count = 1;
-    sd.Windowed = TRUE;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-    return SUCCEEDED(m->dxgi->CreateSwapChain(m->d3d, &sd, &m->swap)) && m->swap;
-}
-
-// Letterboxed destination rect preserving the video aspect.
-RECT VideoDstRect(MediaCtx* m, int vw, int vh) {
-    RECT r{0, 0, vw, vh};
-    DWORD nw = 0, nh = 0;
-    if (m->engine && SUCCEEDED(m->engine->GetNativeVideoSize(&nw, &nh)) &&
-        nw > 0 && nh > 0 && vw > 0 && vh > 0) {
-        double s = (double)vw / (double)nw;
-        double t = (double)vh / (double)nh;
-        double z = s < t ? s : t;
-        int dw = (int)(nw * z + 0.5), dh = (int)(nh * z + 0.5);
-        r.left = (vw - dw) / 2;
-        r.top = (vh - dh) / 2;
-        r.right = r.left + dw;
-        r.bottom = r.top + dh;
+class SessionEvents : public IMFAsyncCallback {
+    LONG m_ref = 1;
+    IMFMediaSession* m_ses = nullptr;
+    HWND m_hwnd = NULL;
+    bool m_dead = false;
+public:
+    SessionEvents(IMFMediaSession* ses, HWND hwnd) : m_hwnd(hwnd) {
+        m_ses = ses;
+        if (m_ses) m_ses->AddRef();
     }
-    return r;
-}
-
-bool VideoEnsureOverlay(MediaCtx* m) {
-    if (m->overlay) return true;
-    if (!m->d2d || !m->dw || !m->swap) return false;
-    IDXGISurface* surf = nullptr;
-    if (FAILED(m->swap->GetBuffer(0, IID_PPV_ARGS(&surf))) || !surf) return false;
-    bool ok = false;
-    D2D1_RENDER_TARGET_PROPERTIES props{};
-    props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
-    props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
-    props.dpiX = 96.0f;
-    props.dpiY = 96.0f;
-    if (SUCCEEDED(m->d2d->CreateDxgiSurfaceRenderTarget(surf, &props, &m->overlay)) &&
-        m->overlay) {
-        D2D1_COLOR_F white{1.0f, 1.0f, 1.0f, 1.0f};
-        D2D1_COLOR_F dim{1.0f, 1.0f, 1.0f, 0.55f};
-        D2D1_COLOR_F accent{0.38f, 0.65f, 0.98f, 1.0f};
-        D2D1_COLOR_F track{1.0f, 1.0f, 1.0f, 0.22f};
-        ok = SUCCEEDED(m->overlay->CreateSolidColorBrush(white, &m->bWhite)) &&
-             SUCCEEDED(m->overlay->CreateSolidColorBrush(dim, &m->bDim)) &&
-             SUCCEEDED(m->overlay->CreateSolidColorBrush(accent, &m->bAccent)) &&
-             SUCCEEDED(m->overlay->CreateSolidColorBrush(track, &m->bTrack));
-        if (!m->tf) {
-            m->dw->CreateTextFormat(L"Segoe UI", NULL, DWRITE_FONT_WEIGHT_NORMAL,
-                                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                                    13.0f, L"", &m->tf);
+    void Detach() {
+        m_dead = true;
+        m_hwnd = NULL;
+        SafeRelease(m_ses);
+    }
+    void SetHwnd(HWND h) { m_hwnd = h; }
+    STDMETHODIMP QueryInterface(REFIID riid, void** pp) {
+        if (!pp) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IMFAsyncCallback) {
+            *pp = static_cast<IMFAsyncCallback*>(this);
+            AddRef();
+            return S_OK;
         }
-        if (!ok) VideoRevokeSwap(m);
+        *pp = nullptr;
+        return E_NOINTERFACE;
     }
-    SafeRelease(surf);
-    return ok && m->overlay;
+    STDMETHODIMP_(ULONG) AddRef() { return (ULONG)InterlockedIncrement(&m_ref); }
+    STDMETHODIMP_(ULONG) Release() {
+        LONG r = InterlockedDecrement(&m_ref);
+        if (!r) delete this;
+        return (ULONG)r;
+    }
+    STDMETHODIMP GetParameters(DWORD*, DWORD*) { return E_NOTIMPL; }
+    STDMETHODIMP Invoke(IMFAsyncResult* r) {
+        MediaEventType t = MEUnknown;
+        HRESULT edata = S_OK;
+        if (r && !m_dead && m_ses) {
+            IMFMediaEvent* e = nullptr;
+            if (SUCCEEDED(m_ses->EndGetEvent(r, &e)) && e) {
+                e->GetType(&t);
+                if (t == MESessionTopologyStatus) {
+                    UINT32 st = 0;
+                    if (SUCCEEDED(e->GetUINT32(MF_EVENT_TOPOLOGY_STATUS, &st)))
+                        edata = (HRESULT)st;
+                } else if (t == MEError) {
+                    e->GetStatus(&edata);
+                }
+                SafeRelease(e);
+            }
+        }
+        if (!m_dead && m_hwnd) PostMessageW(m_hwnd, WM_APP_SES, (WPARAM)t, (LPARAM)edata);
+        if (!m_dead && m_ses) m_ses->BeginGetEvent(this, NULL);
+        return S_OK;
+    }
+};
+
+bool VideoBuildTopology(MediaCtx* m, IMFMediaSource* src) {
+    IMFPresentationDescriptor* pd = nullptr;
+    if (FAILED(src->CreatePresentationDescriptor(&pd)) || !pd) return false;
+    m->pd = pd; // owned from here (released in teardown)
+    DWORD streams = 0;
+    if (FAILED(pd->GetStreamDescriptorCount(&streams))) return false;
+    IMFTopology* topo = nullptr;
+    if (FAILED(MFCreateTopology(&topo)) || !topo) return false;
+    m->topo = topo;
+    for (DWORD i = 0; i < streams; i++) {
+        IMFStreamDescriptor* sd = nullptr;
+        BOOL selected = FALSE;
+        if (FAILED(pd->GetStreamDescriptorByIndex(i, &selected, &sd)) || !sd) continue;
+        IMFMediaTypeHandler* handler = nullptr;
+        GUID major = GUID_NULL;
+        if (SUCCEEDED(sd->GetMediaTypeHandler(&handler)) && handler)
+            handler->GetMajorType(&major);
+        SafeRelease(handler);
+        DWORD sid = 0;
+        sd->GetStreamIdentifier(&sid);
+        IMFActivate* act = nullptr;
+        bool want = false;
+        if (major == MFMediaType_Video) {
+            want = SUCCEEDED(MFCreateVideoRendererActivate(m->hwnd, &act)) && act;
+            pd->SelectStream(sid);
+        } else if (major == MFMediaType_Audio) {
+            want = SUCCEEDED(MFCreateAudioRendererActivate(&act)) && act;
+            pd->SelectStream(sid);
+        } else {
+            pd->DeselectStream(sid); // subtitles, scripts: not rendered
+        }
+        if (!want) {
+            SafeRelease(sd);
+            continue;
+        }
+        IMFTopologyNode* srcNode = nullptr;
+        IMFTopologyNode* outNode = nullptr;
+        bool linked = false;
+        if (SUCCEEDED(MFCreateTopologyNode(MF_TOPOLOGY_SOURCESTREAM_NODE, &srcNode)) &&
+            srcNode &&
+            SUCCEEDED(MFCreateTopologyNode(MF_TOPOLOGY_OUTPUT_NODE, &outNode)) &&
+            outNode) {
+            srcNode->SetUnknown(MF_TOPONODE_SOURCE, (IUnknown*)m->source);
+            srcNode->SetUnknown(MF_TOPONODE_PRESENTATION_DESCRIPTOR, (IUnknown*)pd);
+            srcNode->SetUnknown(MF_TOPONODE_STREAM_DESCRIPTOR, (IUnknown*)sd);
+            outNode->SetObject(act);
+            if (SUCCEEDED(topo->AddNode(srcNode)) && SUCCEEDED(topo->AddNode(outNode)) &&
+                SUCCEEDED(srcNode->ConnectOutput(0, outNode, 0)))
+                linked = true;
+        }
+        SafeRelease(srcNode);
+        SafeRelease(outNode);
+        SafeRelease(act);
+        SafeRelease(sd);
+        if (!linked) return false;
+    }
+    // Duration for the scrub bar (absent on some files: UI degrades to 0:00).
+    UINT64 dur100ns = 0;
+    if (SUCCEEDED(pd->GetUINT64(MF_PD_DURATION, &dur100ns)) && dur100ns > 0)
+        m->duration = (double)dur100ns / 10000000.0;
+    return true;
 }
 
-void VideoDrawControls(MediaCtx* m) {
-    if (!VideoEnsureOverlay(m)) return;
-    RECT cl{};
-    GetClientRect(m->hwnd, &cl);
-    int W = cl.right - cl.left, H = cl.bottom - cl.top;
-    if (W <= 0 || H <= 0) return;
-    m->overlay->BeginDraw();
-    D2D1_COLOR_F band{0.0f, 0.0f, 0.0f, 0.55f};
-    ID2D1SolidColorBrush* bBand = nullptr;
-    m->overlay->CreateSolidColorBrush(band, &bBand);
-    float top = (float)(H - 64);
-    if (bBand) {
-        D2D1_RECT_F br{0.0f, top, (float)W, (float)H};
-        m->overlay->FillRectangle(&br, bBand);
-        bBand->Release();
+void VideoTrackClock(MediaCtx* m) {
+    // Snapshot the clock base for position(). Called after every Start.
+    SafeRelease(m->clock);
+    if (m->session) m->session->GetClock(&m->clock);
+    if (m->clock) {
+        LONGLONG t = 0;
+        if (SUCCEEDED(m->clock->GetTime(&t))) m->segClock = t;
     }
-    double cur = m->engine ? m->engine->GetCurrentTime() : 0.0;
-    double frac = 0.0;
-    if (m->duration > 0.0 && cur >= 0.0) {
-        frac = cur / m->duration;
-        if (frac < 0.0) frac = 0.0;
-        if (frac > 1.0) frac = 1.0;
-    }
-    float x0 = 16.0f, x1 = (float)W - 16.0f;
-    float by = (float)H - 40.0f;
-    D2D1_RECT_F track{x0, by - 3.0f, x1, by + 3.0f};
-    m->overlay->FillRectangle(&track, m->bTrack);
-    D2D1_RECT_F fill{x0, by - 3.0f, x0 + (float)(frac * (x1 - x0)), by + 3.0f};
-    if (fill.right > fill.left) m->overlay->FillRectangle(&fill, m->bAccent);
-    D2D1_ELLIPSE knob{{x0 + (float)(frac * (x1 - x0)), by}, 5.0f, 5.0f};
-    m->overlay->FillEllipse(&knob, m->bWhite);
-    if (m->tf) {
-        std::wstring left = MediaFormatSpeed(kMediaSpeeds[m->rateIdx]) + L"  " +
-                            MediaVolumeLabel(m->muted, m->volume);
-        D2D1_RECT_F lr{x0, (float)H - 26.0f, x0 + 220.0f, (float)H - 6.0f};
-        m->overlay->DrawText(left.c_str(), (UINT32)left.size(), m->tf, &lr, m->bDim);
-        std::wstring right = MediaFormatTimePair(cur < 0.0 ? 0.0 : cur,
-                                                m->duration < 0.0 ? 0.0 : m->duration);
-        D2D1_RECT_F rr{x1 - 220.0f, (float)H - 26.0f, x1, (float)H - 6.0f};
-        m->overlay->DrawText(right.c_str(), (UINT32)right.size(), m->tf, &rr, m->bDim);
-    }
-    m->overlay->EndDraw();
 }
 
-// One presented frame: video blit, then the D2D control pass, then flip.
-// Overlay surfaces are acquired per present so ResizeBuffers is always safe.
-bool VideoPresent(MediaCtx* m, bool withOverlay) {
-    if (!m->swap || !m->engine) return false;
-    RECT cl{};
-    GetClientRect(m->hwnd, &cl);
-    int W = cl.right - cl.left, H = cl.bottom - cl.top;
-    if (W <= 0 || H <= 0) return true;
-    IDXGISurface* surf = nullptr;
-    if (FAILED(m->swap->GetBuffer(0, IID_PPV_ARGS(&surf))) || !surf) return false;
-    RECT dst = VideoDstRect(m, W, H);
-    MFARGB black{255, 0, 0, 0}; // MFARGB channels are bytes, not floats
-    HRESULT hr = m->engine->TransferVideoFrame(surf, NULL, &dst, &black);
-    SafeRelease(surf);
-    if (FAILED(hr)) return false;
-    if (withOverlay && m->controls) VideoDrawControls(m);
-    return SUCCEEDED(m->swap->Present(1, 0));
+double VideoPosition(MediaCtx* m) {
+    if (!m->clock || !m->playing) return m->segPos; // frozen while paused
+    LONGLONG t = 0;
+    if (FAILED(m->clock->GetTime(&t))) return m->segPos;
+    double p = m->segPos + (double)(t - m->segClock) / 10000000.0;
+    if (p < 0.0) p = 0.0;
+    if (m->duration > 0.0 && p > m->duration) p = m->duration;
+    return p;
 }
 
-void VideoShowControls(MediaCtx* m, bool show) {
+bool VideoEnsureRate(MediaCtx* m) {
+    if (m->rate || !m->session) return m->rate != nullptr;
+    IMFRateControl* rc = nullptr;
+    if (SUCCEEDED(MFGetService(m->session, MF_RATE_CONTROL_SERVICE,
+                               IID_PPV_ARGS(&rc))) &&
+        rc) {
+        m->rate = rc;
+        return true;
+    }
+    SafeRelease(rc);
+    return false;
+}
+
+bool VideoEnsureAudio(MediaCtx* m) {
+    if (m->audio || !m->session) return m->audio != nullptr;
+    IMFSimpleAudioVolume* av = nullptr;
+    if (SUCCEEDED(MFGetService(m->session, MR_POLICY_VOLUME_SERVICE,
+                               IID_PPV_ARGS(&av))) &&
+        av) {
+        m->audio = av;
+        return true;
+    }
+    SafeRelease(av);
+    return false;
+}
+
+void VideoUpdateBar(MediaCtx* m) {
+    if (m->hBar) InvalidateRect(m->hBar, NULL, FALSE);
+}
+
+void VideoSetPlaying(MediaCtx* m, bool play) {
+    if (!m->session || m->playing == play) return;
+    if (play) {
+        if (FAILED(m->session->Start(&GUID_NULL, NULL))) return;
+        m->playing = true;
+        VideoTrackClock(m);
+        m->lastTime = -1.0;
+        m->lastAdvanceTick = GetTickCount();
+        SetTimer(m->hwnd, IDT_UI, 100, NULL);
+        VideoShowBar(m, true);
+    } else {
+        m->segPos = VideoPosition(m); // freeze where we are
+        m->session->Pause();
+        m->playing = false;
+        KillTimer(m->hwnd, IDT_UI);
+        VideoShowBar(m, true); // forced visible while paused
+    }
+}
+
+void VideoSeekTo(MediaCtx* m, double t, bool resume) {
+    if (!m->session) return;
+    if (t < 0.0) t = 0.0;
+    if (m->duration > 0.0 && t > m->duration) t = m->duration;
+    PROPVARIANT var{};
+    var.vt = VT_I8;
+    var.hVal.QuadPart = (LONGLONG)(t * 10000000.0);
+    HRESULT hr = m->session->Start(&GUID_NULL, &var);
+    PropVariantClear(&var);
+    if (FAILED(hr)) return;
+    m->segPos = t;
+    VideoTrackClock(m);
+    m->lastTime = -1.0;
+    m->lastAdvanceTick = GetTickCount();
+    if (resume && !m->playing) {
+        m->playing = true; // Start() is already rolling: mirror the state
+        SetTimer(m->hwnd, IDT_UI, 100, NULL);
+    } else if (!resume && m->playing) {
+        // Paused seek: start-then-pause lands exactly on the frame.
+        m->session->Pause();
+        m->playing = false;
+        KillTimer(m->hwnd, IDT_UI);
+        m->segPos = t;
+        VideoTrackClock(m);
+    }
+    m->lastShownSec = -1;
+    VideoUpdateBar(m);
+}
+
+void VideoFrameStep(MediaCtx* m, bool fwd) {
+    if (!m->session) return;
+    if (m->playing) VideoSetPlaying(m, false);
+    VideoSeekTo(m, VideoPosition(m) + (fwd ? 1.0 / 30.0 : -1.0 / 30.0), false);
+}
+
+void VideoSetRate(MediaCtx* m, int idx) {
+    idx = MediaSpeedClamp(idx);
+    if (idx == m->rateIdx) return;
+    if (VideoEnsureRate(m) && SUCCEEDED(m->rate->SetRate(FALSE, (float)kMediaSpeeds[idx]))) {
+        m->rateIdx = idx;
+        VideoTrackClock(m); // the clock now advances at the new rate
+        m->lastShownSec = -1;
+        VideoUpdateBar(m);
+    }
+}
+
+void VideoSetVolume(MediaCtx* m, double v, bool mute) {
+    if (v < 0.0) v = 0.0;
+    if (v > 1.0) v = 1.0;
+    if (VideoEnsureAudio(m)) {
+        m->audio->SetMasterVolume((float)v);
+        m->audio->SetMute(mute ? TRUE : FALSE);
+    }
+    m->volume = v;
+    m->muted = mute;
+    m->lastShownSec = -1;
+    VideoUpdateBar(m);
+    if (!m->controls) VideoShowBar(m, true);
+}
+
+void VideoShowBar(MediaCtx* m, bool show) {
+    if (!m->hBar) return;
     if (m->controls == show) {
         if (show) {
             KillTimer(m->hwnd, IDT_HIDE);
@@ -786,102 +814,30 @@ void VideoShowControls(MediaCtx* m, bool show) {
         return;
     }
     m->controls = show;
+    ShowWindow(m->hBar, show ? SW_SHOW : SW_HIDE);
     if (show) {
         KillTimer(m->hwnd, IDT_HIDE);
         if (m->playing && !m->scrubbing) SetTimer(m->hwnd, IDT_HIDE, 2500, NULL);
-        m->lastShownSec = -1; // force label refresh
-        VideoPresent(m, true);
+        m->lastShownSec = -1;
+        VideoUpdateBar(m);
     } else {
         KillTimer(m->hwnd, IDT_HIDE);
-        VideoPresent(m, false);
     }
 }
 
-void VideoSetPlaying(MediaCtx* m, bool play) {
-    if (!m->engine || m->playing == play) return;
-    if (play) {
-        if (FAILED(m->engine->Play())) return;
-        m->playing = true;
-        m->lastTime = -1.0;
-        m->lastAdvanceTick = GetTickCount();
-        SetTimer(m->hwnd, IDT_PUMP, 16, NULL);
-        VideoShowControls(m, true);
-    } else {
-        m->engine->Pause();
-        m->playing = false;
-        KillTimer(m->hwnd, IDT_PUMP);
-        VideoShowControls(m, true); // forced visible while paused
-        VideoPresent(m, true);
-    }
-}
-
-// Poll the engine: errors, duration, first frame, end-of-stream, stalls.
-// Deterministic for local files; no reliance on callback plumbing.
-// 100 ms loader: duration, readiness, first frame. Runs only until shown;
-// the watchdog bounds the whole wait, so a stall can never hang silently.
-void VideoPollLoad(MediaCtx* m) {
-    if (!m->engine || m->closing || m->shown) return;
-    if (m->duration <= 0.0) {
-        double d = m->engine->GetDuration();
-        if (d > 0.0) m->duration = d;
-    }
-    // Ready-state values mirror HTML (HAVE_CURRENT_DATA = 2); the watchdog
-    // bounds any stall regardless.
-    int rs = (int)m->engine->GetReadyState();
-    if (rs < 2) return; // still loading
-    DWORD nw = 0, nh = 0;
-    bool sized = SUCCEEDED(m->engine->GetNativeVideoSize(&nw, &nh)) &&
-                 nw > 0 && nh > 0;
-    RECT area{0, 0, 960, 540};
-    WorkAreaFor(m->hwnd, area);
-    int aw = area.right - area.left, ah = area.bottom - area.top;
-    // Initial window covers ~70% of the work area (never edge-to-edge).
-    int ww = 960, wh = 540;
-    if (sized) {
-        MediaFitWindow((int)nw, (int)nh, (aw * 7) / 10, (ah * 7) / 10, ww, wh);
-        m->sizeKnown = true;
-    } else {
-        // Size unknown yet: show at a default size and play anyway. The
-        // letterbox rect corrects itself once the size arrives (no resize,
-        // no failure just for reporting late).
-        if (ww > aw) ww = aw;
-        if (wh > ah) wh = ah;
-    }
-    if (!VideoCreateSwap(m)) {
-        MediaFail(L"This video couldn't be played on this Windows build.");
-        return;
-    }
-    SetWindowPos(m->hwnd, HWND_TOP,
-                 (area.left + area.right - ww) / 2,
-                 (area.top + area.bottom - wh) / 2, ww, wh,
-                 SWP_SHOWWINDOW);
-    SetForegroundWindow(m->hwnd);
-    m->shown = true;
-    KillTimer(m->hwnd, IDT_WATCHDOG);
-    VideoSetPlaying(m, true);
-    if (!m->playing)
-        MediaFail(L"This video couldn't be started on this Windows build.");
-}
-
-// 16 ms pump while playing: present EVERY tick (the old code only presented
-// on second changes, freezing the picture), plus end-of-stream and stall
-// bookkeeping. Pausing kills this timer; nothing runs while paused.
-void VideoPumpFrame(MediaCtx* m) {
-    if (!m->engine || m->closing || !m->playing) return;
-    if (!m->sizeKnown) {
-        DWORD nw = 0, nh = 0; // late arrival: dst rect self-corrects, no resize
-        if (SUCCEEDED(m->engine->GetNativeVideoSize(&nw, &nh)) && nw > 0 && nh > 0)
-            m->sizeKnown = true;
-    }
-    VideoPresent(m, m->controls);
-    double cur = m->engine->GetCurrentTime();
+// 100 ms UI tick while playing: clock labels, end-of-stream, stalls.
+// Nothing runs while paused: the frame simply holds.
+void VideoTick(MediaCtx* m) {
+    if (!m->session || m->closing || !m->playing) return;
+    double cur = VideoPosition(m);
     if (m->duration > 0.0 && cur >= m->duration - 0.05) {
-        // End of stream: hold the last frame, show controls.
-        m->engine->Pause();
+        // End of stream: hold the last frame, show the bar.
+        m->session->Pause();
         m->playing = false;
-        KillTimer(m->hwnd, IDT_PUMP);
-        VideoShowControls(m, true);
-        VideoPresent(m, true);
+        KillTimer(m->hwnd, IDT_UI);
+        m->segPos = m->duration;
+        VideoShowBar(m, true);
+        VideoUpdateBar(m);
         return;
     }
     DWORD now = GetTickCount();
@@ -895,102 +851,108 @@ void VideoPumpFrame(MediaCtx* m) {
         m->lastAdvanceTick = now;
     }
     int sec = (int)cur;
-    if (sec != m->lastShownSec) m->lastShownSec = sec; // labels read live
-}
-
-void VideoSeekTo(MediaCtx* m, double t) {
-    if (!m->engine || m->duration <= 0.0) return;
-    if (t < 0.0) t = 0.0;
-    if (t > m->duration) t = m->duration;
-    if (FAILED(m->engine->SetCurrentTime(t))) return;
-    m->lastTime = -1.0;
-    m->lastAdvanceTick = GetTickCount();
-    VideoPresent(m, true);
-}
-
-void VideoFrameStep(MediaCtx* m, bool fwd) {
-    if (!m->engine) return;
-    if (m->playing) VideoSetPlaying(m, false);
-    if (m->engineEx) {
-        if (SUCCEEDED(m->engineEx->FrameStep(fwd ? TRUE : FALSE))) {
-            VideoPresent(m, true);
-            return;
-        }
-    }
-    double cur = m->engine->GetCurrentTime(); // fallback: ~one frame at 30 fps
-    VideoSeekTo(m, cur + (fwd ? 1.0 / 30.0 : -1.0 / 30.0));
-}
-
-void VideoSetRate(MediaCtx* m, int idx) {
-    idx = MediaSpeedClamp(idx);
-    if (!m->engine || idx == m->rateIdx) return;
-    if (SUCCEEDED(m->engine->SetPlaybackRate(kMediaSpeeds[idx]))) {
-        m->rateIdx = idx;
-        m->lastShownSec = -1;
-        if (m->controls) VideoPresent(m, true);
+    if (sec != m->lastShownSec) {
+        m->lastShownSec = sec;
+        VideoUpdateBar(m);
     }
 }
 
-void VideoSetVolume(MediaCtx* m, double v, bool mute) {
-    if (!m->engine) return;
-    if (v < 0.0) v = 0.0;
-    if (v > 1.0) v = 1.0;
-    m->engine->SetVolume(v);
-    m->engine->SetMuted(mute ? TRUE : FALSE);
-    m->volume = v;
-    m->muted = mute;
+void VideoTeardown(MediaCtx* m) {
+    // Stop events first so no callback can fire mid-teardown.
+    if (m->events) {
+        m->events->Detach();
+        m->events->Release();
+        m->events = nullptr;
+    }
+    if (m->session) {
+        m->session->CloseSession();
+        m->session->Shutdown();
+    }
+    SafeRelease(m->rate);
+    SafeRelease(m->audio);
+    SafeRelease(m->clock);
+    SafeRelease(m->topo);
+    SafeRelease(m->pd);
+    SafeRelease(m->source);
+    SafeRelease(m->session);
+    m->playing = false;
+    m->duration = 0.0;
+    m->segPos = 0.0;
+    KillTimer(m->hwnd, IDT_UI);
+    KillTimer(m->hwnd, IDT_HIDE);
+    KillTimer(m->hwnd, IDT_WATCHDOG);
+}
+
+bool VideoLoad(MediaCtx* m, const std::wstring& path) {
+    VideoTeardown(m);
+    m->path = path;
+    size_t sep = path.find_last_of(L"\\/");
+    m->folder = (sep == std::wstring::npos) ? L"" : path.substr(0, sep + 1);
+    m->rateIdx = MediaSpeedDefaultIndex();
+    m->muted = false;
+    m->volume = 1.0;
+    m->controls = true;
+    m->scrubbing = false;
     m->lastShownSec = -1;
-    if (m->controls) VideoPresent(m, true);
-    else VideoShowControls(m, true);
+    m->lastTime = -1.0;
+    IMFSourceResolver* resolver = nullptr;
+    if (FAILED(MFCreateSourceResolver(&resolver)) || !resolver) {
+        m->err = L"Couldn't start video playback on this PC.";
+        return false;
+    }
+    MF_OBJECT_TYPE objType = MF_OBJECT_INVALID;
+    IUnknown* unk = nullptr;
+    HRESULT hr = resolver->CreateObjectFromURL(path.c_str(), MF_RESOLUTION_MEDIASOURCE,
+                                               NULL, &objType, &unk);
+    SafeRelease(resolver);
+    if (FAILED(hr) || !unk || objType != MF_OBJECT_MEDIASOURCE) {
+        SafeRelease(unk);
+        m->err = L"This video couldn't be opened on this Windows build "
+                 L"(missing codec — try Ctrl+Enter).";
+        return false;
+    }
+    IMFMediaSource* src = nullptr;
+    hr = unk->QueryInterface(IID_PPV_ARGS(&src));
+    SafeRelease(unk);
+    if (FAILED(hr) || !src) {
+        m->err = L"This video couldn't be opened on this Windows build "
+                 L"(missing codec — try Ctrl+Enter).";
+        return false;
+    }
+    m->source = src; // owned from here
+    if (!VideoBuildTopology(m, src)) {
+        m->err = L"This video has no playable streams on this Windows build.";
+        return false;
+    }
+    // Fresh session + events per source: the teardown above shut the old
+    // session down, and a shut session never plays again.
+    if (FAILED(MFCreateMediaSession(NULL, &m->session)) || !m->session) {
+        m->err = L"Couldn't start video playback on this PC.";
+        return false;
+    }
+    m->events = new (std::nothrow) SessionEvents(m->session, m->hwnd);
+    if (!m->events) {
+        m->err = L"Out of memory";
+        return false;
+    }
+    if (FAILED(m->session->SetTopology(0, m->topo))) {
+        m->err = L"This video couldn't be played on this Windows build.";
+        return false;
+    }
+    // Events flow from here; READY starts playback (watchdog bounds it).
+    m->events->BeginGetEvent(m->events, NULL);
+    SetTimer(m->hwnd, IDT_WATCHDOG, 10000, NULL);
+    return true;
 }
+
+static bool OpenVideo(const std::wstring& path);
+static LRESULT CALLBACK MediaBarProc(HWND hwnd, UINT m, WPARAM w, LPARAM l);
+static void EnsureMediaBarClass(HINSTANCE hInst);
 
 } // namespace
 
 static bool OpenVideo(const std::wstring& path) {
     MediaCtx* m = g_m;
-    // Hybrid-GPU safe: first adapter that supports video wins. Never assume
-    // adapter 0 (on battery Windows may park the discrete GPU; MF then uses
-    // Intel QuickSync — no special handling needed).
-    IDXGIFactory1* dxgi = nullptr;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&dxgi))) || !dxgi) {
-        m->err = L"Couldn't start video playback on this PC.";
-        return false;
-    }
-    m->dxgi = dxgi;
-    static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1,
-                                               D3D_FEATURE_LEVEL_11_0};
-    ID3D11Device* dev = nullptr;
-    ID3D11DeviceContext* ctx = nullptr;
-    for (UINT i = 0;; i++) {
-        IDXGIAdapter1* ad = nullptr;
-        if (FAILED(dxgi->EnumAdapters1(i, &ad))) break;
-        HRESULT hr = D3D11CreateDevice(ad, D3D_DRIVER_TYPE_UNKNOWN, NULL,
-                                       D3D11_CREATE_DEVICE_VIDEO_SUPPORT |
-                                           D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                                       levels, 2, D3D11_SDK_VERSION,
-                                       &dev, NULL, &ctx);
-        SafeRelease(ad);
-        if (SUCCEEDED(hr) && dev) break;
-        SafeRelease(dev);
-        SafeRelease(ctx);
-    }
-    if (!dev) {
-        m->err = L"Couldn't start video playback on this PC (no video-capable GPU).";
-        return false;
-    }
-    m->d3d = dev;
-    m->dctx = ctx;
-    IMFDXGIDeviceManager* mgr = nullptr;
-    UINT token = 0;
-    if (FAILED(MFCreateDXGIDeviceManager(&token, &mgr)) || !mgr) {
-        m->err = L"Couldn't start video playback on this PC.";
-        return false;
-    }
-    m->mgr = mgr;
-    if (FAILED(mgr->ResetDevice(dev, token))) {
-        m->err = L"Couldn't start video playback on this PC.";
-        return false;
-    }
     if (!g_mfStarted) {
         // Process-lifetime MF: started on first video open (never at boot),
         // never shut down (reopen cost would return for zero benefit).
@@ -1000,54 +962,9 @@ static bool OpenVideo(const std::wstring& path) {
         }
         g_mfStarted = true;
     }
-    IMFAttributes* attr = nullptr;
-    IMFMediaEngineClassFactory* fac = nullptr;
-    IMFMediaEngine* eng = nullptr;
-    bool ok = false;
-    if (SUCCEEDED(MFCreateAttributes(&attr, 2)) && attr) {
-        attr->SetUnknown(MF_MEDIA_ENGINE_DXGI_MANAGER, mgr);
-        attr->SetUINT32(MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT,
-                        DXGI_FORMAT_B8G8R8A8_UNORM);
-        if (SUCCEEDED(CoCreateInstance(CLSID_MFMediaEngineClassFactory, NULL,
-                                       CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac))) &&
-            fac &&
-            SUCCEEDED(fac->CreateInstance(0, attr, &eng)) && eng) {
-            m->engine = eng; // ownership transferred
-            eng->QueryInterface(IID_PPV_ARGS(&m->engineEx)); // FrameStep; may stay NULL
-            ok = true;
-        }
-    }
-    SafeRelease(fac);
-    SafeRelease(attr);
-    if (!ok) {
-        m->err = L"This video couldn't be played on this Windows build "
-                 L"(missing codec — try Ctrl+Enter).";
-        return false;
-    }
-    // D2D/DWrite factories for the control overlay (created with the video
-    // path only, so images never map these DLLs).
-    // Explicit-IID factory form (no options struct needed).
-    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                                 __uuidof(ID2D1Factory), (void**)&m->d2d)) ||
-        !m->d2d) {
-        m->err = L"Couldn't start video playback on this PC.";
-        return false;
-    }
-    if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
-                                   (IUnknown**)&m->dw)) ||
-        !m->dw) {
-        m->err = L"Couldn't start video playback on this PC.";
-        return false;
-    }
-    if (FAILED(m->dw->CreateTextFormat(L"Segoe UI", NULL, DWRITE_FONT_WEIGHT_NORMAL,
-                                       DWRITE_FONT_STYLE_NORMAL,
-                                       DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"", &m->tf)) ||
-        !m->tf) {
-        m->err = L"Couldn't start video playback on this PC.";
-        return false;
-    }
-    // Hidden window first: it only ever appears with a frame ready, so a
-    // failure can never leave a black window behind.
+    // Hidden window first (session + events are created per source inside
+    // VideoLoad, after the window exists to post to): a failure can never
+    // leave a black window behind.
     RECT area{0, 0, 960, 540};
     WorkAreaFor(NULL, area);
     int ww = 960, wh = 540;
@@ -1064,23 +981,143 @@ static bool OpenVideo(const std::wstring& path) {
     }
     m->hwnd = hwnd;
     MediaExtendFrame(hwnd);
-    BSTR url = SysAllocString(path.c_str());
-    HRESULT hr = url ? m->engine->SetSource(url) : E_OUTOFMEMORY;
-    if (url) SysFreeString(url);
-    if (FAILED(hr)) {
+    EnsureMediaBarClass(m->hInst);
+    // Control bar: GDI child window docked at the bottom (own proc below).
+    m->hBar = CreateWindowExW(0, kMediaBarClass, L"",
+                              WS_CHILD | WS_CLIPSIBLINGS,
+                              0, wh - kBarH, ww, kBarH,
+                              hwnd, (HMENU)7, m->hInst, NULL);
+    if (m->hBar) {
+        HFONT f = CreateFontW(-DpxM(13, m->dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE,
+                              FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                              CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                              DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        if (f) {
+            if (m->barFont) DeleteObject(m->barFont);
+            m->barFont = f;
+        }
+        ShowWindow(m->hBar, SW_SHOW);
+    }
+    if (!VideoLoad(m, path)) {
         // Window exists but nothing was shown: destroy it — WM_DESTROY runs
         // the identical restore path, so MediaOpen just reports failure.
-        m->err = L"This video couldn't be played on this Windows build "
-                 L"(missing codec — try Ctrl+Enter).";
         DestroyWindow(hwnd);
         return false;
     }
-    m->volume = 1.0;
-    m->engine->SetVolume(1.0);
-    m->engine->SetMuted(FALSE);
-    SetTimer(hwnd, IDT_LOAD, 100, NULL);    // state poll until first frame
-    SetTimer(hwnd, IDT_WATCHDOG, 8000, NULL); // bounds stalls before first frame
     return true;
+}
+
+// ---- control bar (GDI child window, video only) -------------------------
+
+namespace {
+
+void BarLayout(MediaCtx* m) {
+    if (m->hBar && IsWindow(m->hBar)) {
+        RECT cl{};
+        GetClientRect(m->hwnd, &cl);
+        SetWindowPos(m->hBar, NULL, 0, cl.bottom - cl.top - kBarH,
+                     cl.right - cl.left, kBarH, SWP_NOZORDER);
+    }
+}
+
+void BarScrubTo(MediaCtx* m, int x) {
+    RECT cl{};
+    GetClientRect(m->hBar, &cl);
+    int l = 16, r = cl.right - cl.left - 16;
+    if (r <= l || m->duration <= 0.0) return;
+    double frac = (double)(x - l) / (double)(r - l);
+    if (frac < 0.0) frac = 0.0;
+    if (frac > 1.0) frac = 1.0;
+    VideoSeekTo(m, frac * m->duration, m->wasPlaying);
+}
+
+bool BarHitTest(MediaCtx* m, int y) {
+    RECT cl{};
+    GetClientRect(m->hBar, &cl);
+    return y >= 8 && y <= 32; // progress strip at the top of the bar
+}
+
+} // namespace
+
+static LRESULT CALLBACK MediaBarProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
+    MediaCtx* mc = g_m;
+    if (!mc || mc->hBar != hwnd) return DefWindowProcW(hwnd, m, w, l);
+    switch (m) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT cl{};
+        GetClientRect(hwnd, &cl);
+        HBRUSH bg = (HBRUSH)GetStockObject(BLACK_BRUSH);
+        FillRect(dc, &cl, bg);
+        SetBkMode(dc, TRANSPARENT);
+        if (mc->barFont) SelectObject(dc, mc->barFont);
+        double frac = 0.0, cur = VideoPosition(mc);
+        if (mc->duration > 0.0 && cur >= 0.0) {
+            frac = cur / mc->duration;
+            if (frac < 0.0) frac = 0.0;
+            if (frac > 1.0) frac = 1.0;
+        }
+        int x0 = 16, x1 = cl.right - cl.left - 16;
+        int by = 20;
+        HPEN track = CreatePen(PS_SOLID, 6, RGB(255, 255, 255));
+        HGDIOBJ old = SelectObject(dc, track);
+        // Track (dim) + fill (accent) as thick lines with round ends.
+        MoveToEx(dc, x0, by, NULL);
+        SelectObject(dc, GetStockObject(DC_PEN));
+        SetDCPenColor(dc, RGB(70, 70, 74));
+        LineTo(dc, x1, by);
+        MoveToEx(dc, x0, by, NULL);
+        SetDCPenColor(dc, RGB(96, 165, 250));
+        LineTo(dc, x0 + (int)(frac * (x1 - x0)), by);
+        int kx = x0 + (int)(frac * (x1 - x0));
+        HBRUSH knob = CreateSolidBrush(RGB(255, 255, 255));
+        HGDIOBJ ob = SelectObject(dc, knob);
+        HGDIOBJ op = SelectObject(dc, GetStockObject(NULL_PEN));
+        Ellipse(dc, kx - 5, by - 5, kx + 5, by + 5);
+        SelectObject(dc, op);
+        SelectObject(dc, ob);
+        DeleteObject(knob);
+        SelectObject(dc, old);
+        DeleteObject(track);
+        wchar_t left[64], right[64];
+        swprintf_s(left, 64, L"%s  %s", MediaFormatSpeed(kMediaSpeeds[mc->rateIdx]).c_str(),
+                   MediaVolumeLabel(mc->muted, mc->volume).c_str());
+        std::wstring rt = MediaFormatTimePair(cur < 0.0 ? 0.0 : cur,
+                                              mc->duration < 0.0 ? 0.0 : mc->duration);
+        SetTextColor(dc, RGB(150, 150, 155));
+        RECT lr{x0, 34, x0 + 260, cl.bottom - 4};
+        DrawTextW(dc, left, -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        RECT rr{x1 - 260, 34, x1, cl.bottom - 4};
+        DrawTextW(dc, rt.c_str(), -1, &rr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+        if (mc->duration > 0.0 && BarHitTest(mc, GET_Y_LPARAM(l))) {
+            mc->scrubbing = true;
+            mc->wasPlaying = mc->playing;
+            if (mc->playing) VideoSetPlaying(mc, false);
+            SetCapture(hwnd);
+            BarScrubTo(mc, GET_X_LPARAM(l));
+            VideoShowBar(mc, true);
+        }
+        return 0;
+    case WM_MOUSEMOVE:
+        if (mc->scrubbing) BarScrubTo(mc, GET_X_LPARAM(l));
+        return 0;
+    case WM_LBUTTONUP:
+        if (mc->scrubbing) {
+            mc->scrubbing = false;
+            ReleaseCapture();
+            if (mc->wasPlaying) VideoSetPlaying(mc, true);
+            VideoShowBar(mc, true);
+        }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, m, w, l);
 }
 
 // ---- window procedure -----------------------------------------------------
@@ -1091,8 +1128,7 @@ void MediaRequestClose() {
     if (!g_m || g_m->closing) return;
     g_m->closing = true;
     if (g_m->hwnd && IsWindow(g_m->hwnd)) {
-        KillTimer(g_m->hwnd, IDT_LOAD);
-        KillTimer(g_m->hwnd, IDT_PUMP);
+        KillTimer(g_m->hwnd, IDT_UI);
         KillTimer(g_m->hwnd, IDT_HIDE);
         KillTimer(g_m->hwnd, IDT_WATCHDOG);
         DestroyWindow(g_m->hwnd);
@@ -1126,50 +1162,23 @@ bool MediaActivateLost(HWND hwnd, LPARAM l) {
     return true;
 }
 
-bool MediaLoadPath(MediaCtx* m, const std::wstring& path) {
-    // Sibling hopping reuses the live window (no destroy/recreate flicker).
-    KillTimer(m->hwnd, IDT_LOAD);
-    KillTimer(m->hwnd, IDT_PUMP);
-    KillTimer(m->hwnd, IDT_WATCHDOG);
-    if (m->kind == MediaKind::Image) {
-        m->turns = 0;
-        if (!LoadImagePath(m, path)) {
-            MediaFail(L"This image couldn't be decoded on this Windows build.");
-            return false;
-        }
-        InvalidateRect(m->hwnd, NULL, FALSE);
-        return true;
-    }
-    if (m->engine) {
-        m->engine->Pause();
-        m->playing = false;
-        m->duration = 0.0;
-        m->lastTime = -1.0;
-        m->lastShownSec = -1;
-        BSTR url = SysAllocString(path.c_str());
-        HRESULT hr = url ? m->engine->SetSource(url) : E_OUTOFMEMORY;
-        if (url) SysFreeString(url);
-        if (FAILED(hr)) {
-            MediaFail(L"This video couldn't be played on this Windows build "
-                      L"(missing codec — try Ctrl+Enter).");
-            return false;
-        }
-        m->path = path;
-        size_t sep = path.find_last_of(L"\\/");
-        m->folder = (sep == std::wstring::npos) ? L"" : path.substr(0, sep + 1);
-        m->shown = false;
-        ShowWindow(m->hwnd, SW_HIDE);
-        SetTimer(m->hwnd, IDT_LOAD, 100, NULL);
-        SetTimer(m->hwnd, IDT_WATCHDOG, 8000, NULL);
-        return true;
-    }
-    return false;
-}
-
 int MediaHop(MediaCtx* m, int delta) {
     auto sibs = MediaSiblings(m->folder, m->kind);
     int to = SiblingStep(sibs, m->path, delta);
-    if (to >= 0) MediaLoadPath(m, sibs[(size_t)to]);
+    if (to < 0) return -1;
+    if (m->kind == MediaKind::Video) {
+        if (!VideoLoad(m, sibs[(size_t)to])) {
+            // Windowed failure already restored via WM_DESTROY; the caller
+            // must not touch m afterwards (MediaRequestClose guards this).
+            MediaFail(L"This video couldn't be played on this Windows build.");
+        }
+        return to;
+    }
+    if (!MediaLoadPath(m, sibs[(size_t)to])) {
+        MediaFail(L"This image couldn't be decoded on this PC.");
+        return to; // window gone; caller guards via MediaRequestClose
+    }
+    InvalidateRect(m->hwnd, NULL, FALSE);
     return to;
 }
 
@@ -1194,28 +1203,101 @@ void MediaDeleteCurrent(MediaCtx* m) {
     if (MediaHop(m, +1) < 0) MediaRequestClose();
 }
 
-bool MediaScrubZone(MediaCtx* m, int y, RECT& bar) {
-    RECT cl{};
-    GetClientRect(m->hwnd, &cl);
-    bar.left = 16;
-    bar.right = cl.right - cl.left - 16;
-    bar.top = cl.bottom - cl.top - 48;
-    bar.bottom = cl.bottom - cl.top - 24;
-    POINT p{0, y};
-    return PtInRect(&bar, p);
+void EnsureMediaBarClass(HINSTANCE hInst) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.hInstance = hInst;
+    wc.lpszClassName = kMediaBarClass;
+    wc.lpfnWndProc = MediaBarProc;
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    RegisterClassExW(&wc); // ALREADY_EXISTS is fine (single registration)
 }
 
-void MediaScrubTo(MediaCtx* m, int x) {
-    RECT bar{};
-    RECT cl{};
-    GetClientRect(m->hwnd, &cl);
-    bar.left = 16;
-    bar.right = cl.right - cl.left - 16;
-    if (bar.right <= bar.left || m->duration <= 0.0) return;
-    double frac = (double)(x - bar.left) / (double)(bar.right - bar.left);
-    if (frac < 0.0) frac = 0.0;
-    if (frac > 1.0) frac = 1.0;
-    VideoSeekTo(m, frac * m->duration);
+// Native video size for the initial window. Falls back to a default box:
+// EVR letterboxes internally, so playback never depends on knowing it.
+bool VideoNativeSize(MediaCtx* m, int& w, int& h) {
+    w = h = 0;
+    if (!m->session) return false;
+    IMFVideoDisplayControl* vdc = nullptr;
+    if (FAILED(MFGetService(m->session, MR_VIDEO_DISPLAY_SERVICE,
+                            IID_PPV_ARGS(&vdc))) ||
+        !vdc)
+        return false;
+    SIZE video{0, 0}, ar{0, 0};
+    bool ok = SUCCEEDED(vdc->GetNativeVideoSize(&video, &ar)) &&
+              video.cx > 0 && video.cy > 0;
+    if (ok) {
+        w = video.cx;
+        h = video.cy;
+    }
+    SafeRelease(vdc);
+    return ok;
+}
+
+// Session event dispatch (posted by SessionEvents::Invoke; all decisions
+// funnel through the same graceful-failure + restore contract).
+void OnSessionEvent(MediaCtx* m, MediaEventType type, LONG_PTR data) {
+    if (!m || m->closing) return;
+    switch (type) {
+    case MESessionTopologyStatus:
+        // Only READY matters; other topology statuses are normal progress,
+        // never failures.
+        if ((UINT32)data == MF_TOPOSTATUS_READY && !m->shown) {
+            int nw = 0, nh = 0;
+            RECT area{0, 0, 960, 540};
+            WorkAreaFor(m->hwnd, area);
+            int aw = area.right - area.left, ah = area.bottom - area.top;
+            int ww = 960, wh = 540;
+            if (VideoNativeSize(m, nw, nh)) {
+                int bw = (aw * 7) / 10, bh = (ah * 7) / 10;
+                MediaFitWindow(nw, nh, bw, bh, ww, wh);
+            } else {
+                if (ww > aw) ww = aw;
+                if (wh > ah) wh = ah;
+            }
+            SetWindowPos(m->hwnd, HWND_TOP,
+                         (area.left + area.right - ww) / 2,
+                         (area.top + area.bottom - wh) / 2, ww, wh,
+                         SWP_SHOWWINDOW);
+            SetForegroundWindow(m->hwnd);
+            m->shown = true;
+            KillTimer(m->hwnd, IDT_WATCHDOG);
+            VideoSetPlaying(m, true);
+            if (!m->playing)
+                MediaFail(L"This video couldn't be started on this Windows build.");
+        }
+        return;
+    case MESessionStarted:
+        m->playing = true;
+        VideoTrackClock(m);
+        m->lastTime = -1.0;
+        m->lastAdvanceTick = GetTickCount();
+        SetTimer(m->hwnd, IDT_UI, 100, NULL);
+        VideoShowBar(m, true);
+        return;
+    case MESessionPaused:
+        m->segPos = VideoPosition(m);
+        m->playing = false;
+        KillTimer(m->hwnd, IDT_UI);
+        VideoShowBar(m, true);
+        return;
+    case MESessionEnded:
+        m->playing = false;
+        KillTimer(m->hwnd, IDT_UI);
+        m->segPos = m->duration;
+        VideoShowBar(m, true);
+        VideoUpdateBar(m);
+        return;
+    case MEError:
+        MediaFail(L"This video couldn't be played on this Windows build.");
+        return;
+    default:
+        return;
+    }
 }
 
 } // namespace
@@ -1252,12 +1334,13 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_ERASEBKGND:
-        return 1; // every pixel painted in WM_PAINT / Present
+        return 1; // every pixel painted in WM_PAINT (images) or by EVR
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
-        if (mc->kind == MediaKind::Image) ImagePaint(mc, dc);
-        else {
+        if (mc->kind == MediaKind::Image) {
+            ImagePaint(mc, dc);
+        } else {
             RECT cl{};
             GetClientRect(hwnd, &cl);
             HBRUSH bg = (HBRUSH)GetStockObject(BLACK_BRUSH);
@@ -1268,22 +1351,22 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_SIZE:
         if (mc->kind == MediaKind::Image) {
-            MediaClampPan(mc->offX, mc->offY, (int)(mc->dibW * mc->zoom + 0.5),
-                          (int)(mc->dibH * mc->zoom + 0.5),
+            MediaClampPan(mc->offX, mc->offY, (int)(mc->pxW * mc->zoom + 0.5),
+                          (int)(mc->pxH * mc->zoom + 0.5),
                           LOWORD(l), HIWORD(l));
-            ImageEnsureRes(mc); // grown window may deserve more pixels
             InvalidateRect(hwnd, NULL, FALSE);
-        } else if (mc->swap && LOWORD(l) > 0 && HIWORD(l) > 0) {
-            VideoRevokeSwap(mc);
-            mc->swap->ResizeBuffers(0, LOWORD(l), HIWORD(l),
-                                    DXGI_FORMAT_UNKNOWN, 0);
-            VideoPresent(mc, mc->controls);
+        } else {
+            BarLayout(mc); // EVR tracks the window itself; re-dock the bar
+            InvalidateRect(hwnd, NULL, FALSE);
         }
         return 0;
     case WM_DPICHANGED:
         mc->dpi = HIWORD(w);
         InvalidateRect(hwnd, NULL, FALSE);
         break;
+    case WM_APP_SES:
+        OnSessionEvent(mc, (MediaEventType)w, (LONG_PTR)l);
+        return 0;
     case WM_KEYDOWN:
         if (mc->kind == MediaKind::Image) {
             switch (w) {
@@ -1319,31 +1402,27 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             case '1':
                 if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {
                     mc->zoom = 1.0;
-                    ImageEnsureRes(mc);
                     ImageCenter(mc);
                     InvalidateRect(hwnd, NULL, FALSE);
                     return 0;
                 }
                 break;
             case 'R': {
-                mc->turns = (mc->turns + 1) % 4;
-                std::vector<BYTE> bits;
-                int tw = 0, th = 0;
-                RECT cl{};
-                GetClientRect(hwnd, &cl);
-                int bw = cl.right - cl.left, bh = cl.bottom - cl.top;
-                if (DecodeImageAt(mc->path, bw > 0 ? bw : 64, bh > 0 ? bh : 64,
-                                  mc->turns, bits, tw, th) &&
-                    tw > 0 && th > 0) {
-                    mc->dib.swap(bits);
-                    mc->dibW = tw;
-                    mc->dibH = th;
-                    mc->fitZoom = MediaFitScale(tw, th, bw, bh);
+                unsigned char* rot = Rotate90CW(mc->px, mc->pxW, mc->pxH);
+                if (rot) {
+                    if (mc->px) stbi_image_free(mc->px);
+                    mc->px = rot;
+                    int t = mc->pxW;
+                    mc->pxW = mc->pxH;
+                    mc->pxH = t;
+                    mc->turns = (mc->turns + 1) % 4;
+                    RECT cl{};
+                    GetClientRect(hwnd, &cl);
+                    mc->fitZoom = MediaFitScale(mc->pxW, mc->pxH,
+                                               cl.right - cl.left, cl.bottom - cl.top);
                     mc->zoom = mc->fitZoom;
                     ImageCenter(mc);
                     InvalidateRect(hwnd, NULL, FALSE);
-                } else {
-                    mc->turns = (mc->turns + 3) % 4; // rotate failed: revert
                 }
                 return 0;
             }
@@ -1370,10 +1449,9 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 } else if (!mc->playing) {
                     VideoFrameStep(mc, dir > 0);
                 } else {
-                    double cur = mc->engine ? mc->engine->GetCurrentTime() : 0.0;
-                    VideoSeekTo(mc, cur + dir * 5.0);
+                    VideoSeekTo(mc, VideoPosition(mc) + dir * 5.0, true);
                 }
-                VideoShowControls(mc, true);
+                VideoShowBar(mc, true);
                 return 0;
             }
             case VK_PRIOR:
@@ -1384,34 +1462,34 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 return 0;
             case 'M':
                 VideoSetVolume(mc, mc->volume, !mc->muted);
-                VideoShowControls(mc, true);
+                VideoShowBar(mc, true);
                 return 0;
             case VK_UP:
                 VideoSetVolume(mc, mc->volume + 0.1, false);
-                VideoShowControls(mc, true);
+                VideoShowBar(mc, true);
                 return 0;
             case VK_DOWN:
                 VideoSetVolume(mc, mc->volume - 0.1, false);
-                VideoShowControls(mc, true);
+                VideoShowBar(mc, true);
                 return 0;
             case 'F': MediaToggleFullscreen(mc); return 0;
             case VK_RETURN: {
                 std::wstring p = mc->path;
                 if ((UINT_PTR)ShellExecuteW(NULL, L"open", p.c_str(), NULL, NULL,
                                             SW_SHOWNORMAL) > 32)
-                    MediaRequestClose(); // default app takes it from here
+                    MediaRequestClose();
                 return 0;
             }
             }
-            VideoShowControls(mc, true); // any other key wakes the controls
+            VideoShowBar(mc, true); // any other key wakes the controls
         }
         break;
     case WM_LBUTTONDOWN: {
         if (mc->kind == MediaKind::Image) {
             RECT cl{};
             GetClientRect(hwnd, &cl);
-            int cw = (int)(mc->dibW * mc->zoom + 0.5);
-            int ch = (int)(mc->dibH * mc->zoom + 0.5);
+            int cw = (int)(mc->pxW * mc->zoom + 0.5);
+            int ch = (int)(mc->pxH * mc->zoom + 0.5);
             if (cw > cl.right - cl.left || ch > cl.bottom - cl.top) {
                 mc->panning = true;
                 mc->panAt.x = GET_X_LPARAM(l);
@@ -1420,19 +1498,9 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 mc->panOY = mc->offY;
                 SetCapture(hwnd);
             }
-        } else {
-            // Clicking the bar seeks (drag = scrub); plain clicks do nothing
-            // so double-click fullscreen never toggles playback by accident.
-            RECT bar{};
-            if (MediaScrubZone(mc, GET_Y_LPARAM(l), bar)) {
-                mc->scrubbing = true;
-                mc->wasPlaying = mc->playing;
-                if (mc->playing) VideoSetPlaying(mc, false);
-                SetCapture(hwnd);
-                MediaScrubTo(mc, GET_X_LPARAM(l));
-                VideoShowControls(mc, true);
-            }
         }
+        // Video: clicks do nothing (no accidental toggles); the scrub bar
+        // handles its own hits and double-click fullscreens.
         return 0;
     }
     case WM_LBUTTONUP:
@@ -1444,7 +1512,7 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             mc->scrubbing = false;
             ReleaseCapture();
             if (mc->wasPlaying) VideoSetPlaying(mc, true);
-            VideoShowControls(mc, true);
+            VideoShowBar(mc, true);
         }
         return 0;
     case WM_LBUTTONDBLCLK:
@@ -1463,14 +1531,22 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             RECT cl{};
             GetClientRect(hwnd, &cl);
             MediaClampPan(mc->offX, mc->offY,
-                          (int)(mc->dibW * mc->zoom + 0.5),
-                          (int)(mc->dibH * mc->zoom + 0.5),
+                          (int)(mc->pxW * mc->zoom + 0.5),
+                          (int)(mc->pxH * mc->zoom + 0.5),
                           cl.right - cl.left, cl.bottom - cl.top);
             InvalidateRect(hwnd, NULL, FALSE);
         } else if (mc->scrubbing) {
-            MediaScrubTo(mc, GET_X_LPARAM(l));
+            RECT cl{};
+            GetClientRect(mc->hBar, &cl);
+            int l16 = 16, r16 = cl.right - cl.left - 16;
+            if (r16 > l16 && mc->duration > 0.0) {
+                double frac = (double)(GET_X_LPARAM(l) - l16) / (double)(r16 - l16);
+                if (frac < 0.0) frac = 0.0;
+                if (frac > 1.0) frac = 1.0;
+                VideoSeekTo(mc, frac * mc->duration, mc->wasPlaying);
+            }
         } else if (mc->kind == MediaKind::Video) {
-            VideoShowControls(mc, true); // wakes + restarts the hide timer
+            VideoShowBar(mc, true); // wakes + restarts the hide timer
         }
         return 0;
     }
@@ -1484,21 +1560,17 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         } else {
             int d = GET_WHEEL_DELTA_WPARAM(w);
             if (d != 0) VideoSetVolume(mc, mc->volume + (d > 0 ? 0.1 : -0.1), false);
-            VideoShowControls(mc, true);
+            VideoShowBar(mc, true);
         }
         return 0;
     case WM_TIMER:
-        if (w == IDT_LOAD) {
-            VideoPollLoad(mc); // pre-play polling only; safe post-close
-            return 0;
-        }
-        if (w == IDT_PUMP) {
-            VideoPumpFrame(mc); // present every tick while playing
+        if (w == IDT_UI) {
+            VideoTick(mc); // clock labels, end-of-stream, stalls
             return 0;
         }
         if (w == IDT_HIDE) {
             KillTimer(hwnd, IDT_HIDE);
-            if (mc->playing && !mc->scrubbing) VideoShowControls(mc, false);
+            if (mc->playing && !mc->scrubbing) VideoShowBar(mc, false);
             return 0;
         }
         if (w == IDT_WATCHDOG) {
@@ -1520,25 +1592,14 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         MediaRequestClose();
         return 0;
     case WM_DESTROY: {
-        KillTimer(hwnd, IDT_LOAD);
-        KillTimer(hwnd, IDT_PUMP);
+        KillTimer(hwnd, IDT_UI);
         KillTimer(hwnd, IDT_HIDE);
         KillTimer(hwnd, IDT_WATCHDOG);
-        SafeRelease(mc->overlay);
-        SafeRelease(mc->bWhite);
-        SafeRelease(mc->bDim);
-        SafeRelease(mc->bAccent);
-        SafeRelease(mc->bTrack);
-        SafeRelease(mc->tf);
-        SafeRelease(mc->dw);
-        SafeRelease(mc->d2d);
-        SafeRelease(mc->engineEx);
-        SafeRelease(mc->engine);
-        SafeRelease(mc->mgr);
-        SafeRelease(mc->swap);
-        SafeRelease(mc->dxgi);
-        SafeRelease(mc->dctx);
-        SafeRelease(mc->d3d);
+        VideoTeardown(mc);
+        if (mc->barFont) {
+            DeleteObject(mc->barFont);
+            mc->barFont = NULL;
+        }
         if (mc->comInit) CoUninitialize();
         bool failed = mc->failed;
         std::wstring err = mc->err;

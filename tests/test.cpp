@@ -492,8 +492,12 @@ int main() {
         CHECK(ClassifyMedia(L"C:\\p\\a.png") == MediaKind::Image);
         CHECK(ClassifyMedia(L"C:\\p\\a.bmp") == MediaKind::Image);
         CHECK(ClassifyMedia(L"C:\\p\\a.gif") == MediaKind::Image);
-        CHECK(ClassifyMedia(L"C:\\p\\a.tif") == MediaKind::Image);
-        CHECK(ClassifyMedia(L"C:\\p\\a.ico") == MediaKind::Image);
+        CHECK(ClassifyMedia(L"C:\\p\\a.tga") == MediaKind::Image);
+        CHECK(ClassifyMedia(L"C:\\p\\a.psd") == MediaKind::Image);
+        CHECK(ClassifyMedia(L"C:\\p\\a.hdr") == MediaKind::Image);
+        CHECK(ClassifyMedia(L"C:\\p\\a.ppm") == MediaKind::Image);
+        CHECK(ClassifyMedia(L"C:\\p\\a.tif") == MediaKind::None); // stb has no TIFF
+        CHECK(ClassifyMedia(L"C:\\p\\a.ico") == MediaKind::None); // ...nor ICO
         CHECK(ClassifyMedia(L"C:\\p\\a.mp4") == MediaKind::Video);
         CHECK(ClassifyMedia(L"C:\\p\\a.MKV") == MediaKind::Video);
         CHECK(ClassifyMedia(L"C:\\p\\a.avi") == MediaKind::Video);

@@ -34,7 +34,14 @@ Bang aliases are editable in Settings (default: `yt`/`youtube`, `gh`/`github`, `
 
 ## Viewer (built-in images + video)
 
-No FFmpeg, no codecs shipped — Windows already has them. Images decode via WIC (scaled **during** decode, so a 24 MP photo never materialises ~72 MB), video plays via Media Foundation with a D3D11 device manager (hardware decode when the GPU offers it, software fallback otherwise — there is deliberately no CPU/GPU toggle). Every media DLL is delay-loaded: the media window does not exist — and no media DLL is mapped — until you actually open a media file. Settings → General shows `Video decode: Hardware (GPU)` or `Software (CPU)`.
+No FFmpeg, no codecs shipped — photos decode via the vendored `stb_image`
+single header (JPEG/PNG/BMP/GIF/TGA/PSD/HDR/PIC/PNM; TIFF/ICO open in the
+default app), video plays via Media Foundation session + EVR renderer with
+auto-inserted decoders (hardware when the GPU offers it, software fallback
+otherwise — there is deliberately no CPU/GPU toggle). Every media DLL is
+delay-loaded: the media window does not exist — and no media DLL is mapped —
+until you actually open a media file. Settings → General shows
+`Video decode: Hardware (GPU)` or `Software (CPU)`.
 
 - In file mode, `Enter`/`Space` on an image or video hides the palette and opens the frameless viewer (no title bar, no border, no taskbar button; resizable, `Win+←/→` snap works, opens at ~70% of the work area — small images still 1:1). Closing (`Esc` or click-outside) restores the palette with the exact same folder, typed query, selection, scroll and window position.
 - `Ctrl+Space` while media is open brings the palette up above it (media stays); closing media afterwards restores the snapshot.
