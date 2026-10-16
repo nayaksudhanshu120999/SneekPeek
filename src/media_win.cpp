@@ -15,10 +15,23 @@
 // not a composited overlay. MFStartup runs once per process on first video
 // open and is never shut down; nothing media-related maps before first use,
 // so idle RSS stays 1-3 MB.
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
 #include <shlobj.h> // SHFileOperationW (recycle-bin delete)
 #include <dwmapi.h> // MARGINS struct only (dwmapi.dll loaded dynamically)
+#include <d3d11.h>  // hardware-decode probe types only (dynamic load, no link)
+#include <dxgi.h>   // adapter enumeration types only (dynamic load, no link)
 #include <mfapi.h>  // MFStartup, session, MFGetService
 #include <mfidl.h>  // session/topology interfaces
 #include <evr.h>    // video + audio renderer activates
@@ -52,6 +65,8 @@ enum : UINT { WM_APP_SES = WM_APP + 32 }; // session event arrived
 static const int kBarH = 64;              // control bar height (video only)
 static const wchar_t* kMediaBarClass = L"SneekPeekMediaBar";
 
+class SessionEvents; // defined below; MediaCtx only holds a pointer
+
 struct MediaCtx {
     HWND hwnd = NULL;
     HWND hBar = NULL;
@@ -80,7 +95,7 @@ struct MediaCtx {
     IMFMediaSource* source = nullptr;
     IMFPresentationDescriptor* pd = nullptr;
     IMFTopology* topo = nullptr;
-    IMFPresentationClock* clock = nullptr;
+    IMFClock* clock = nullptr; // presentation clock (GetClock hands this out)
     IMFRateControl* rate = nullptr;
     IMFSimpleAudioVolume* audio = nullptr;
     SessionEvents* events = nullptr;
@@ -411,6 +426,23 @@ bool LoadImagePath(MediaCtx* m, const std::wstring& path) {
     return true;
 }
 
+// All-or-nothing gate: a missing media DLL must degrade to an honest
+// message, never a delay-load fault (which would terminate the process).
+// stb_image needs no DLL at all; video needs the MF + EVR stack.
+bool MediaStackPresent(MediaKind mk, std::wstring& err) {
+    auto need = [&](const wchar_t* dll, const wchar_t* what) {
+        if (MediaDllPresent(dll)) return true;
+        err = std::wstring(L"Couldn't open this file (") + what +
+              L" missing on this Windows build).";
+        return false;
+    };
+    if (mk == MediaKind::Video) {
+        if (!need(L"mfplat.dll", L"Media Feature Pack")) return false;
+        if (!need(L"evr.dll", L"video renderer")) return false;
+    }
+    return true;
+}
+
 } // namespace
 
 // ---- open / close lifecycle (bridge implementation) -------------------
@@ -489,22 +521,7 @@ bool MediaOpen(HINSTANCE hInst, HWND owner, int dpi, const std::wstring& path,
 
 namespace {
 
-// All-or-nothing gate: a missing media DLL must degrade to an honest
-// message, never a delay-load fault (which would terminate the process).
-// stb_image needs no DLL at all; video needs the MF + EVR stack.
-bool MediaStackPresent(MediaKind mk, std::wstring& err) {
-    auto need = [&](const wchar_t* dll, const wchar_t* what) {
-        if (MediaDllPresent(dll)) return true;
-        err = std::wstring(L"Couldn't open this file (") + what +
-              L" missing on this Windows build).";
-        return false;
-    };
-    if (mk == MediaKind::Video) {
-        if (!need(L"mfplat.dll", L"Media Feature Pack")) return false;
-        if (!need(L"evr.dll", L"video renderer")) return false;
-    }
-    return true;
-}
+// (MediaStackPresent lives in the earlier helpers block, ahead of MediaOpen.)
 
 static bool OpenImage(const std::wstring& path) {
     MediaCtx* m = g_m;
@@ -724,6 +741,8 @@ void VideoUpdateBar(MediaCtx* m) {
     if (m->hBar) InvalidateRect(m->hBar, NULL, FALSE);
 }
 
+void VideoShowBar(MediaCtx* m, bool show); // defined below; used by SetPlaying
+
 void VideoSetPlaying(MediaCtx* m, bool play) {
     if (!m->session || m->playing == play) return;
     if (play) {
@@ -865,7 +884,7 @@ void VideoTeardown(MediaCtx* m) {
         m->events = nullptr;
     }
     if (m->session) {
-        m->session->CloseSession();
+        m->session->Close(); // IMFMediaSession has Close, not CloseSession
         m->session->Shutdown();
     }
     SafeRelease(m->rate);
@@ -1174,7 +1193,7 @@ int MediaHop(MediaCtx* m, int delta) {
         }
         return to;
     }
-    if (!MediaLoadPath(m, sibs[(size_t)to])) {
+    if (!LoadImagePath(m, sibs[(size_t)to])) {
         MediaFail(L"This image couldn't be decoded on this PC.");
         return to; // window gone; caller guards via MediaRequestClose
     }
@@ -1219,23 +1238,48 @@ void EnsureMediaBarClass(HINSTANCE hInst) {
 
 // Native video size for the initial window. Falls back to a default box:
 // EVR letterboxes internally, so playback never depends on knowing it.
+// Native video size for the initial window, read from the source video
+// stream's media type (MF_MT_FRAME_SIZE packs width/height). Falls back to
+// a default box: EVR letterboxes internally, so playback never depends on
+// knowing it.
 bool VideoNativeSize(MediaCtx* m, int& w, int& h) {
     w = h = 0;
-    if (!m->session) return false;
-    IMFVideoDisplayControl* vdc = nullptr;
-    if (FAILED(MFGetService(m->session, MR_VIDEO_DISPLAY_SERVICE,
-                            IID_PPV_ARGS(&vdc))) ||
-        !vdc)
-        return false;
-    SIZE video{0, 0}, ar{0, 0};
-    bool ok = SUCCEEDED(vdc->GetNativeVideoSize(&video, &ar)) &&
-              video.cx > 0 && video.cy > 0;
-    if (ok) {
-        w = video.cx;
-        h = video.cy;
+    if (!m->pd) return false;
+    DWORD count = 0;
+    if (FAILED(m->pd->GetStreamDescriptorCount(&count))) return false;
+    for (DWORD i = 0; i < count; i++) {
+        IMFStreamDescriptor* sd = nullptr;
+        BOOL sel = FALSE;
+        if (FAILED(m->pd->GetStreamDescriptorByIndex(i, &sel, &sd)) || !sd)
+            continue;
+        IMFMediaTypeHandler* handler = nullptr;
+        GUID major = GUID_NULL;
+        if (SUCCEEDED(sd->GetMediaTypeHandler(&handler)) && handler)
+            handler->GetMajorType(&major);
+        bool video = (major == MFMediaType_Video);
+        IMFMediaType* mt = nullptr;
+        if (video && handler) {
+            // Current type once resolved, else the first offered type.
+            if (FAILED(handler->GetCurrentMediaType(&mt)) || !mt)
+                handler->GetMediaTypeByIndex(0, &mt);
+        }
+        SafeRelease(handler);
+        UINT64 packed = 0;
+        if (mt && SUCCEEDED(mt->GetUINT64(MF_MT_FRAME_SIZE, &packed)) && packed) {
+            int vw = (int)(packed >> 32), vh = (int)(packed & 0xFFFFFFFF);
+            SafeRelease(mt);
+            SafeRelease(sd);
+            if (vw > 0 && vh > 0) {
+                w = vw;
+                h = vh;
+                return true;
+            }
+            return false;
+        }
+        SafeRelease(mt);
+        SafeRelease(sd);
     }
-    SafeRelease(vdc);
-    return ok;
+    return false;
 }
 
 // Session event dispatch (posted by SessionEvents::Invoke; all decisions
