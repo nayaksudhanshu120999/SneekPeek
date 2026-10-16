@@ -12,7 +12,7 @@
 #include "icons.h"
 
 enum class VerbId {
-    Open,           // launch / drill in / play (label varies by target)
+    Open,           // launch / drill in
     OpenNewWindow,  // folders: separate Explorer window
     RunAsAdmin,     // exe/scripts via the "runas" shell verb
     OpenLocation,   // explorer.exe /select — works for every real path
@@ -148,7 +148,7 @@ inline std::vector<VerbId> VerbsFor(const VerbCtx& c) {
         return v;
     case GlyphStyle::Audio:
     case GlyphStyle::Video:
-        v.push_back(VerbId::Open); // labeled "Play" by the caller
+        v.push_back(VerbId::Open);
         v.push_back(VerbId::OpenWith);
         v.push_back(VerbId::CopyPath);
         v.push_back(VerbId::Properties);
