@@ -467,8 +467,52 @@ static void MediaFail(const std::wstring& err) {
     MediaOnClosed(true, e);
 }
 
-static bool OpenImage(const std::wstring& path);
 static bool OpenVideo(const std::wstring& path);
+
+// Single global definition (before first use in MediaOpen below): one entity,
+// no forward/definition scope split.
+static bool OpenImage(const std::wstring& path) {
+    MediaCtx* m = g_m;
+    RECT area{0, 0, 1024, 768};
+    WorkAreaFor(m->hwnd, area); // hwnd NULL: primary monitor work area
+    int aw = area.right - area.left, ah = area.bottom - area.top;
+    int w = 0, h = 0;
+    unsigned char* px = DecodeImage(path, w, h);
+    if (!px) {
+        m->err = L"This image couldn't be decoded on this PC.";
+        return false;
+    }
+    int ww = 0, wh = 0;
+    // Initial window covers ~70% of the work area, centered (never
+    // edge-to-edge); small images still open at native 1:1.
+    MediaFitWindow(w, h, (aw * 7) / 10, (ah * 7) / 10, ww, wh);
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kMediaClass, L"SneekPeek",
+                                WS_POPUP | WS_THICKFRAME | WS_CLIPCHILDREN,
+                                (area.left + area.right - ww) / 2,
+                                (area.top + area.bottom - wh) / 2, ww, wh,
+                                NULL, NULL, m->hInst, NULL);
+    if (!hwnd) {
+        stbi_image_free(px);
+        m->err = L"Couldn't open this file";
+        return false;
+    }
+    m->hwnd = hwnd;
+    m->px = px;
+    m->pxW = m->imgW = w;
+    m->pxH = m->imgH = h;
+    m->turns = 0;
+    RECT cl{};
+    GetClientRect(hwnd, &cl);
+    m->fitZoom = MediaFitScale(w, h, cl.right - cl.left, cl.bottom - cl.top);
+    m->zoom = m->fitZoom;
+    ImageCenter(m);
+    MediaExtendFrame(hwnd);
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+    UpdateWindow(hwnd); // force the first paint now: never show an empty frame
+    m->shown = true;
+    return true;
+}
 
 bool MediaOpen(HINSTANCE hInst, HWND owner, int dpi, const std::wstring& path,
                std::wstring& err) {
@@ -523,49 +567,6 @@ bool MediaOpen(HINSTANCE hInst, HWND owner, int dpi, const std::wstring& path,
 namespace {
 
 // (MediaStackPresent lives in the earlier helpers block, ahead of MediaOpen.)
-
-static bool OpenImage(const std::wstring& path) {
-    MediaCtx* m = g_m;
-    RECT area{0, 0, 1024, 768};
-    WorkAreaFor(m->hwnd, area); // hwnd NULL: primary monitor work area
-    int aw = area.right - area.left, ah = area.bottom - area.top;
-    // Initial window covers ~70% of the work area, centered (never
-    // edge-to-edge); small images still open at native 1:1.
-    int ww = 0, wh = 0;
-    int w = 0, h = 0;
-    unsigned char* px = DecodeImage(path, w, h);
-    if (!px) {
-        m->err = L"This image couldn't be decoded on this PC.";
-        return false;
-    }
-    MediaFitWindow(w, h, (aw * 7) / 10, (ah * 7) / 10, ww, wh);
-    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kMediaClass, L"SneekPeek",
-                                WS_POPUP | WS_THICKFRAME | WS_CLIPCHILDREN,
-                                (area.left + area.right - ww) / 2,
-                                (area.top + area.bottom - wh) / 2, ww, wh,
-                                NULL, NULL, m->hInst, NULL);
-    if (!hwnd) {
-        stbi_image_free(px);
-        m->err = L"Couldn't open this file";
-        return false;
-    }
-    m->hwnd = hwnd;
-    m->px = px;
-    m->pxW = m->imgW = w;
-    m->pxH = m->imgH = h;
-    m->turns = 0;
-    RECT cl{};
-    GetClientRect(hwnd, &cl);
-    m->fitZoom = MediaFitScale(w, h, cl.right - cl.left, cl.bottom - cl.top);
-    m->zoom = m->fitZoom;
-    ImageCenter(m);
-    MediaExtendFrame(hwnd);
-    ShowWindow(hwnd, SW_SHOW);
-    SetForegroundWindow(hwnd);
-    UpdateWindow(hwnd); // force the first paint now: never show an empty frame
-    m->shown = true;
-    return true;
-}
 
 // ---- video path (Media Foundation session + EVR) -----------------------
 // Source Resolver -> partial topology (decoder auto-inserted, hardware when
@@ -1106,7 +1107,7 @@ static LRESULT CALLBACK MediaBarProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         DeleteObject(knob);
         SelectObject(dc, old);
         DeleteObject(track);
-        wchar_t left[64], right[64];
+        wchar_t left[64];
         swprintf_s(left, 64, L"%s  %s", MediaFormatSpeed(kMediaSpeeds[mc->rateIdx]).c_str(),
                    MediaVolumeLabel(mc->muted, mc->volume).c_str());
         std::wstring rt = MediaFormatTimePair(cur < 0.0 ? 0.0 : cur,
