@@ -135,10 +135,16 @@ enum {
     IDC_ROWS_DEC = 206, IDC_ROWS_INC = 207,
     IDC_COLS_DEC = 208, IDC_COLS_INC = 209,
     IDC_PAGE_0 = 301, IDC_PAGE_1, IDC_PAGE_2, IDC_PAGE_3, IDC_PAGE_4, IDC_PAGE_5,
+    // Theme swatches: IDC_THEME_BG + table index (29 fields: 401-429).
     IDC_THEME_BG = 401, IDC_THEME_INPUT, IDC_THEME_SEL, IDC_THEME_TEXT,
-    IDC_THEME_SUB, IDC_THEME_APP, IDC_THEME_WEB, IDC_THEME_CALC,
-    IDC_THEME_HINT, IDC_THEME_SET, IDC_THEME_AWAKE, IDC_THEME_FILE,
-    IDC_THEME_FOLDER, IDC_THEME_QUICK, IDC_THEME_RESET,
+    IDC_THEME_ROWTEXT, IDC_THEME_SUB, IDC_THEME_APP, IDC_THEME_WEB,
+    IDC_THEME_CALC, IDC_THEME_HINT, IDC_THEME_SET, IDC_THEME_AWAKE,
+    IDC_THEME_FILE, IDC_THEME_FOLDER, IDC_THEME_QUICK, IDC_THEME_BTNFILL,
+    IDC_THEME_BTNFILLHOT, IDC_THEME_BTNEDGE, IDC_THEME_EDGEHOT,
+    IDC_THEME_BTNSEL, IDC_THEME_BTNSELHOT, IDC_THEME_SEP, IDC_THEME_MENUACC,
+    IDC_THEME_CHIPTEXT, IDC_THEME_DANGER, IDC_THEME_POWDOWN,
+    IDC_THEME_POWREBOOT, IDC_THEME_POWSLEEP, IDC_THEME_POWHIB,
+    IDC_THEME_RESET, IDC_THEME_EDITFILE, IDC_THEME_RELOAD,
 };
 
 // ------------------------------------------------------------- small helpers
@@ -245,10 +251,9 @@ static int         g_cellCol = 0;
 static std::vector<HWND> g_pageGeneral, g_pageApps, g_pageBangs, g_pageQuick, g_pageFiles,
     g_pageTheme;
 static bool        g_fillingSettings = false;
-// Theme swatches (Settings > Theme), one button per Theme color, same order
-// as kThemeFields below. Custom Colors dialog memory for ChooseColor.
-static HWND        g_themeBtn[14] = {};
-static DWORD       g_themeCustom[16] = {};
+// Theme swatches (Settings > Theme), IDC_THEME_BG + table index. The table
+// itself lives in settings.h and drives defaults, INI, theme.ini, and UI.
+static HWND        g_themeBtn[32] = {};
 static HFONT       g_fontInput = NULL;
 static HFONT       g_fontTitle = NULL;
 static HFONT       g_fontSub = NULL;
@@ -416,7 +421,7 @@ struct PowerDef {
     COLORREF color;
     const wchar_t* aliases[4];
 };
-static const PowerDef kPowers[] = {
+static PowerDef kPowers[] = { // colors follow the theme (see ApplyTheme)
     {PowerOp::Shutdown,  L"Shut down", RGB(255, 90, 90),
         {L"shutdown", L"shut down", L"shut", L"power off"}},
     {PowerOp::Restart,   L"Restart",   RGB(251, 191, 36),
@@ -449,6 +454,7 @@ static COLORREF kBg     = RGB(0, 0, 0);
 static COLORREF kInput  = RGB(0, 0, 0); // seamless with the bar: minimal
 static COLORREF kSel    = RGB(28, 28, 30);
 static COLORREF kText   = RGB(240, 240, 240);
+static COLORREF kRowText= RGB(218, 218, 226); // unselected row text
 static COLORREF kSub    = RGB(130, 130, 135);
 static COLORREF kAppCol = RGB(96, 165, 250);
 static COLORREF kWebCol = RGB(46, 224, 158);
@@ -459,15 +465,32 @@ static COLORREF kAwakeCol = RGB(45, 212, 191);
 static COLORREF kFileCol = RGB(96, 165, 250);   // files: blue
 static COLORREF kFolderCol = RGB(251, 191, 36); // folders/drives: amber
 static COLORREF kQuickCol = RGB(255, 95, 170);
+static COLORREF kBtnFill = RGB(26, 26, 28);   // settings buttons
+static COLORREF kBtnFillHot = RGB(52, 52, 56);
+static COLORREF kBtnEdge = RGB(66, 66, 72);
+static COLORREF kEdgeHot = RGB(130, 130, 140);
+static COLORREF kBtnSel = RGB(29, 65, 115);   // accent selection blue
+static COLORREF kBtnSelHot = RGB(38, 82, 140);
+static COLORREF kSep    = RGB(30, 30, 32);    // hairlines + menu separators
+static COLORREF kMenuAcc= RGB(150, 150, 155); // default menu accent
+static COLORREF kChipText = RGB(255, 255, 255);
+static COLORREF kDanger = RGB(255, 90, 90);   // quit + destructive-adjacent
 
 // Push Settings.theme into the live palette: colors, brushes, repaints.
 // Safe before windows exist (boot path): every handle use is guarded.
 static void ApplyThemeFromSettings() {
     const Theme& t = g_settings.theme;
-    kBg = t.bg; kInput = t.input; kSel = t.sel; kText = t.text; kSub = t.sub;
+    kBg = t.bg; kInput = t.input; kSel = t.sel; kText = t.text;
+    kRowText = t.rowtext; kSub = t.sub;
     kAppCol = t.app; kWebCol = t.web; kCalcCol = t.calc; kHintCol = t.hint;
     kSetCol = t.set; kAwakeCol = t.awake; kFileCol = t.file;
     kFolderCol = t.folder; kQuickCol = t.quick;
+    kBtnFill = t.btnfill; kBtnFillHot = t.btnfillhot; kBtnEdge = t.btnedge;
+    kEdgeHot = t.edgehot; kBtnSel = t.btnsel; kBtnSelHot = t.btnselhot;
+    kSep = t.sep; kMenuAcc = t.menuacc; kChipText = t.chiptext;
+    kDanger = t.danger;
+    kPowers[0].color = t.powdown; kPowers[1].color = t.powreboot;
+    kPowers[2].color = t.powsleep; kPowers[3].color = t.powhib;
     if (g_brBg) DeleteObject(g_brBg);
     if (g_brInput) DeleteObject(g_brInput);
     if (g_brSel) DeleteObject(g_brSel);
@@ -498,25 +521,7 @@ static void ApplyThemeFromSettings() {
     }
 }
 
-// Settings > Theme page: label + member pointer per editable color.
-struct ThemeField { const wchar_t* name; COLORREF Theme::*field; int btnId; };
-static const ThemeField kThemeFields[] = {
-    {L"Background",      &Theme::bg,     IDC_THEME_BG},
-    {L"Search field",    &Theme::input,  IDC_THEME_INPUT},
-    {L"Highlight",       &Theme::sel,    IDC_THEME_SEL},
-    {L"Text",            &Theme::text,   IDC_THEME_TEXT},
-    {L"Secondary text",  &Theme::sub,    IDC_THEME_SUB},
-    {L"Apps accent",     &Theme::app,    IDC_THEME_APP},
-    {L"Web accent",       &Theme::web,    IDC_THEME_WEB},
-    {L"Calculator",      &Theme::calc,   IDC_THEME_CALC},
-    {L"Hint",            &Theme::hint,   IDC_THEME_HINT},
-    {L"Settings accent", &Theme::set,    IDC_THEME_SET},
-    {L"Awake accent",    &Theme::awake,  IDC_THEME_AWAKE},
-    {L"Files accent",    &Theme::file,   IDC_THEME_FILE},
-    {L"Folders accent",  &Theme::folder, IDC_THEME_FOLDER},
-    {L"Quick links",     &Theme::quick,  IDC_THEME_QUICK},
-};
-
+// Theme swatch buttons: IDC_THEME_BG + table index (see the IDs below).
 // Awake state (see below).
 static bool g_awakeOn = false;
 
@@ -2196,7 +2201,7 @@ static LRESULT CALLBACK ChipProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         FillPill(dc, r, ChipFill(col));
         SetBkMode(dc, TRANSPARENT);
         SelectObject(dc, g_fontChip);
-        SetTextColor(dc, RGB(255, 255, 255));
+        SetTextColor(dc, kChipText);
         RECT tr = r; tr.left += Dpx(10); tr.right -= Dpx(24);
         DrawTextW(dc, text.c_str(), -1, &tr,
                   DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
@@ -2262,7 +2267,7 @@ static LRESULT CALLBACK ChipRowProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             COLORREF base = ChipFill(c.color);
             // Solid pills, white bold text; selection = full brightness.
             FillPill(dc, r, sel ? base : Darken(base, 65));
-            SetTextColor(dc, RGB(255, 255, 255));
+            SetTextColor(dc, kChipText);
             RECT tr = r;
             DrawTextW(dc, c.title.c_str(), -1, &tr,
                       DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS);
@@ -2311,7 +2316,7 @@ static LRESULT CALLBACK FileBarProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         RECT cl; GetClientRect(hwnd, &cl);
         FillRect(dc, &cl, g_brBg);
         // hairline separator on top
-        HBRUSH sep = CreateSolidBrush(RGB(30, 30, 32));
+        HBRUSH sep = CreateSolidBrush(kSep);
         RECT sr = cl; sr.bottom = sr.top + 1;
         FillRect(dc, &sr, sep);
         DeleteObject(sep);
@@ -2516,7 +2521,7 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             PaintGlyph(dc, gcell, fg, isCur, ri.title, g_fontGrid);
             SetBkMode(dc, TRANSPARENT);
             SelectObject(dc, g_fontSub);
-            SetTextColor(dc, isCur ? kText : RGB(218, 218, 226));
+            SetTextColor(dc, isCur ? kText : kRowText);
             RECT nr{tile.left + Dpx(4), gcell.bottom + Dpx(4),
                     tile.right - Dpx(4), tile.bottom - Dpx(2)};
             // Pre-fitted to two lines with a true ellipsis: long names
@@ -2597,7 +2602,7 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
 // Row target rides in g_menuRow; menu item data carries the g_menuItems index.
 struct DarkMenuItem {
     std::wstring text;
-    COLORREF accent = RGB(150, 150, 155);
+    COLORREF accent = kMenuAcc;
     UINT wID = 0; // 0 = separator (never returned)
     bool separator = false;
     bool checked = false;
@@ -2665,7 +2670,7 @@ static void DrawDarkMenuItem(const DRAWITEMSTRUCT* d) {
     if (it.separator) {
         int y = (d->rcItem.top + d->rcItem.bottom) / 2;
         GlyphLine(dc, d->rcItem.left + kPadX, y, d->rcItem.right - kPadX, y,
-                  1, RGB(44, 44, 46));
+                  1, kSep);
         return;
     }
     // Category accent bar, like the result rows.
@@ -2685,7 +2690,7 @@ static void DrawDarkMenuItem(const DRAWITEMSTRUCT* d) {
     RECT tr = d->rcItem; tr.left = tx + Dpx(16);
     SetBkMode(dc, TRANSPARENT);
     if (g_fontUI) SelectObject(dc, g_fontUI);
-    SetTextColor(dc, dis ? kSub : (sel ? kText : RGB(218, 218, 226)));
+    SetTextColor(dc, dis ? kSub : (sel ? kText : kRowText));
     DrawTextW(dc, it.text.c_str(), -1, &tr,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
@@ -2937,7 +2942,7 @@ static void ShowPaletteMenu(int x, int y) {
     DarkMenuItem st{L"Settings...", kSetCol, ID_TRAY_SETTINGS};
     DarkMenuItem su{L"Run at startup", kCalcCol, ID_TRAY_STARTUP};
     su.checked = g_settings.runAtStartup;
-    DarkMenuItem qu{L"Quit", RGB(255, 90, 90), ID_TRAY_QUIT};
+    DarkMenuItem qu{L"Quit", kDanger, ID_TRAY_QUIT};
     g_menuRow = -1;
     g_menuItems.clear();
     g_menuItems.push_back(std::move(rf));
@@ -3519,7 +3524,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 tr.left += Dpx(44);
             }
             tr.right -= Dpx(10);
-            SetTextColor(dc, sel ? kText : RGB(218, 218, 226));
+            SetTextColor(dc, sel ? kText : kRowText);
             SelectObject(dc, g_fontTitle);
             DrawTextW(dc, r.title.c_str(), -1, &tr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -3708,7 +3713,7 @@ static void ShowTrayMenu(HWND hwnd) {
     DarkMenuItem su{L"Run at startup", kCalcCol, ID_TRAY_STARTUP};
     su.checked = g_settings.runAtStartup;
     DarkMenuItem sep; sep.separator = true;
-    DarkMenuItem qu{L"Quit", RGB(255, 90, 90), ID_TRAY_QUIT};
+    DarkMenuItem qu{L"Quit", kDanger, ID_TRAY_QUIT};
     g_menuRow = -1;
     g_menuItems.clear();
     g_menuItems.push_back(std::move(st));
@@ -4106,19 +4111,147 @@ static LRESULT CALLBACK PlainEditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
     return DefSubclassProc(h, m, w, l);
 }
 
-// Color picker for one theme field: applies + saves instantly, repaints live.
+// Hex color editor for one theme field: a small modal dialog with a #RRGGBB
+// box + live preview chip. Applies + saves instantly on OK, repaints live.
+// (Replaces the system color dialog: hex-only, per the theme-file format.)
+static const wchar_t* kHexDlgClass = L"SneekPeekHexEdit";
+static bool g_hexAccepted = false;
+static bool g_hexOpen = false; // modal loop guard (never PostQuitMessage here:
+static COLORREF g_hexValue = RGB(0, 0, 0); // that would quit the whole app)
+static HWND g_hexEdit = NULL;
+static bool g_hexClassReady = false;
+
+static LRESULT CALLBACK HexProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_ERASEBKGND: {
+        HDC dc = (HDC)w;
+        RECT r; GetClientRect(hwnd, &r);
+        FillRect(dc, &r, g_brBg);
+        return 1;
+    }
+    case WM_PAINT: {
+        // Live preview chip: the currently-typed color, dark when invalid.
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT chip{200, 36, 288, 60};
+        wchar_t buf[32] = {0};
+        if (g_hexEdit) GetWindowTextW(g_hexEdit, buf, 32);
+        COLORREF c;
+        bool ok = ParseColor(buf, c);
+        HBRUSH b = CreateSolidBrush(ok ? c : kBg);
+        HGDIOBJ oldB = SelectObject(dc, b);
+        HPEN pen = CreatePen(PS_SOLID, 1, ok ? kBtnEdge : kDanger);
+        HGDIOBJ oldP = SelectObject(dc, pen);
+        RoundRect(dc, chip.left, chip.top, chip.right, chip.bottom, 6, 6);
+        SelectObject(dc, oldB);
+        SelectObject(dc, oldP);
+        DeleteObject(b);
+        DeleteObject(pen);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_COMMAND: {
+        WORD id = LOWORD(w), code = HIWORD(w);
+        if (id == 100 && code == EN_CHANGE) { // typing: refresh the preview
+            InvalidateRect(hwnd, NULL, FALSE);
+        } else if (id == IDOK) {
+            wchar_t buf[32] = {0};
+            if (g_hexEdit) GetWindowTextW(g_hexEdit, buf, 32);
+            COLORREF c;
+            if (!ParseColor(buf, c)) {
+                MessageBoxW(hwnd, L"Enter a hex color like #1C1C1E (6 hex digits).",
+                            L"SneekPeek", MB_ICONWARNING | MB_OK);
+                if (g_hexEdit) SetFocus(g_hexEdit);
+                break;
+            }
+            g_hexValue = c;
+            g_hexAccepted = true;
+            DestroyWindow(hwnd);
+        } else if (id == IDCANCEL) {
+            DestroyWindow(hwnd);
+        }
+        break;
+    }
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        break;
+    case WM_DESTROY:
+        g_hexEdit = NULL;
+        g_hexOpen = false; // ends the modal loop below
+        break;
+    }
+    return DefWindowProcW(hwnd, m, w, l);
+}
+
 static void PickThemeColor(HWND owner, int fieldIdx) {
-    if (fieldIdx < 0 || fieldIdx >= (int)(sizeof(kThemeFields) / sizeof(kThemeFields[0])))
-        return;
-    COLORREF cur = g_settings.theme.*(kThemeFields[fieldIdx].field);
-    CHOOSECOLORW cc{};
-    cc.lStructSize = sizeof(cc);
-    cc.hwndOwner = owner;
-    cc.rgbResult = cur;
-    cc.lpCustColors = g_themeCustom;
-    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
-    if (!ChooseColorW(&cc)) return; // cancelled: nothing changes
-    g_settings.theme.*(kThemeFields[fieldIdx].field) = cc.rgbResult;
+    if (fieldIdx < 0 || fieldIdx >= ThemeFieldCount()) return;
+    if (!g_hexClassReady) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.hInstance = g_hInst;
+        wc.lpszClassName = kHexDlgClass;
+        wc.lpfnWndProc = HexProc;
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = g_brBg;
+        if (!RegisterClassExW(&wc)) return;
+        g_hexClassReady = true;
+    }
+    COLORREF cur = g_settings.theme.*(kThemeFields[fieldIdx].member);
+    g_hexAccepted = false;
+    g_hexValue = cur;
+    RECT orc; GetWindowRect(owner, &orc);
+    int W = 312, H = 128;
+    int x = orc.left + ((orc.right - orc.left) - W) / 2;
+    int y = orc.top + ((orc.bottom - orc.top) - H) / 2;
+    HWND dlg = CreateWindowExW(0, kHexDlgClass, kThemeFields[fieldIdx].label,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN,
+        x, y, W, H, owner, NULL, g_hInst, NULL);
+    if (!dlg) return;
+    HWND lab = CreateWindowW(L"STATIC", L"Hex color (#RRGGBB):",
+        WS_CHILD | WS_VISIBLE, 12, 12, 276, 18, dlg, NULL, g_hInst, NULL);
+    g_hexEdit = CreateWindowW(L"EDIT", SerializeColor(cur).c_str(),
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+        12, 36, 180, 24, dlg, (HMENU)100, g_hInst, NULL);
+    HWND ok = CreateWindowW(L"BUTTON", L"OK",
+        WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+        120, 70, 84, 26, dlg, (HMENU)IDOK, g_hInst, NULL);
+    HWND cancel = CreateWindowW(L"BUTTON", L"Cancel",
+        WS_CHILD | WS_VISIBLE, 212, 70, 84, 26, dlg, (HMENU)IDCANCEL, g_hInst, NULL);
+    if (g_fontUI) {
+        SendMessageW(lab, WM_SETFONT, (WPARAM)g_fontUI, FALSE);
+        SendMessageW(g_hexEdit, WM_SETFONT, (WPARAM)g_fontUI, FALSE);
+        SendMessageW(ok, WM_SETFONT, (WPARAM)g_fontUI, FALSE);
+        SendMessageW(cancel, WM_SETFONT, (WPARAM)g_fontUI, FALSE);
+    }
+    SendMessageW(g_hexEdit, EM_SETSEL, 0, -1);
+    DarkTitleBar(dlg);
+    EnableWindow(owner, FALSE); // modal to Settings
+    ShowWindow(dlg, SW_SHOW);
+    SetFocus(g_hexEdit);
+    g_hexOpen = true;
+    MSG msg;
+    while (g_hexOpen && GetMessageW(&msg, NULL, 0, 0) > 0) {
+        // Enter/Esc in the box map to OK/Cancel (plain windows don't do
+        // this on their own); everything else gets dialog-manager keys.
+        if (msg.message == WM_KEYDOWN && msg.hwnd == g_hexEdit) {
+            if (msg.wParam == VK_RETURN) {
+                SendMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDOK, 0), 0);
+                continue;
+            }
+            if (msg.wParam == VK_ESCAPE) {
+                SendMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, 0), 0);
+                continue;
+            }
+        }
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+    if (!g_hexAccepted) return; // cancelled or invalid: nothing changes
+    g_settings.theme.*(kThemeFields[fieldIdx].member) = g_hexValue;
     SaveNow(); // instant save, like the rest of Settings
     ApplyThemeFromSettings(); // live repaint: palette + Settings tables
     if (g_themeBtn[fieldIdx] && IsWindow(g_themeBtn[fieldIdx]))
@@ -4132,7 +4265,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         g_pageGeneral.clear(); g_pageApps.clear();
         g_pageBangs.clear(); g_pageQuick.clear(); g_pageFiles.clear();
         g_pageTheme.clear();
-        for (int i = 0; i < 14; i++) g_themeBtn[i] = NULL;
+        for (int i = 0; i < 32; i++) g_themeBtn[i] = NULL;
 
         // Page tabs: owner-drawn buttons matching the app theme (no tab
         // control, so there is no light-themed rim anywhere in Settings).
@@ -4270,25 +4403,31 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             SetWindowTextW(g_hwndColsVal, cv);
         }
 
-        // ---- Theme page (every palette color editable, applies instantly).
+        // ---- Theme page (every UI color editable, applies instantly).
+        // 3 columns x 10 rows of swatches, then file actions. Hex clicks
+        // open a #RRGGBB box; Edit file round-trips through theme.ini.
         {
             page(g_pageTheme, NewCtrl(L"STATIC",
-                L"Click a color to change it - everything applies instantly:",
+                L"Click a color to type a new hex value - everything applies instantly:",
                 WS_VISIBLE, 24, 52, 536, 20, hwnd, 0));
-            for (int i = 0; i < (int)(sizeof(kThemeFields) / sizeof(kThemeFields[0])); i++) {
-                int col = i % 2, row = i / 2;
+            for (int i = 0; i < ThemeFieldCount(); i++) {
+                int col = i % 3, row = i / 3;
                 g_themeBtn[i] = page(g_pageTheme,
-                    NewCtrl(L"BUTTON", kThemeFields[i].name,
+                    NewCtrl(L"BUTTON", kThemeFields[i].label,
                             WS_VISIBLE | WS_TABSTOP,
-                            24 + col * 276, 78 + row * 36, 260, 30, hwnd,
-                            (UINT)kThemeFields[i].btnId));
+                            24 + col * 184, 74 + row * 31, 176, 27, hwnd,
+                            (UINT)(IDC_THEME_BG + i)));
             }
-            page(g_pageTheme, NewCtrl(L"BUTTON", L"Reset to default",
-                WS_VISIBLE, 24, 78 + 7 * 36 + 8, 160, 28, hwnd, IDC_THEME_RESET));
+            page(g_pageTheme, NewCtrl(L"BUTTON", L"Reset",
+                WS_VISIBLE, 24, 394, 110, 28, hwnd, IDC_THEME_RESET));
+            page(g_pageTheme, NewCtrl(L"BUTTON", L"Edit file",
+                WS_VISIBLE, 140, 394, 110, 28, hwnd, IDC_THEME_EDITFILE));
+            page(g_pageTheme, NewCtrl(L"BUTTON", L"Reload file",
+                WS_VISIBLE, 256, 394, 110, 28, hwnd, IDC_THEME_RELOAD));
             page(g_pageTheme, NewCtrl(L"STATIC",
-                L"Background/Text/Highlight recolor the whole palette;\r\n"
-                L"accents recolor their result rows, chips, and tiles.",
-                WS_VISIBLE, 196, 78 + 7 * 36 + 6, 364, 40, hwnd, 0));
+                L"Edit file exports the live theme to theme.ini and opens it;\r\n"
+                L"Reload file applies your edits.",
+                WS_VISIBLE, 376, 392, 200, 40, hwnd, 0));
         }
 
         // Shared bottom buttons (always visible).
@@ -4337,7 +4476,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         if (d->CtlType == ODT_COMBOBOX) {
             bool field = (d->itemState & ODS_COMBOBOXEDIT) != 0;
             bool sel = !field && (d->itemState & ODS_SELECTED) != 0;
-            HBRUSH bg = CreateSolidBrush(sel ? RGB(29, 65, 115) : kBg);
+            HBRUSH bg = CreateSolidBrush(sel ? kBtnSel : kBg);
             FillRect(dc, &d->rcItem, bg);
             DeleteObject(bg);
             if ((int)d->itemID >= 0) {
@@ -4351,7 +4490,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                           DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
             }
             if (field) { // thin frame around the closed combo
-                HPEN pen = CreatePen(PS_SOLID, 1, RGB(66, 66, 72));
+                HPEN pen = CreatePen(PS_SOLID, 1, kBtnEdge);
                 HGDIOBJ op = SelectObject(dc, pen);
                 SelectObject(dc, GetStockObject(NULL_BRUSH));
                 RoundRect(dc, d->rcItem.left, d->rcItem.top,
@@ -4364,18 +4503,18 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         if (d->CtlType != ODT_BUTTON) break;
         // Theme swatches: live color chip + field name (not the generic
         // button paint, which would hide the color being edited).
-        if (d->CtlID >= (UINT)IDC_THEME_BG && d->CtlID <= (UINT)IDC_THEME_QUICK) {
-            size_t fi = (size_t)(d->CtlID - (UINT)IDC_THEME_BG);
-            size_t nf = sizeof(kThemeFields) / sizeof(kThemeFields[0]);
+        if (d->CtlID >= (UINT)IDC_THEME_BG &&
+            (int)(d->CtlID - (UINT)IDC_THEME_BG) < ThemeFieldCount()) {
+            int fi = (int)(d->CtlID - (UINT)IDC_THEME_BG);
             FillRect(dc, &d->rcItem, g_brBg);
-            COLORREF col = (fi < nf) ? (g_settings.theme.*(kThemeFields[fi].field)) : kBg;
+            COLORREF col = g_settings.theme.*(kThemeFields[fi].member);
             RECT chip = d->rcItem;
             chip.left += Dpx(8); chip.right = chip.left + Dpx(28);
             chip.top += Dpx(5); chip.bottom -= Dpx(5);
             if (chip.right > chip.left && chip.bottom > chip.top) {
                 HBRUSH cb = CreateSolidBrush(col);
                 HGDIOBJ oldB = SelectObject(dc, cb);
-                HPEN pen = CreatePen(PS_SOLID, 1, RGB(66, 66, 72));
+                HPEN pen = CreatePen(PS_SOLID, 1, kBtnEdge);
                 HGDIOBJ oldP = SelectObject(dc, pen);
                 RoundRect(dc, chip.left, chip.top, chip.right, chip.bottom, 6, 6);
                 SelectObject(dc, oldB);
@@ -4388,8 +4527,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             SetTextColor(dc, kText);
             RECT tr = d->rcItem; tr.left += Dpx(8) + Dpx(28) + Dpx(10);
             tr.right -= Dpx(6);
-            const wchar_t* nm = (fi < nf) ? kThemeFields[fi].name : L"";
-            DrawTextW(dc, nm, -1, &tr,
+            DrawTextW(dc, kThemeFields[fi].label, -1, &tr,
                       DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
             bool pressed = (d->itemState & ODS_SELECTED) != 0;
             bool focus = (d->itemState & ODS_FOCUS) != 0;
@@ -4415,10 +4553,10 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         bool viewSel = isView && ((d->CtlID == (UINT)IDC_VIEW_GRID) == g_settings.fileGrid);
         bool accent = isSave || pageSel || viewSel;
         FillRect(dc, &d->rcItem, g_brBg);
-        COLORREF fill = accent ? (pressed ? RGB(38, 82, 140) : RGB(29, 65, 115))
-                               : (pressed ? RGB(52, 52, 56) : RGB(26, 26, 28));
+        COLORREF fill = accent ? (pressed ? kBtnSelHot : kBtnSel)
+                               : (pressed ? kBtnFillHot : kBtnFill);
         COLORREF edge = accent ? kAppCol
-                               : (focus ? RGB(130, 130, 140) : RGB(66, 66, 72));
+                               : (focus ? kEdgeHot : kBtnEdge);
         HBRUSH bg = CreateSolidBrush(fill);
         HPEN pen = CreatePen(PS_SOLID, 1, edge);
         HGDIOBJ oldB = SelectObject(dc, bg);
@@ -4624,15 +4762,37 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             ListView_SetItemState(g_hwndQuickList, row, LVIS_SELECTED, LVIS_SELECTED);
             ListView_EnsureVisible(g_hwndQuickList, row, FALSE);
             ListView_EditLabel(g_hwndQuickList, row);
-        } else if (id >= IDC_THEME_BG && id <= IDC_THEME_QUICK) {
+        } else if (id >= IDC_THEME_BG &&
+                   (int)(id - IDC_THEME_BG) < ThemeFieldCount()) {
             PickThemeColor(hwnd, (int)(id - IDC_THEME_BG));
         } else if (id == IDC_THEME_RESET) {
             g_settings.theme = DefaultTheme();
             SaveNow();
             ApplyThemeFromSettings();
-            for (int i = 0; i < 14; i++)
+            for (int i = 0; i < ThemeFieldCount(); i++)
                 if (g_themeBtn[i] && IsWindow(g_themeBtn[i]))
                     InvalidateRect(g_themeBtn[i], NULL, FALSE);
+        } else if (id == IDC_THEME_EDITFILE) {
+            // Fresh export of the live theme, then open it for editing.
+            ExportThemeFile(g_settings.theme);
+            if ((UINT_PTR)ShellExecuteW(NULL, L"open",
+                    ThemeIniPath().c_str(), NULL, NULL,
+                    SW_SHOWNORMAL) <= 32)
+                MessageBoxW(hwnd, L"Couldn't open theme.ini.",
+                            L"SneekPeek", MB_ICONWARNING | MB_OK);
+        } else if (id == IDC_THEME_RELOAD) {
+            Theme t = g_settings.theme;
+            if (!ImportThemeFile(t)) {
+                MessageBoxW(hwnd, L"theme.ini not found - use Edit file first.",
+                            L"SneekPeek", MB_ICONWARNING | MB_OK);
+            } else {
+                g_settings.theme = t;
+                SaveNow(); // persist the file's colors into settings.ini
+                ApplyThemeFromSettings();
+                for (int i = 0; i < ThemeFieldCount(); i++)
+                    if (g_themeBtn[i] && IsWindow(g_themeBtn[i]))
+                        InvalidateRect(g_themeBtn[i], NULL, FALSE);
+            }
         } else if (id == IDC_RESCAN) {
             g_indexReady.store(false);
             BuildIndexAsync(true); // manual rescan: full pass
@@ -4654,7 +4814,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         g_hwndEngineCombo = g_hwndEngineUrl = g_hwndBrowserCombo = NULL;
         g_hwndRowsVal = g_hwndColsVal = NULL;
         g_hwndAppsList = g_hwndBangsList = g_hwndQuickList = NULL;
-        for (int i = 0; i < 14; i++) g_themeBtn[i] = NULL;
+        for (int i = 0; i < 32; i++) g_themeBtn[i] = NULL;
         g_pageGeneral.clear(); g_pageApps.clear();
         g_pageBangs.clear(); g_pageQuick.clear(); g_pageFiles.clear();
         g_pageTheme.clear();

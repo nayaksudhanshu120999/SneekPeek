@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <shlobj.h>
 #include <shellapi.h>
+#include <cstdio>
 #include <string>
 #include <vector>
 #include "bangs.h"
@@ -46,34 +47,72 @@ inline int EffectiveGridCols(int clientW, int wantCols, int minTileW) {
 }
 
 // ------------------------------------------------- palette theme (Settings > Theme)
-// Every palette color is user-editable: background, search field, selection,
-// text, secondary text, plus all category accents. Stored in [Theme] as
-// #RRGGBB; anything malformed falls back to the default below.
+// Every UI color is user-editable: background, fields, text, all accents,
+// buttons, edges, separators, even the power-chip colors. ONE descriptor
+// table drives everything (defaults, settings.ini, theme.ini, swatches), so
+// a color can never be added in one place and forgotten in another.
 struct Theme {
-    COLORREF bg    = RGB(0, 0, 0);
-    COLORREF input = RGB(0, 0, 0);
-    COLORREF sel   = RGB(28, 28, 30);
-    COLORREF text  = RGB(240, 240, 240);
-    COLORREF sub   = RGB(130, 130, 135);
-    COLORREF app   = RGB(96, 165, 250);
-    COLORREF web   = RGB(46, 224, 158);
-    COLORREF calc  = RGB(251, 191, 36);
-    COLORREF hint  = RGB(110, 110, 115);
-    COLORREF set   = RGB(45, 212, 191);
-    COLORREF awake = RGB(45, 212, 191);
-    COLORREF file  = RGB(96, 165, 250);
-    COLORREF folder = RGB(251, 191, 36);
-    COLORREF quick = RGB(255, 95, 170);
+    COLORREF bg, input, sel, text, rowtext, sub;
+    COLORREF app, web, calc, hint, set, awake, file, folder, quick;
+    COLORREF btnfill, btnfillhot, btnedge, edgehot, btnsel, btnselhot;
+    COLORREF sep, menuacc, chiptext, danger;
+    COLORREF powdown, powreboot, powsleep, powhib;
 };
 
-inline Theme DefaultTheme() { return Theme(); }
+struct ThemeField {
+    const wchar_t* key;   // INI + theme.ini name
+    const wchar_t* label; // swatch button text (short: 176px buttons)
+    COLORREF Theme::*member;
+    COLORREF def;
+};
+
+inline const ThemeField kThemeFields[] = {
+    {L"Bg",        L"Background",   &Theme::bg,        RGB(0, 0, 0)},
+    {L"Input",     L"Search field", &Theme::input,     RGB(0, 0, 0)},
+    {L"Sel",       L"Highlight",    &Theme::sel,       RGB(28, 28, 30)},
+    {L"Text",      L"Text",         &Theme::text,      RGB(240, 240, 240)},
+    {L"RowText",   L"Row text",     &Theme::rowtext,   RGB(218, 218, 226)},
+    {L"Sub",       L"Secondary",    &Theme::sub,       RGB(130, 130, 135)},
+    {L"App",       L"Apps",         &Theme::app,       RGB(96, 165, 250)},
+    {L"Web",       L"Web",          &Theme::web,       RGB(46, 224, 158)},
+    {L"Calc",      L"Calculator",   &Theme::calc,      RGB(251, 191, 36)},
+    {L"Hint",      L"Hint",         &Theme::hint,      RGB(110, 110, 115)},
+    {L"Set",       L"Settings",     &Theme::set,       RGB(45, 212, 191)},
+    {L"Awake",     L"Awake",        &Theme::awake,     RGB(45, 212, 191)},
+    {L"File",      L"Files",        &Theme::file,      RGB(96, 165, 250)},
+    {L"Folder",    L"Folders",      &Theme::folder,    RGB(251, 191, 36)},
+    {L"Quick",     L"Quick links",  &Theme::quick,     RGB(255, 95, 170)},
+    {L"BtnFill",   L"Button",       &Theme::btnfill,   RGB(26, 26, 28)},
+    {L"BtnFillHot",L"Button hot",   &Theme::btnfillhot,RGB(52, 52, 56)},
+    {L"BtnEdge",   L"Button edge",  &Theme::btnedge,   RGB(66, 66, 72)},
+    {L"EdgeHot",   L"Edge hot",     &Theme::edgehot,   RGB(130, 130, 140)},
+    {L"BtnSel",    L"Accent",       &Theme::btnsel,    RGB(29, 65, 115)},
+    {L"BtnSelHot", L"Accent hot",   &Theme::btnselhot, RGB(38, 82, 140)},
+    {L"Sep",       L"Separator",    &Theme::sep,       RGB(30, 30, 32)},
+    {L"MenuAcc",   L"Menu accent",  &Theme::menuacc,   RGB(150, 150, 155)},
+    {L"ChipText",  L"Chip text",    &Theme::chiptext,  RGB(255, 255, 255)},
+    {L"Danger",    L"Danger",       &Theme::danger,    RGB(255, 90, 90)},
+    {L"PowDown",   L"Shut down",    &Theme::powdown,   RGB(255, 90, 90)},
+    {L"PowReboot", L"Restart",      &Theme::powreboot, RGB(251, 191, 36)},
+    {L"PowSleep",  L"Sleep",        &Theme::powsleep,  RGB(80, 140, 255)},
+    {L"PowHib",    L"Hibernate",    &Theme::powhib,    RGB(160, 110, 255)},
+};
+
+inline int ThemeFieldCount() {
+    return (int)(sizeof(kThemeFields) / sizeof(kThemeFields[0]));
+}
+
+inline Theme DefaultTheme() {
+    Theme t{};
+    for (int i = 0; i < ThemeFieldCount(); i++)
+        t.*(kThemeFields[i].member) = kThemeFields[i].def;
+    return t;
+}
 
 inline bool operator==(const Theme& a, const Theme& b) {
-    return a.bg == b.bg && a.input == b.input && a.sel == b.sel &&
-           a.text == b.text && a.sub == b.sub && a.app == b.app &&
-           a.web == b.web && a.calc == b.calc && a.hint == b.hint &&
-           a.set == b.set && a.awake == b.awake && a.file == b.file &&
-           a.folder == b.folder && a.quick == b.quick;
+    for (int i = 0; i < ThemeFieldCount(); i++)
+        if (a.*(kThemeFields[i].member) != b.*(kThemeFields[i].member)) return false;
+    return true;
 }
 inline bool operator!=(const Theme& a, const Theme& b) { return !(a == b); }
 
@@ -185,24 +224,13 @@ inline void LoadSettingsCore(Settings& s) {
     s.gridCols = ClampGridCols(GetPrivateProfileIntW(L"General", L"GridCols", 5, ini.c_str()));
     // Theme: every key falls back to its default when missing or malformed,
     // so a hand-edited or older INI can never produce an unreadable palette.
-    {
-        Theme d = DefaultTheme();
-        struct Key { const wchar_t* name; COLORREF* field; COLORREF def; };
-        Key keys[] = {
-            {L"Bg", &s.theme.bg, d.bg}, {L"Input", &s.theme.input, d.input},
-            {L"Sel", &s.theme.sel, d.sel}, {L"Text", &s.theme.text, d.text},
-            {L"Sub", &s.theme.sub, d.sub}, {L"App", &s.theme.app, d.app},
-            {L"Web", &s.theme.web, d.web}, {L"Calc", &s.theme.calc, d.calc},
-            {L"Hint", &s.theme.hint, d.hint}, {L"Set", &s.theme.set, d.set},
-            {L"Awake", &s.theme.awake, d.awake}, {L"File", &s.theme.file, d.file},
-            {L"Folder", &s.theme.folder, d.folder}, {L"Quick", &s.theme.quick, d.quick},
-        };
-        for (const auto& k : keys) {
-            GetPrivateProfileStringW(L"Theme", k.name, SerializeColor(k.def).c_str(),
-                                     buf, 4096, ini.c_str());
-            COLORREF c;
-            *k.field = (buf[0] && ParseColor(buf, c)) ? c : k.def;
-        }
+    for (int i = 0; i < ThemeFieldCount(); i++) {
+        GetPrivateProfileStringW(L"Theme", kThemeFields[i].key,
+                                 SerializeColor(kThemeFields[i].def).c_str(),
+                                 buf, 4096, ini.c_str());
+        COLORREF c;
+        s.theme.*(kThemeFields[i].member) =
+            (buf[0] && ParseColor(buf, c)) ? c : kThemeFields[i].def;
     }
 }
 
@@ -307,19 +335,10 @@ inline void SaveSettings(const Settings& s) {
         WritePrivateProfileStringW(L"General", L"GridCols", nc, ini.c_str());
     }
     {
-        struct Key { const wchar_t* name; COLORREF field; };
-        Key keys[] = {
-            {L"Bg", s.theme.bg}, {L"Input", s.theme.input},
-            {L"Sel", s.theme.sel}, {L"Text", s.theme.text},
-            {L"Sub", s.theme.sub}, {L"App", s.theme.app},
-            {L"Web", s.theme.web}, {L"Calc", s.theme.calc},
-            {L"Hint", s.theme.hint}, {L"Set", s.theme.set},
-            {L"Awake", s.theme.awake}, {L"File", s.theme.file},
-            {L"Folder", s.theme.folder}, {L"Quick", s.theme.quick},
-        };
-        for (const auto& k : keys)
-            WritePrivateProfileStringW(L"Theme", k.name, SerializeColor(k.field).c_str(),
-                                       ini.c_str());
+        for (int i = 0; i < ThemeFieldCount(); i++)
+            WritePrivateProfileStringW(L"Theme", kThemeFields[i].key,
+                SerializeColor(s.theme.*(kThemeFields[i].member)).c_str(),
+                ini.c_str());
     }
     size_t nbangs = s.bangs.size() < (size_t)kMaxCustomEntries
         ? s.bangs.size() : (size_t)kMaxCustomEntries;
@@ -349,6 +368,71 @@ inline void SaveSettings(const Settings& s) {
         swprintf_s(key, 32, L"Item%d", (int)i);
         WritePrivateProfileStringW(L"History", key, s.history[i].c_str(), ini.c_str());
     }
+}
+
+// ------------------------------------------------- theme.ini (plain-text theme file)
+// %APPDATA%\SneekPeek\theme.ini: commented "#RRGGBB per line" file for people
+// who'd rather edit colors in Notepad than click swatches. settings.ini stays
+// the store: "Edit file" exports the live theme, "Reload" imports + saves.
+inline std::wstring ThemeIniPath() {
+    std::wstring ini = SettingsPath(); // ensures the directory exists
+    size_t p = ini.rfind(L'\\');
+    return (p == std::wstring::npos ? L"" : ini.substr(0, p + 1)) + L"theme.ini";
+}
+
+// One theme.ini line: "Key = #RRGGBB" (spacing/case tolerant). False for
+// blanks, #-comments, unknown keys, and malformed colors. Unit-tested.
+inline bool ParseThemeLine(const std::wstring& line, std::wstring& key, COLORREF& color) {
+    std::wstring t = BangTrim(line);
+    if (t.empty() || t[0] == L'#' || t[0] == L';') return false;
+    size_t eq = t.find(L'=');
+    if (eq == std::wstring::npos) return false;
+    std::wstring k = BangTrim(t.substr(0, eq));
+    std::wstring v = BangTrim(t.substr(eq + 1));
+    if (k.empty() || v.empty()) return false;
+    for (int i = 0; i < ThemeFieldCount(); i++) {
+        if (_wcsicmp(k.c_str(), kThemeFields[i].key) == 0) {
+            if (!ParseColor(v, color)) return false;
+            key = kThemeFields[i].key;
+            return true;
+        }
+    }
+    return false; // unknown key: never fail the whole file for one line
+}
+
+// Export the live theme with comments (always rewrites: the file is a fresh
+// export of what Settings holds, so the two can never silently disagree).
+inline void ExportThemeFile(const Theme& t) {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, ThemeIniPath().c_str(), L"w,ccs=UTF-8") != 0 || !f) return;
+    fwprintf(f, L"# SneekPeek theme - #RRGGBB per line, # starts a comment.\n");
+    fwprintf(f, L"# Exported from Settings; edit, save, then press Reload.\n");
+    fwprintf(f, L"# Unknown keys and bad lines are ignored on reload.\n");
+    for (int i = 0; i < ThemeFieldCount(); i++)
+        fwprintf(f, L"%-10s = %s\n", kThemeFields[i].key,
+                 SerializeColor(t.*(kThemeFields[i].member)).c_str());
+    fclose(f);
+}
+
+// Import theme.ini over t (missing/bad lines keep current values).
+// False when the file doesn't exist (caller says "use Edit file first").
+inline bool ImportThemeFile(Theme& t) {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, ThemeIniPath().c_str(), L"r,ccs=UTF-8") != 0 || !f) return false;
+    wchar_t buf[512];
+    while (fgetws(buf, 512, f)) {
+        std::wstring key;
+        COLORREF c;
+        if (!ParseThemeLine(buf, key, c)) continue;
+        for (int i = 0; i < ThemeFieldCount(); i++) {
+            if (key == kThemeFields[i].key) {
+                t.*(kThemeFields[i].member) = c;
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return true;
 }
 
 inline void ApplyRunAtStartup(bool enable) {

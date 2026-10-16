@@ -484,6 +484,28 @@ int main() {
         CHECK(!LoadAppCache(L"Z:\\no\\such\\file.bin", c));
         DeleteFileW(f.c_str());
     }
+    // theme.ini line parsing + extended defaults
+    {
+        CHECK(ThemeFieldCount() == 29);
+        Theme d = DefaultTheme();
+        CHECK(d.rowtext == RGB(218, 218, 226) && d.danger == RGB(255, 90, 90));
+        CHECK(d.btnsel == RGB(29, 65, 115) && d.sep == RGB(30, 30, 32));
+        CHECK(d.powdown == RGB(255, 90, 90) && d.powhib == RGB(160, 110, 255));
+        CHECK(d.chiptext == RGB(255, 255, 255) && d.menuacc == RGB(150, 150, 155));
+        std::wstring key;
+        COLORREF c;
+        CHECK(ParseThemeLine(L"Bg = #000000", key, c) && key == L"Bg" &&
+              c == RGB(0, 0, 0));
+        CHECK(ParseThemeLine(L"  text=#F0F0F0  ", key, c) && key == L"Text");
+        CHECK(ParseThemeLine(L"powhib=160110FF", key, c) && key == L"PowHib");
+        CHECK(!ParseThemeLine(L"# a comment", key, c));
+        CHECK(!ParseThemeLine(L"", key, c));
+        CHECK(!ParseThemeLine(L"NoEqualsHere", key, c));
+        CHECK(!ParseThemeLine(L"Nope = #000000", key, c)); // unknown key
+        CHECK(!ParseThemeLine(L"Bg = notacolor", key, c)); // bad color
+        CHECK(!ParseThemeLine(L"Bg = ", key, c));
+        CHECK(!ParseThemeLine(L" = #000000", key, c));
+    }
     // theme defaults + auto-fit grid columns + multi-select membership
     {
         Theme d = DefaultTheme();
