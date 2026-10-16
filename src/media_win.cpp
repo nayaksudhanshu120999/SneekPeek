@@ -312,8 +312,7 @@ int MediaHardwareDecode() {
             if (SUCCEEDED(hr2) && dev) {
                 ID3D11VideoDevice* vd = nullptr;
                 if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&vd))) && vd) {
-                    UINT n = 0;
-                    if (SUCCEEDED(vd->GetVideoDecoderProfileCount(&n)) && n > 0)
+                    if (vd->GetVideoDecoderProfileCount() > 0)
                         g_hwProbe = 1;
                     SafeRelease(vd);
                 }
