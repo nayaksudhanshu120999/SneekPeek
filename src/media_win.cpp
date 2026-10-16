@@ -23,7 +23,7 @@
 #include <wincodec.h> // WIC image decode + scaler
 #include <d3d11.h>    // video device (VIDEO_SUPPORT, enumerated adapters)
 #include <dxgi.h>     // swapchain
-#include <mfapi.h>    // MFStartup, MFTEnumEx (hardware probe)
+#include <mfapi.h>    // MFStartup (process-lifetime, first video open)
 #include <mfidl.h>    // MFT interface declarations
 #include <mftransform.h> // MFT category GUIDs
 #include <mfmediaengine.h> // IMFMediaEngine playback
@@ -284,24 +284,46 @@ int SiblingStep(const std::vector<std::wstring>& sibs, const std::wstring& cur, 
 HWND MediaHwnd() { return (g_m && g_m->hwnd) ? g_m->hwnd : NULL; }
 
 int MediaHardwareDecode() {
+    // Answers "can THIS GPU decode video" by asking D3D11 itself for decoder
+    // profiles, adapter by adapter (same order as playback). This deliberately
+    // avoids MFTEnumEx: it reports registered MFTs, not what the active
+    // adapter supports, and its profile of the hybrid-GPU case is murky.
+    // Runs only on first Settings open (cached); never at boot or idle.
     if (g_hwProbe >= 0) return g_hwProbe;
-    g_hwProbe = -1; // unknown until proven otherwise
-    if (!MediaDllPresent(L"mfplat.dll")) { g_hwProbe = 0; return g_hwProbe; }
+    g_hwProbe = 0; // guilty until proven innocent
+    if (!MediaDllPresent(L"d3d11.dll")) return g_hwProbe;
     bool uninit = false;
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED |
                                       COINIT_DISABLE_OLE1DDE);
     if (hr == S_OK) uninit = true;
     else if (hr != S_FALSE && hr != RPC_E_CHANGED_MODE) return g_hwProbe;
-    IMFActivate** acts = nullptr;
-    UINT32 count = 0;
-    if (SUCCEEDED(MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_HARDWARE,
-                            NULL, NULL, NULL, &acts, &count))) {
-        g_hwProbe = (count > 0) ? 1 : 0;
-        for (UINT32 i = 0; i < count; i++) acts[i]->Release();
-        CoTaskMemFree(acts);
+    IDXGIFactory1* dxgi = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&dxgi))) && dxgi) {
+        static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1,
+                                                   D3D_FEATURE_LEVEL_11_0};
+        for (UINT i = 0;; i++) {
+            IDXGIAdapter1* ad = nullptr;
+            if (FAILED(dxgi->EnumAdapters1(i, &ad))) break;
+            ID3D11Device* dev = nullptr;
+            HRESULT hr2 = D3D11CreateDevice(ad, D3D_DRIVER_TYPE_UNKNOWN, NULL,
+                D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                levels, 2, D3D11_SDK_VERSION, &dev, NULL, NULL);
+            SafeRelease(ad);
+            if (SUCCEEDED(hr2) && dev) {
+                ID3D11VideoDevice* vd = nullptr;
+                if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&vd))) && vd) {
+                    UINT n = 0;
+                    if (SUCCEEDED(vd->GetVideoDecoderProfileCount(&n)) && n > 0)
+                        g_hwProbe = 1;
+                    SafeRelease(vd);
+                }
+                SafeRelease(dev);
+                if (g_hwProbe > 0) break;
+            }
+        }
+        SafeRelease(dxgi);
     }
     if (uninit) CoUninitialize();
-    if (g_hwProbe < 0) g_hwProbe = 0;
     return g_hwProbe;
 }
 
@@ -607,7 +629,7 @@ bool VideoCreateSwap(MediaCtx* m) {
 // Letterboxed destination rect preserving the video aspect.
 RECT VideoDstRect(MediaCtx* m, int vw, int vh) {
     RECT r{0, 0, vw, vh};
-    UINT32 nw = 0, nh = 0;
+    DWORD nw = 0, nh = 0;
     if (m->engine && SUCCEEDED(m->engine->GetNativeVideoSize(&nw, &nh)) &&
         nw > 0 && nh > 0 && vw > 0 && vh > 0) {
         double s = (double)vw / (double)nw;
@@ -710,7 +732,7 @@ bool VideoPresent(MediaCtx* m, bool withOverlay) {
     IDXGISurface* surf = nullptr;
     if (FAILED(m->swap->GetBuffer(0, IID_PPV_ARGS(&surf))) || !surf) return false;
     RECT dst = VideoDstRect(m, W, H);
-    MFARGB black{1.0f, 0.0f, 0.0f, 0.0f};
+    MFARGB black{255, 0, 0, 0}; // MFARGB channels are bytes, not floats
     HRESULT hr = m->engine->TransferVideoFrame(surf, NULL, &dst, &black);
     SafeRelease(surf);
     if (FAILED(hr)) return false;
@@ -770,7 +792,7 @@ void VideoPoll(MediaCtx* m) {
     int rs = (int)m->engine->GetReadyState();
     if (!m->shown) {
         if (rs >= 2 /*HAVE_CURRENT_DATA*/) {
-            UINT32 nw = 0, nh = 0;
+            DWORD nw = 0, nh = 0;
             if (SUCCEEDED(m->engine->GetNativeVideoSize(&nw, &nh)) && nw > 0 && nh > 0) {
                 RECT area{0, 0, 960, 540};
                 WorkAreaFor(m->hwnd, area);
@@ -1112,7 +1134,7 @@ void MediaDeleteCurrent(MediaCtx* m) {
     fo.wFunc = FO_DELETE;
     fo.pFrom = from.data();
     fo.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT;
-    if (SHFileOperationW(&fo) != 0 || fo.fAborted) return;
+    if (SHFileOperationW(&fo) != 0 || fo.fAnyOperationsAborted) return;
     // The palette refresh on restore drops the row naturally (matched by
     // action, now absent). Advance first so something stays on screen.
     if (MediaHop(m, +1) < 0) MediaRequestClose();

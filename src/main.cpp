@@ -3527,8 +3527,8 @@ static void FillBrowserCombo() {
     SendMessageW(g_hwndBrowserCombo, CB_SETCURSEL, sel, 0);
 }
 
-// Hardware video-decode diagnostic: probed lazily here (one registry read,
-// cached process-wide) so boot and idle never pay for it.
+// Hardware video-decode diagnostic: probed lazily here (D3D11 decoder
+// profiles, cached process-wide) so boot and idle never pay for it.
 static void FillDecodeLabel() {
     if (g_hwndDecodeLabel)
         SetWindowTextW(g_hwndDecodeLabel, MediaDecodeLabel().c_str());
