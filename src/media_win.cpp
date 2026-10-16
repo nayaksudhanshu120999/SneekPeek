@@ -971,7 +971,6 @@ bool VideoLoad(MediaCtx* m, const std::wstring& path) {
 }
 
 static bool OpenVideo(const std::wstring& path);
-static LRESULT CALLBACK MediaBarProc(HWND hwnd, UINT m, WPARAM w, LPARAM l);
 static void EnsureMediaBarClass(HINSTANCE hInst);
 
 } // namespace
