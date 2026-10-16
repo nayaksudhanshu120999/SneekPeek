@@ -55,6 +55,18 @@ __pragma(warning(push, 0))
 __pragma(warning(pop))
 #endif
 
+#ifdef _MSC_VER
+// Belt-and-suspenders linkage: these import libs are also listed in
+// CMakeLists.txt / build.bat, but a pragma travels with the source file, so
+// a stale build file can never silently drop them (which once produced 7
+// LNK2019s plus LNK4199 on evr.dll). Duplicate references are harmless.
+// MinGW ignores this block and uses its -l flags instead.
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "evr.lib")
+#pragma comment(lib, "mfuuid.lib")
+#pragma comment(lib, "dxgi.lib") // IID_IDXGIFactory1 for the probe only
+#endif
+
 namespace {
 
 template <class T> void SafeRelease(T*& p) {

@@ -40,7 +40,7 @@ if %ERRORLEVEL%==0 (
         if exist src\app.o set RES_OBJS=src\app.o
     )
     g++ -std=c++17 -Os -s -DUNICODE -D_UNICODE -finput-charset=UTF-8 %SRC% %RES_OBJS% -o %OUT% ^
-        -mwindows -municode -luser32 -lshell32 -lgdi32 -ladvapi32 -lshlwapi -lcomctl32 -lcomdlg32 -lpowrprof -lole32 -lgdiplus -lmfplat -levr -lmfuuid -static
+        -mwindows -municode -luser32 -lshell32 -lgdi32 -ladvapi32 -lshlwapi -lcomctl32 -lcomdlg32 -lpowrprof -lole32 -lgdiplus -lmfplat -levr -lmfuuid -ldxgi -static
     if %ERRORLEVEL%==0 echo [build] OK -^> %OUT%
     exit /b %ERRORLEVEL%
 )
