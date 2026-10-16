@@ -224,6 +224,9 @@ static HWND        g_hwndChipRow = NULL;
 static HWND        g_hwndFileBar = NULL; // slim Explorer bar, file mode only
 static HWND        g_hwndFileGrid = NULL; // tile grid, file grid-view only
 static int         g_bangChipW = 0;  // 0 = hidden
+// Hover preview row (results index, -1 = none): painted as a subtle fill,
+// never touches selection or the multi-set.
+static int         g_hoverRow = -1;
 static HWND        g_hwndSettings = NULL;
 static int         g_settingsPage = 0;
 static HWND        g_hwndEngineCombo = NULL;
@@ -678,7 +681,9 @@ static int RowH(size_t i) {
     if (i < g_results.size() && g_results[i].kind == ResultKind::Header) return kHeadH;
     return kItemH;
 }
-// Visible data rows from the current top index (variable heights).
+// Visible data rows from the current top index. Uses the listbox's real
+// measured heights (not the assumed metrics) so scroll math always matches
+// what is actually painted.
 static int VisibleRowCount() {
     if (!g_hwndList) return 1;
     RECT lr; GetClientRect(g_hwndList, &lr);
@@ -687,7 +692,8 @@ static int VisibleRowCount() {
     if (top < 0) top = 0;
     int n = 0, y = 0;
     for (size_t i = (size_t)top; i < g_results.size() && y < h; i++) {
-        y += RowH(i);
+        LRESULT mh = SendMessageW(g_hwndList, LB_GETITEMHEIGHT, i, 0);
+        y += (mh > 0) ? (int)mh : RowH(i);
         n++;
     }
     return n < 1 ? 1 : n;
@@ -768,6 +774,7 @@ static void HidePalette() {
     DeactivateBang();
     DeactivateFileMode();
     MultiClear(); // selections never leak into the next open
+    g_hoverRow = -1;
     g_chips.clear();
     g_chipsFocus = false;
     if (g_hwndChipRow) ShowWindow(g_hwndChipRow, SW_HIDE);
@@ -928,6 +935,14 @@ static void DeactivateFileMode() {
 // rows carry names only. Current path alone is scanned; filter narrows it.
 // ".." returns only when the filter is empty (Backspace also goes up).
 static void UpdateFileResults(const std::wstring& filter) {
+    // A new filter invalidates picked paths (they may not even match
+    // anymore): the set belongs to the filter that picked it. Navigation,
+    // clicks, and hover never clear — only typing/drilling does.
+    static std::wstring lastFilter;
+    if (filter != lastFilter) {
+        lastFilter = filter;
+        MultiClear();
+    }
     g_results.clear();
     g_results.reserve(9);
     std::wstring fl = FileLower(filter);
@@ -1119,6 +1134,26 @@ static int GridColsEff() {
 // itself is a member — a stale set can never hijack a plain Enter.
 static std::set<std::wstring> g_multiSel;
 static int g_multiAnchor = -1; // Shift-range anchor (results index)
+static void TrackHoverLeave(HWND h) {
+    TRACKMOUSEEVENT tme{};
+    tme.cbSize = sizeof(tme);
+    tme.dwFlags = TME_LEAVE;
+    tme.hwndTrack = h;
+    TrackMouseEvent(&tme);
+}
+// List-box point -> results index, or -1 (shared by hover tracking).
+static int ListRowFromPoint(HWND h, LPARAM l) {
+    int idx = (int)SendMessageW(h, LB_ITEMFROMPOINT, 0, l);
+    if (HIWORD(idx) != 0) return -1;
+    LRESULT data = SendMessageW(h, LB_GETITEMDATA, LOWORD(idx), 0);
+    if (data < 0 || data >= (LRESULT)g_results.size()) return -1;
+    return (int)data;
+}
+// readable mark color on any accent fill (white on dark, near-black on light)
+static COLORREF ContrastOn(COLORREF c) {
+    int lum = (GetRValue(c) * 299 + GetGValue(c) * 587 + GetBValue(c) * 114) / 1000;
+    return lum > 128 ? RGB(10, 10, 12) : RGB(255, 255, 255);
+}
 static bool MultiSelectable(int idx) {
     return InFileMode() && idx >= 0 && idx < (int)g_results.size() &&
            MultiKeySelectable(g_results[(size_t)idx]);
@@ -1150,11 +1185,6 @@ static void MultiChanged() { // repaint everything that shows membership
     if (g_hwndList && IsWindow(g_hwndList)) InvalidateRect(g_hwndList, NULL, FALSE);
     if (g_hwndFileGrid && IsWindow(g_hwndFileGrid)) InvalidateRect(g_hwndFileGrid, NULL, FALSE);
     if (g_hwndFileBar && IsWindow(g_hwndFileBar)) InvalidateRect(g_hwndFileBar, NULL, FALSE);
-}
-static void MultiCollapseUnlessMember(int idx) {
-    if (g_multiSel.empty()) { g_multiAnchor = idx; return; }
-    if (!MultiHas(idx)) MultiClear();
-    g_multiAnchor = idx;
 }
 static int GridContentH() {
     bool head = !g_results.empty() && g_results.front().kind == ResultKind::Header;
@@ -1272,6 +1302,64 @@ static void BuildChips(const std::wstring& qlower) {
     }
 }
 
+// Content height from the listbox's real measured item heights, starting at
+// the given top index (grid tiles keep their own uniform metric). Sizing from
+// ground truth instead of assumed constants means the last row — descenders
+// and all — always fits, at any DPI, scrolled or not.
+static int ContentHForTop(int top) {
+    if (GridActive()) return GridContentH();
+    int count = (int)g_results.size();
+    int show = count > kMaxItems ? kMaxItems : count;
+    if (top < 0) top = 0;
+    int hgt = 0;
+    for (int k = 0; k < show && top + k < count; k++) {
+        LRESULT mh = SendMessageW(g_hwndList, LB_GETITEMHEIGHT, top + k, 0);
+        hgt += (mh > 0) ? (int)mh : RowH((size_t)(top + k));
+    }
+    return hgt;
+}
+// Resize the palette window (round region + chip row follow) to fit content.
+// Only acts when the height actually changed: no per-keystroke blink.
+static void FitPaletteWindow(int inputH, int listY, int contentH, int barH,
+                             bool showChips) {
+    // Bottom pad generously: the last row's descenders (e.g. "g") must clear
+    // the rounded window edge at every DPI, never sit on the boundary.
+    int h = listY + contentH + barH + Dpx(8);
+    RECT wr; GetWindowRect(g_hwndPalette, &wr);
+    if (h == wr.bottom - wr.top) return;
+    SetWindowPos(g_hwndPalette, HWND_TOPMOST, wr.left, wr.top, kWidth, h,
+                 SWP_NOACTIVATE | SWP_NOZORDER);
+    ApplyRoundCorners();
+    RECT cr; GetClientRect(g_hwndPalette, &cr);
+    if (showChips)
+        SetWindowPos(g_hwndChipRow, NULL, kPadX, inputH, cr.right - kPadX * 2, kChipRowH,
+                     SWP_NOZORDER | SWP_SHOWWINDOW);
+    else
+        ShowWindow(g_hwndChipRow, SW_HIDE);
+}
+// After a programmatic scroll the visible band starts at a different row
+// (headers are slim, so bands differ in height): refit window + children so
+// the new band never overflows its frame.
+static void RefitListHeight() {
+    if (GridActive() || !g_hwndList || !IsWindowVisible(g_hwndList)) return;
+    if (!g_hwndPalette) return;
+    int top = (int)SendMessageW(g_hwndList, LB_GETTOPINDEX, 0, 0);
+    if (top < 0) top = 0;
+    int inputH = CurrentInputH();
+    bool showChips = !g_chips.empty();
+    int listY = inputH + (showChips ? kChipRowH : 0);
+    int contentH = ContentHForTop(top);
+    bool showBar = InFileMode() && !g_fileDir.empty();
+    int barH = showBar ? kBottomBarH : 0;
+    FitPaletteWindow(inputH, listY, contentH, barH, showChips);
+    RECT cr; GetClientRect(g_hwndPalette, &cr);
+    SetWindowPos(g_hwndList, NULL, kPadX, listY, cr.right - kPadX * 2,
+                 contentH, SWP_NOZORDER | SWP_SHOWWINDOW);
+    if (showBar && g_hwndFileBar)
+        SetWindowPos(g_hwndFileBar, NULL, kPadX, listY + contentH,
+                     cr.right - kPadX * 2, barH, SWP_NOZORDER | SWP_SHOWWINDOW);
+}
+
 static void RebuildListControl() {
     SendMessageW(g_hwndList, LB_RESETCONTENT, 0, 0);
     for (size_t i = 0; i < g_results.size(); i++) {
@@ -1295,30 +1383,13 @@ static void RebuildListControl() {
     size_t rows = g_results.size() > kMaxItems ? kMaxItems : g_results.size();
     int inputH = CurrentInputH();
     int listY = inputH + (showChips ? kChipRowH : 0);
-    // Exact content height: headers are slim, so the window fits the rows
-    // with no trailing blank (grid tiles keep their own metric).
-    int contentH = 0;
-    if (gridOn) contentH = GridContentH();
-    else for (size_t i = 0; i < rows; i++) contentH += RowH(i);
+    // Measured heights from the live top index (EnsureVisible above may have
+    // scrolled a slim header out): the band always fits, scrolled or not.
+    g_hoverRow = -1; // fresh results, fresh hover
+    int top = (int)SendMessageW(g_hwndList, LB_GETTOPINDEX, 0, 0);
+    int contentH = ContentHForTop(top);
     int barH = showBar ? kBottomBarH : 0;
-    // Bottom pad generously: the last row's descenders (e.g. "g") must clear
-    // the rounded window edge at every DPI, never sit on the boundary.
-    int h = listY + contentH + barH + Dpx(8);
-
-    // Resize (window + region + children) only when the height changed:
-    // this is what stops the per-keystroke blink.
-    RECT wr; GetWindowRect(g_hwndPalette, &wr);
-    if (h != wr.bottom - wr.top) {
-        SetWindowPos(g_hwndPalette, HWND_TOPMOST, wr.left, wr.top, kWidth, h,
-                     SWP_NOACTIVATE | SWP_NOZORDER);
-        ApplyRoundCorners();
-        RECT cr; GetClientRect(g_hwndPalette, &cr);
-        if (showChips)
-            SetWindowPos(g_hwndChipRow, NULL, kPadX, inputH, cr.right - kPadX * 2, kChipRowH,
-                         SWP_NOZORDER | SWP_SHOWWINDOW);
-        else
-            ShowWindow(g_hwndChipRow, SW_HIDE);
-    }
+    FitPaletteWindow(inputH, listY, contentH, barH, showChips);
     // List/grid visibility + geometry, every refresh (cheap, idempotent).
     {
         RECT cr; GetClientRect(g_hwndPalette, &cr);
@@ -1737,10 +1808,17 @@ static void EnsureVisible(int sel) {
     }
     int top = (int)SendMessageW(g_hwndList, LB_GETTOPINDEX, 0, 0);
     int vis = VisibleRowCount();
+    int newTop = top;
     if (sel < top)
-        SendMessageW(g_hwndList, LB_SETTOPINDEX, sel, 0);
+        newTop = sel;
     else if (sel >= top + vis)
-        SendMessageW(g_hwndList, LB_SETTOPINDEX, sel - vis + 1, 0);
+        newTop = sel - vis + 1;
+    if (newTop != top) {
+        SendMessageW(g_hwndList, LB_SETTOPINDEX, newTop, 0);
+        // The scrolled band starts at a different row (slim headers shift
+        // the math): refit so the new band never overflows its frame.
+        RefitListHeight();
+    }
 }
 
 // Multi-step arrow motion (shared by keys + wheel), no wrapping.
@@ -1759,7 +1837,7 @@ static void MoveSelSteps(int steps) {
         SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
         SyncSelToBox(to);
         EnsureVisible(to);
-        MultiCollapseUnlessMember(to); // wheel re-anchors like arrows
+        g_multiAnchor = to; // wheel re-anchors the Shift range, keeps the set
     }
     InvalidateRect(g_hwndList, NULL, FALSE);
     if (!g_chips.empty()) InvalidateRect(g_hwndChipRow, NULL, FALSE);
@@ -1813,11 +1891,12 @@ static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
             POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
             ArmRowDrag(row, pt);
             // File-mode multi-select: Ctrl toggles, Shift extends, plain
-            // click collapses to the cursor (Explorer rule).
+            // click just re-anchors (the set survives navigation now; only
+            // filter/dir changes clear it).
             if (InFileMode() && !GridActive() && row >= 0) {
                 if (ctrl && !shift) MultiToggleIdx(row);
                 else if (shift && !ctrl) MultiRangeTo(row);
-                else MultiCollapseUnlessMember(row);
+                else g_multiAnchor = row;
                 MultiChanged();
             }
         } else {
@@ -1828,7 +1907,22 @@ static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
     if (m == WM_MOUSEMOVE) {
         POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
         MoveRowDrag(h, pt);
+        // Hover preview only: repaints the hot row, never moves selection
+        // or disturbs the multi-set.
+        int hov = ListRowFromPoint(h, l);
+        if (hov != g_hoverRow) {
+            g_hoverRow = hov;
+            if (hov >= 0) TrackHoverLeave(h);
+            InvalidateRect(h, NULL, FALSE);
+        }
         return DefSubclassProc(h, m, w, l);
+    }
+    if (m == WM_MOUSELEAVE) {
+        if (g_hoverRow >= 0) {
+            g_hoverRow = -1;
+            InvalidateRect(h, NULL, FALSE);
+        }
+        return 0;
     }
     if (m == WM_LBUTTONUP) {
         CancelRowDrag();
@@ -1925,23 +2019,39 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                 InvalidateRect(g_hwndList, NULL, FALSE);
             } else if (count > 0) {
                 EnsureNavStart();
-                // Grid mode jumps a full tile row; list mode steps one row.
-                int step = GridActive() ? GridColsEff() : 1;
-                int to = sel;
-                bool moved = false;
-                for (int i = 0; i < step; i++) {
-                    int nx = MoveSelNoWrap(to, +1);
-                    if (nx < 0) break;
-                    to = nx;
-                    moved = true;
-                }
-                if (moved) {
+                if (InFileMode()) {
+                    // File mode never dead-ends: clamp onto the nearest
+                    // selectable row, so arrows always leave a live target
+                    // for Enter and never disturb the multi-set.
+                    int step = GridActive() ? GridColsEff() : 1;
+                    int to = sel;
+                    for (int i = 0; i < step; i++) {
+                        int nx = ClampMoveSel(g_results, to, +1);
+                        if (nx < 0 || nx == to) break;
+                        to = nx;
+                    }
+                    g_multiAnchor = to;
                     SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
                     SyncSelToBox(to);
                     EnsureVisible(to);
-                    MultiCollapseUnlessMember(to); // arrows collapse the set
                 } else {
-                    RestoreOrigSel(); // past last: back to the typed text
+                    // Grid mode jumps a full tile row; list mode steps one row.
+                    int step = GridActive() ? GridColsEff() : 1;
+                    int to = sel;
+                    bool moved = false;
+                    for (int i = 0; i < step; i++) {
+                        int nx = MoveSelNoWrap(to, +1);
+                        if (nx < 0) break;
+                        to = nx;
+                        moved = true;
+                    }
+                    if (moved) {
+                        SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
+                        SyncSelToBox(to);
+                        EnsureVisible(to);
+                    } else {
+                        RestoreOrigSel(); // past last: back to the typed text
+                    }
                 }
                 InvalidateRect(g_hwndList, NULL, FALSE);
                 if (haveChips) InvalidateRect(g_hwndChipRow, NULL, FALSE);
@@ -1957,23 +2067,37 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                 InvalidateRect(g_hwndList, NULL, FALSE);
             } else if (count > 0) {
                 EnsureNavStart();
-                // Grid mode jumps a full tile row; list mode steps one row.
-                int step = GridActive() ? GridColsEff() : 1;
-                int to = sel;
-                bool moved = false;
-                for (int i = 0; i < step; i++) {
-                    int nx = MoveSelNoWrap(to, -1);
-                    if (nx < 0) break;
-                    to = nx;
-                    moved = true;
-                }
-                if (moved) {
+                if (InFileMode()) {
+                    // File mode never dead-ends: clamp, never clear.
+                    int step = GridActive() ? GridColsEff() : 1;
+                    int to = sel;
+                    for (int i = 0; i < step; i++) {
+                        int nx = ClampMoveSel(g_results, to, -1);
+                        if (nx < 0 || nx == to) break;
+                        to = nx;
+                    }
+                    g_multiAnchor = to;
                     SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
                     SyncSelToBox(to);
                     EnsureVisible(to);
-                    MultiCollapseUnlessMember(to); // arrows collapse the set
                 } else {
-                    RestoreOrigSel(); // above first: back to the typed text
+                    // Grid mode jumps a full tile row; list mode steps one row.
+                    int step = GridActive() ? GridColsEff() : 1;
+                    int to = sel;
+                    bool moved = false;
+                    for (int i = 0; i < step; i++) {
+                        int nx = MoveSelNoWrap(to, -1);
+                        if (nx < 0) break;
+                        to = nx;
+                        moved = true;
+                    }
+                    if (moved) {
+                        SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
+                        SyncSelToBox(to);
+                        EnsureVisible(to);
+                    } else {
+                        RestoreOrigSel(); // above first: back to the typed text
+                    }
                 }
                 InvalidateRect(g_hwndList, NULL, FALSE);
                 if (haveChips) InvalidateRect(g_hwndChipRow, NULL, FALSE);
@@ -1985,14 +2109,13 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
             if (GridActive() && count > 0) {
                 g_confirmPower = -1;
                 EnsureNavStart();
-                int to = MoveSelNoWrap(sel, (w == VK_RIGHT) ? +1 : -1);
+                // Grid is file-mode-only: clamp, never clear (no dead spot).
+                int to = ClampMoveSel(g_results, sel, (w == VK_RIGHT) ? +1 : -1);
                 if (to >= 0) {
+                    g_multiAnchor = to;
                     SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
                     SyncSelToBox(to);
                     EnsureVisible(to);
-                    MultiCollapseUnlessMember(to); // arrows collapse the set
-                } else {
-                    RestoreOrigSel();
                 }
                 InvalidateRect(g_hwndList, NULL, FALSE);
                 return 0; // consumed by the grid
@@ -2184,7 +2307,7 @@ static LRESULT CALLBACK FileBarProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         size_t nm = g_multiSel.size();
         if (InFileMode() && nm > 0) {
             wchar_t b[128];
-            swprintf_s(b, 128, L"%u selected \u00B7 Enter opens all \u00B7 plain click clears",
+            swprintf_s(b, 128, L"%u selected \u00B7 Enter opens all \u00B7 typing clears",
                        (unsigned)nm);
             DrawTextW(dc, b, -1, &tr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -2343,17 +2466,47 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             bool isCur = ((int)i == sel);
             bool isMem = MultiHas((int)i);
             if (isCur) FillRect(dc, &tile, g_brSel);
-            if (isMem && !isCur) {
-                // Multi-selection frame in the row accent color (the cursor
-                // keeps the full highlight); drawn inside the tile so it
-                // never overlaps a neighbor's label.
-                HPEN pen = CreatePen(PS_SOLID, 2, ri.color);
-                HGDIOBJ oldP = SelectObject(dc, pen);
-                HGDIOBJ oldB = SelectObject(dc, GetStockObject(NULL_BRUSH));
-                Rectangle(dc, tile.left, tile.top, tile.right, tile.bottom);
-                SelectObject(dc, oldP);
-                SelectObject(dc, oldB);
-                DeleteObject(pen);
+            // Hover preview: subtle fill, visual only.
+            if (!isCur && (int)i == g_hoverRow) {
+                HBRUSH brHov = CreateSolidBrush(
+                    RGB((GetRValue(kBg) + GetRValue(kSel)) / 2,
+                        (GetGValue(kBg) + GetGValue(kSel)) / 2,
+                        (GetBValue(kBg) + GetBValue(kSel)) / 2));
+                FillRect(dc, &tile, brHov);
+                DeleteObject(brHov);
+            }
+            // Corner selection badge: empty outline = pickable, filled +
+            // check = member. Sits in the tile corner, clear of glyph/label.
+            if (MultiKeySelectable(ri)) {
+                int bs = Dpx(18);
+                RECT badge{tile.left + Dpx(4), tile.top + Dpx(4),
+                           tile.left + Dpx(4) + bs, tile.top + Dpx(4) + bs};
+                if (isMem) {
+                    HBRUSH fb = CreateSolidBrush(ri.color);
+                    HGDIOBJ oldB = SelectObject(dc, fb);
+                    HPEN pen = CreatePen(PS_SOLID, 1, ri.color);
+                    HGDIOBJ oldP = SelectObject(dc, pen);
+                    RoundRect(dc, badge.left, badge.top,
+                              badge.right, badge.bottom, 6, 6);
+                    SelectObject(dc, oldB);
+                    SelectObject(dc, oldP);
+                    DeleteObject(fb);
+                    DeleteObject(pen);
+                    COLORREF ck = ContrastOn(ri.color);
+                    int qx = badge.left + Dpx(4), qy = badge.top + bs / 2;
+                    GlyphLine(dc, qx, qy, qx + Dpx(3), qy + Dpx(3), 2, ck);
+                    GlyphLine(dc, qx + Dpx(3), qy + Dpx(3),
+                              qx + Dpx(7), qy - Dpx(3), 2, ck);
+                } else {
+                    HPEN pen = CreatePen(PS_SOLID, 1, kSub);
+                    HGDIOBJ oldP = SelectObject(dc, pen);
+                    HGDIOBJ oldB = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                    RoundRect(dc, badge.left, badge.top,
+                              badge.right, badge.bottom, 6, 6);
+                    SelectObject(dc, oldP);
+                    SelectObject(dc, oldB);
+                    DeleteObject(pen);
+                }
             }
             int gz = Dpx(32);
             int gx = tile.left + (tile.right - tile.left - gz) / 2;
@@ -2383,13 +2536,14 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             SendMessageW(g_hwndList, LB_SETCURSEL, idx, 0);
             SyncSelToBox(idx);
             EnsureVisible(idx);
-            // Same Explorer rule as the list: Ctrl toggles, Shift extends,
-            // plain click collapses to the cursor tile.
+            // Ctrl toggles, Shift extends, plain click just re-anchors
+            // (the set survives navigation now; only filter/dir changes
+            // clear it).
             bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             if (ctrl && !shift) MultiToggleIdx(idx);
             else if (shift && !ctrl) MultiRangeTo(idx);
-            else MultiCollapseUnlessMember(idx);
+            else g_multiAnchor = idx;
             MultiChanged();
             InvalidateRect(hwnd, NULL, FALSE);
         }
@@ -2405,8 +2559,21 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     case WM_MOUSEMOVE: {
         POINT dpt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
         MoveRowDrag(hwnd, dpt);
+        // Hover preview only: never moves selection or the multi-set.
+        int hov = GridHitTest(GET_X_LPARAM(l), GET_Y_LPARAM(l));
+        if (hov != g_hoverRow) {
+            g_hoverRow = hov;
+            if (hov >= 0) TrackHoverLeave(hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
         break;
     }
+    case WM_MOUSELEAVE:
+        if (g_hoverRow >= 0) {
+            g_hoverRow = -1;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
     case WM_MOUSEWHEEL: // wheel over tiles moves through them
         WheelScrollList(GET_WHEEL_DELTA_WPARAM(w));
         return 0;
@@ -3353,6 +3520,16 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         bool isHead = ((int)ri < (int)g_results.size()) &&
                       g_results[ri].kind == ResultKind::Header;
         FillRect(dc, &d->rcItem, (!isHead && sel) ? g_brSel : g_brBg);
+        // Hover preview: a half-step between background and highlight.
+        // Visual only — selection and the multi-set are untouched.
+        if (!isHead && !sel && (int)ri == g_hoverRow) {
+            HBRUSH brHov = CreateSolidBrush(
+                RGB((GetRValue(kBg) + GetRValue(kSel)) / 2,
+                    (GetGValue(kBg) + GetGValue(kSel)) / 2,
+                    (GetBValue(kBg) + GetBValue(kSel)) / 2));
+            FillRect(dc, &d->rcItem, brHov);
+            DeleteObject(brHov);
+        }
         if ((int)ri < (int)g_results.size()) {
             const ResultItem& r = g_results[ri];
             SetBkMode(dc, TRANSPARENT);
@@ -3364,15 +3541,33 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
                 return TRUE;
             }
-            // Multi-selection member tick (file mode): accent bar at the far
-            // left, clear of the glyph cell, so membership never overlaps text.
-            if (MultiHas((int)ri)) {
-                HBRUSH mb = CreateSolidBrush(r.color);
-                RECT mr = d->rcItem;
-                mr.left += Dpx(6); mr.right = mr.left + Dpx(2);
-                mr.top += Dpx(7); mr.bottom -= Dpx(7);
-                FillRect(dc, &mr, mb);
-                DeleteObject(mb);
+            // File-mode rows lead with a selection checkbox (uniform indent
+            // keeps every label aligned): empty box = pickable, filled box +
+            // check = member. ".." gets the indent but no box.
+            int lead = InFileMode() ? Dpx(22) : 0;
+            if (InFileMode() && MultiKeySelectable(r)) {
+                int cb = Dpx(14);
+                int cyy = (d->rcItem.top + d->rcItem.bottom) / 2;
+                RECT box{d->rcItem.left + Dpx(6), cyy - cb / 2,
+                         d->rcItem.left + Dpx(6) + cb, cyy + cb / 2};
+                bool mem = MultiHas((int)ri);
+                if (mem) {
+                    HBRUSH fb = CreateSolidBrush(r.color);
+                    FillRect(dc, &box, fb);
+                    DeleteObject(fb);
+                    COLORREF ck = ContrastOn(r.color);
+                    int qx = box.left + Dpx(3);
+                    GlyphLine(dc, qx, cyy, qx + Dpx(3), cyy + Dpx(3), 2, ck);
+                    GlyphLine(dc, qx + Dpx(3), cyy + Dpx(3),
+                              qx + Dpx(7), cyy - Dpx(3), 2, ck);
+                }
+                HPEN pen = CreatePen(PS_SOLID, 1, mem ? r.color : kSub);
+                HGDIOBJ oldP = SelectObject(dc, pen);
+                HGDIOBJ oldB = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                Rectangle(dc, box.left, box.top, box.right, box.bottom);
+                SelectObject(dc, oldP);
+                SelectObject(dc, oldB);
+                DeleteObject(pen);
             }
             // App rows keep the original v1 look (slim category bar);
             // every other kind paints its glyph.
@@ -3389,10 +3584,10 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 FileGlyph fg = GlyphForResult(r.kind, r.title, r.action, r.color);
                 int isz = Dpx(20);
                 int icy = (d->rcItem.top + d->rcItem.bottom) / 2;
-                RECT cell{d->rcItem.left + Dpx(14), icy - isz / 2,
-                          d->rcItem.left + Dpx(14) + isz, icy + isz / 2};
+                RECT cell{d->rcItem.left + Dpx(14) + lead, icy - isz / 2,
+                          d->rcItem.left + Dpx(14) + lead + isz, icy + isz / 2};
                 PaintGlyph(dc, cell, fg, sel, r.title, g_fontChip);
-                tr.left += Dpx(44);
+                tr.left += Dpx(44) + lead;
             }
             tr.right -= Dpx(10);
             SetTextColor(dc, sel ? kText : RGB(218, 218, 226));

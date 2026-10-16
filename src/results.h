@@ -42,6 +42,32 @@ inline int FirstSelectable(const std::vector<ResultItem>& results) {
         if (results[i].kind != ResultKind::Header) return (int)i;
     return -1;
 }
+// Last actionable row, or -1 when there is none.
+inline int LastSelectable(const std::vector<ResultItem>& results) {
+    for (size_t i = results.size(); i-- > 0;)
+        if (results[i].kind != ResultKind::Header) return (int)i;
+    return -1;
+}
+// File-mode arrow motion never lands on nothing: step to the nearest
+// selectable row in `dir`, skipping headers, clamping at either end (stay
+// put instead of clearing). -1 only when no row is selectable at all.
+inline int ClampMoveSel(const std::vector<ResultItem>& items, int from, int dir) {
+    int first = FirstSelectable(items);
+    if (first < 0) return -1;
+    int last = LastSelectable(items);
+    auto ok = [&](int i) {
+        return i >= 0 && i < (int)items.size() &&
+               items[(size_t)i].kind != ResultKind::Header;
+    };
+    if (!ok(from)) return dir > 0 ? first : last;
+    int cur = from;
+    for (;;) {
+        int nx = cur + dir;
+        if (nx < first || nx > last) return cur; // past the end: stay
+        if (ok(nx)) return nx;
+        cur = nx;
+    }
+}
 
 // ------------------------------------------------- file-mode multi-selection
 // The selection set holds row action paths (full paths / drive roots), so it

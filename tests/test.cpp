@@ -524,6 +524,20 @@ int main() {
         CHECK(sel.size() == 3);
         std::set<std::wstring> empty;
         CHECK(MultiMemberRows(empty, items).empty());
+        // clamped file-mode motion: skips headers, never lands on nothing
+        // (".." is a real Folder row, so arrows stop on it like before)
+        CHECK(LastSelectable(items) == 4);
+        CHECK(ClampMoveSel(items, 1, +1) == 2);  // file -> folder
+        CHECK(ClampMoveSel(items, 2, +1) == 3);  // folder -> ".."
+        CHECK(ClampMoveSel(items, 3, +1) == 4);  // ".." -> drive
+        CHECK(ClampMoveSel(items, 4, +1) == 4);  // past last: stays (no dead spot)
+        CHECK(ClampMoveSel(items, 1, -1) == 1);  // above first pickable: stays
+        CHECK(ClampMoveSel(items, 4, -1) == 3);  // drive -> ".."
+        CHECK(ClampMoveSel(items, -1, +1) == 1); // resyncs to first pickable
+        CHECK(ClampMoveSel(items, -1, -1) == 4); // resyncs to last pickable
+        std::vector<ResultItem> headsOnly = {hd};
+        CHECK(ClampMoveSel(headsOnly, 0, +1) == -1); // nothing selectable
+        CHECK(LastSelectable(headsOnly) == -1);
     }
     if (g_fail == 0) printf("ALL TESTS PASSED\n");
     return g_fail ? 1 : 0;
