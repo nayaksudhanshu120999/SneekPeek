@@ -54,6 +54,7 @@
 #include "syspages.h"
 #include "results.h"
 #include "verbs.h"
+#include "media.h"
 #include "resource.h"
 
 #pragma comment(lib, "user32.lib")
@@ -96,7 +97,7 @@ static int Dpx(int px) { return MulDiv(px, g_dpi, 96); }
 // Layout metrics scale with DPI (recomputed by UpdateLayoutMetrics).
 // Width stays fixed; compactness comes from slimmer rows, not density:
 // data rows keep breathing room while headers/padding tighten up.
-static int kWidth = 600;
+static int kWidth = 520;
 static int kInputH = 40;   // one text line incl. vertical padding (grows when wrapping)
 static int kItemH = 34;    // data rows
 static int kHeadH = 22;    // section header rows (variable-height listbox)
@@ -111,7 +112,7 @@ static int kGridTileH = 74; // Explorer-like tile height (glyph + 2 name lines)
 static int kGridHeadH = 20; // slim count header above the tiles
 static const int kMaxChips = 4;
 static void UpdateLayoutMetrics() {
-    kWidth = Dpx(600); kInputH = Dpx(40); kItemH = Dpx(34); kHeadH = Dpx(22);
+    kWidth = Dpx(520); kInputH = Dpx(40); kItemH = Dpx(34); kHeadH = Dpx(22);
     kPadX = Dpx(12);
     kCornerR = Dpx(12); kChipH = Dpx(28); kChipRowH = Dpx(34);
     kBottomBarH = Dpx(26);
@@ -225,6 +226,7 @@ static HWND        g_hwndEngineCombo = NULL;
 static HWND        g_hwndEngineUrl = NULL;
 static HWND        g_hwndBrowserCombo = NULL;
 static HWND        g_hwndSavedLabel = NULL; // "Saved HH:MM:SS" indicator
+static HWND        g_hwndDecodeLabel = NULL; // Settings: video-decode diagnostic
 static HWND        g_hwndRowsVal = NULL; // grid rows value label (Files tab)
 static HWND        g_hwndColsVal = NULL; // grid columns value label (Files tab)
 static HWND        g_hwndAppsList = NULL;
@@ -345,6 +347,11 @@ static bool g_changingEdit = false;
 // ever scanned (no parent/child prefetch, no cache).
 static bool g_fileActive = false;
 static std::wstring g_fileDir;
+// Built-in viewer: while a media window is open the palette's dismiss
+// handlers stand down (see the g_mediaActive guards) and the palette state
+// below is restored verbatim on close.
+static bool g_mediaActive = false;
+static PaletteSnapshot g_snapshot;
 // File grid view (Settings toggle): Explorer-like tiles instead of rows.
 // The hidden listbox stays the selection store; the grid only paints +
 // hit-tests, so all nav/execute code keeps working unchanged.
@@ -431,6 +438,7 @@ static void ActivateFileMode(const std::wstring& dir);
 static void DeactivateFileMode();
 static void UpdateFileResults(const std::wstring& filter);
 static void ExecuteFileSelected(bool inExplorer);
+static void OpenMediaViewer(const std::wstring& path);
 static std::wstring SystemExe(const wchar_t* name);
 static void RebuildListControl();
 static int CurrentSelection();
@@ -970,6 +978,22 @@ static void ExecuteFileSelected(bool inExplorer) {
     if (r.kind == ResultKind::File) {
         if (r.action.empty()) return;
         std::wstring full = r.action; // copy: HidePalette clears file state
+        if (!inExplorer) {
+            // Built-in viewer takes Enter/Space on images and video;
+            // Ctrl+Enter keeps the old default-app behaviour. Unsupported
+            // formats (no in-box codec) report and stay in the palette.
+            bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            MediaKind mk = ctrl ? MediaKind::None : ClassifyMedia(full);
+            if (mk == MediaKind::Image || mk == MediaKind::Video) {
+                OpenMediaViewer(full); // snapshots, hides, opens media
+                return;
+            }
+            if (mk == MediaKind::Unsupported) {
+                NotifyLaunchFailed(L"This format has no codec on this Windows "
+                                   L"build. Ctrl+Enter opens the default app.");
+                return;
+            }
+        }
         HidePalette(); // hide first: never wait for the target
         if ((UINT_PTR)ShellExecuteW(NULL, L"open", full.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
             NotifyLaunchFailed(L"Couldn't open this file");
@@ -983,6 +1007,115 @@ static void ExecuteFileSelected(bool inExplorer) {
             NotifyLaunchFailed(L"Couldn't open this folder");
         return;
     }
+}
+
+// ------------------------------------------------------- media lifecycle
+// Snapshot BEFORE HidePalette() destroys file state; restore verbatim when
+// the media window closes (Esc, click-outside, error — one identical path).
+static void SavePaletteSnapshot() {
+    g_snapshot.valid = true;
+    g_snapshot.fileActive = g_fileActive;
+    g_snapshot.fileDir = g_fileDir; // HidePalette() clears this: read it first
+    g_snapshot.query = GetEditText(g_hwndEdit);
+    int sel = CurrentSelection();
+    g_snapshot.selIndex = sel;
+    g_snapshot.selAction.clear();
+    if (sel >= 0 && sel < (int)g_results.size())
+        g_snapshot.selAction = g_results[(size_t)sel].action;
+    g_snapshot.gridTopRow = g_gridTopRow;
+    g_snapshot.listTop = g_hwndList
+        ? (int)SendMessageW(g_hwndList, LB_GETTOPINDEX, 0, 0) : 0;
+    if (g_hwndPalette) {
+        GetWindowRect(g_hwndPalette, &g_snapshot.rect);
+        g_snapshot.monitor = MonitorFromWindow(g_hwndPalette, MONITOR_DEFAULTTOPRIMARY);
+    }
+}
+
+static void RestorePalette() {
+    if (!g_snapshot.valid) { ShowPalette(); return; } // defensive: fresh bar
+    EnsureSettingsLists();
+    EnsureGdiplus();
+    EnsureAppFonts();
+    EnsureOle();
+    EnableRoundCorners(g_hwndPalette);
+    // NOTE: no DeactivateBang/edit-clear here: this is a restore, not a fresh bar.
+    // fileDir may be "" (drive-list level): fileActive alone decides the mode.
+    if (g_snapshot.fileActive) {
+        g_fileActive = true;
+        g_fileDir = g_snapshot.fileDir;
+        RefreshDriveCache(); // labels may be stale after viewing/deleting
+    }
+    // Saved position if its monitor still exists, else re-place.
+    bool placed = false;
+    if (g_snapshot.rect.right > g_snapshot.rect.left) {
+        HMONITOR m = MonitorFromRect(&g_snapshot.rect, MONITOR_DEFAULTTONULL);
+        if (m) {
+            SetWindowPos(g_hwndPalette, HWND_TOPMOST,
+                         g_snapshot.rect.left, g_snapshot.rect.top,
+                         g_snapshot.rect.right - g_snapshot.rect.left,
+                         g_snapshot.rect.bottom - g_snapshot.rect.top,
+                         SWP_SHOWWINDOW | SWP_NOACTIVATE);
+            ApplyRoundCorners();
+            placed = true;
+        }
+    }
+    if (!placed) {
+        PlacePalette(); // centers + default height; content pass resizes below
+        ApplyRoundCorners();
+    }
+    LayoutPaletteChildren();
+    if (g_snapshot.fileActive)
+        PositionFileChip(); // window is sized now: measuring is valid
+    g_changingEdit = true;
+    SetWindowTextW(g_hwndEdit, g_snapshot.query.c_str());
+    SendMessageW(g_hwndEdit, EM_SETSEL,
+                 (WPARAM)g_snapshot.query.size(), (LPARAM)g_snapshot.query.size());
+    g_changingEdit = false;
+    UpdateResults();
+    // Re-select by action string (immune to reorder); a deleted file simply
+    // falls back to the default row.
+    std::vector<std::wstring> actions;
+    actions.reserve(g_results.size());
+    for (const auto& r : g_results) actions.push_back(r.action);
+    int to = MediaResolveSelection(actions, g_snapshot.selAction, g_snapshot.selIndex);
+    if (to < 0) to = FirstSelectable(g_results);
+    if (to >= 0) {
+        SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
+        g_gridTopRow = g_snapshot.gridTopRow < 0 ? 0 : g_snapshot.gridTopRow;
+        SendMessageW(g_hwndList, LB_SETTOPINDEX, g_snapshot.listTop, 0);
+        EnsureVisible(to); // pins an out-of-range scroll into view
+        InvalidateRect(g_hwndList, NULL, FALSE);
+        if (g_hwndFileGrid) InvalidateRect(g_hwndFileGrid, NULL, FALSE);
+    }
+    g_snapshot.valid = false;
+    ShowWindow(g_hwndPalette, SW_SHOW);
+    SetForegroundWindow(g_hwndPalette);
+    if (g_hwndEdit) SetFocus(g_hwndEdit);
+}
+
+static void OpenMediaViewer(const std::wstring& path) {
+    SavePaletteSnapshot(); // BEFORE HidePalette destroys file state
+    HidePalette();
+    g_mediaActive = true;
+    std::wstring err;
+    if (!MediaOpen(g_hInst, g_hwndPalette, g_dpi, path, err) && g_mediaActive) {
+        // Windowless failure only (nothing was ever shown): restore here. A
+        // windowed failure already restored via MediaOnClosed (WM_DESTROY),
+        // which clears g_mediaActive — restoring twice would balloon twice.
+        g_mediaActive = false;
+        NotifyLaunchFailed(err.empty() ? L"Couldn't open this file" : err.c_str());
+        RestorePalette();
+    }
+}
+
+// Every media close path (Esc, click-outside, playback error) lands here
+// exactly once, via the media window's WM_DESTROY.
+void MediaOnClosed(bool failed, const std::wstring& err) {
+    if (g_quitting.load()) { g_mediaActive = false; return; } // exiting: no restore
+    g_mediaActive = false;
+    if (failed)
+        NotifyLaunchFailed(err.empty() ? L"Couldn't play this file" : err.c_str());
+    RestorePalette();
 }
 
 // ------------------------------------------------------- file grid metrics
@@ -1155,6 +1288,14 @@ static void RebuildListControl() {
     // List/grid visibility + geometry, every refresh (cheap, idempotent).
     {
         RECT cr; GetClientRect(g_hwndPalette, &cr);
+        // The edit itself must track wrapped lines every refresh: word wrap
+        // only becomes visible when the control is tall enough to show it.
+        // Sized only on change (per-keystroke moves would flicker the caret).
+        RECT er;
+        GetWindowRect(g_hwndEdit, &er);
+        if (er.bottom - er.top != inputH - Dpx(14))
+            SetWindowPos(g_hwndEdit, NULL, kPadX, Dpx(9), cr.right - kPadX * 2,
+                         inputH - Dpx(14), SWP_NOZORDER);
         if (gridOn) {
             if (IsWindowVisible(g_hwndList)) ShowWindow(g_hwndList, SW_HIDE);
             SetWindowPos(g_hwndFileGrid, NULL, kPadX, listY,
@@ -1991,14 +2132,8 @@ static LRESULT CALLBACK FileBarProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         SelectObject(dc, g_fontSub);
         SetTextColor(dc, kText);
         RECT tr = cl; tr.left += Dpx(30); tr.right -= Dpx(10);
-        DrawTextW(dc, L"Open in Explorer", -1, &tr,
+        DrawTextW(dc, L"Enter/Space view \u00B7 Ctrl+Enter open \u00B7 Shift+Enter folder", -1, &tr,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        const wchar_t* hint = L"Shift+Enter";
-        RECT hr{0, 0, 0, 0};
-        DrawTextW(dc, hint, -1, &hr, DT_SINGLELINE | DT_CALCRECT);
-        SetTextColor(dc, kSub);
-        RECT rr = cl; rr.left = rr.right - Dpx(10) - (hr.right - hr.left);
-        DrawTextW(dc, hint, -1, &rr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -2016,6 +2151,52 @@ static LRESULT CALLBACK FileBarProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     return DefWindowProcW(hwnd, m, w, l);
+}
+
+// Screen point near a result row for the keyboard menu key: selected tile
+// center in grid mode, selected list-row center otherwise. Falls back to the
+// palette center when the row is scrolled out of view or unknown.
+static POINT RowScreenPoint(int resultsIdx) {
+    POINT fb{0, 0};
+    if (g_hwndPalette) {
+        RECT wr;
+        GetWindowRect(g_hwndPalette, &wr);
+        fb.x = (wr.left + wr.right) / 2;
+        fb.y = (wr.top + wr.bottom) / 2;
+    }
+    if (resultsIdx < 0 || resultsIdx >= (int)g_results.size()) return fb;
+    if (GridActive() && g_hwndFileGrid) {
+        size_t base = (!g_results.empty() &&
+                       g_results.front().kind == ResultKind::Header) ? 1 : 0;
+        if ((size_t)resultsIdx < base) return fb;
+        int cols = GridColumns();
+        if (cols < 1) cols = 1;
+        RECT gr;
+        GetWindowRect(g_hwndFileGrid, &gr);
+        int tw = (gr.right - gr.left) / cols;
+        if (tw <= 0) return fb;
+        int t = resultsIdx - (int)base - g_gridTopRow * cols;
+        int c = t % cols, r = t / cols;
+        if (r < 0 || r >= GridRows() || c < 0) return fb;
+        POINT p{gr.left + c * tw + tw / 2,
+                gr.top + kGridHeadH + r * kGridTileH + kGridTileH / 2};
+        return p;
+    }
+    if (g_hwndList) {
+        // Listbox items are added in g_results order: indices match.
+        RECT ri{};
+        if (SendMessageW(g_hwndList, LB_GETITEMRECT, resultsIdx, (LPARAM)&ri) != LB_ERR) {
+            RECT lr, cl;
+            GetWindowRect(g_hwndList, &lr);
+            GetClientRect(g_hwndList, &cl);
+            int cy = (ri.top + ri.bottom) / 2;
+            if (cy >= 0 && cy <= cl.bottom - cl.top) {
+                POINT p{lr.left + (lr.right - lr.left) / 2, lr.top + cy};
+                return p;
+            }
+        }
+    }
+    return fb;
 }
 
 // ------------------------------------------------------- file grid window
@@ -2504,6 +2685,74 @@ static bool g_dragArmed = false;
 static POINT g_dragPt{};
 static int g_dragRow = -1;
 
+// Preferred-drop-effect support: without it Explorer defaults same-volume
+// drags to MOVE (the file vanishes from its folder). Advertising COPY keeps
+// every palette drag a copy, everywhere.
+static UINT g_cfPreferred = 0;
+static UINT PreferredEffectFormat() {
+    if (!g_cfPreferred)
+        g_cfPreferred = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
+    return g_cfPreferred;
+}
+static void HdropFormatEtc(FORMATETC& f) {
+    f.cfFormat = CF_HDROP;
+    f.ptd = NULL;
+    f.dwAspect = DVASPECT_CONTENT;
+    f.lindex = -1;
+    f.tymed = TYMED_HGLOBAL;
+}
+static void PreferredFormatEtc(FORMATETC& f) {
+    f.cfFormat = (CLIPFORMAT)PreferredEffectFormat();
+    f.ptd = NULL;
+    f.dwAspect = DVASPECT_CONTENT;
+    f.lindex = -1;
+    f.tymed = TYMED_HGLOBAL;
+}
+
+class CEnumFmt : public IEnumFORMATETC {
+    LONG m_ref = 1;
+    FORMATETC m_fmt[2];
+    ULONG m_at = 0;
+public:
+    CEnumFmt(const FORMATETC& a, const FORMATETC& b) { m_fmt[0] = a; m_fmt[1] = b; }
+    STDMETHODIMP QueryInterface(REFIID riid, void** pp) {
+        if (!pp) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IEnumFORMATETC) {
+            *pp = static_cast<IEnumFORMATETC*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *pp = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() { return (ULONG)InterlockedIncrement(&m_ref); }
+    STDMETHODIMP_(ULONG) Release() {
+        LONG r = InterlockedDecrement(&m_ref);
+        if (!r) delete this;
+        return (ULONG)r;
+    }
+    STDMETHODIMP Next(ULONG celt, FORMATETC* out, ULONG* fetched) {
+        if (!out) return E_INVALIDARG;
+        ULONG n = 0;
+        while (n < celt && m_at < 2) out[n++] = m_fmt[m_at++];
+        if (fetched) *fetched = n;
+        return (n == celt) ? S_OK : S_FALSE;
+    }
+    STDMETHODIMP Skip(ULONG celt) {
+        m_at = (m_at + celt > 2) ? 2 : m_at + celt;
+        return (m_at < 2 || celt == 0) ? S_OK : S_FALSE;
+    }
+    STDMETHODIMP Reset() { m_at = 0; return S_OK; }
+    STDMETHODIMP Clone(IEnumFORMATETC** pp) {
+        if (!pp) return E_POINTER;
+        CEnumFmt* c = new (std::nothrow) CEnumFmt(m_fmt[0], m_fmt[1]);
+        if (!c) return E_OUTOFMEMORY;
+        c->m_at = m_at;
+        *pp = c;
+        return S_OK;
+    }
+};
+
 class HdropDataObject : public IDataObject {
     LONG m_ref = 1;
     std::wstring m_path;
@@ -2527,7 +2776,20 @@ public:
     }
     STDMETHODIMP GetData(FORMATETC* f, STGMEDIUM* m) {
         if (!f || !m) return E_INVALIDARG;
-        if (f->cfFormat != CF_HDROP || !(f->tymed & TYMED_HGLOBAL))
+        if (!(f->tymed & TYMED_HGLOBAL)) return DV_E_FORMATETC;
+        if (g_cfPreferred && f->cfFormat == (CLIPFORMAT)g_cfPreferred) {
+            HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
+            if (!h) return E_OUTOFMEMORY;
+            DWORD* p = (DWORD*)GlobalLock(h);
+            if (!p) { GlobalFree(h); return E_OUTOFMEMORY; }
+            *p = DROPEFFECT_COPY;
+            GlobalUnlock(h);
+            m->tymed = TYMED_HGLOBAL;
+            m->hGlobal = h;
+            m->pUnkForRelease = nullptr;
+            return S_OK;
+        }
+        if (f->cfFormat != CF_HDROP)
             return DV_E_FORMATETC;
         size_t chars = m_path.size() + 2; // path + double null
         HGLOBAL h = GlobalAlloc(GHND | GMEM_SHARE, sizeof(DROPFILES) +
@@ -2549,15 +2811,27 @@ public:
     STDMETHODIMP GetDataHere(FORMATETC*, STGMEDIUM*) { return E_NOTIMPL; }
     STDMETHODIMP QueryGetData(FORMATETC* f) {
         if (!f) return E_INVALIDARG;
-        return (f->cfFormat == CF_HDROP && (f->tymed & TYMED_HGLOBAL))
-            ? S_OK : DV_E_FORMATETC;
+        if (!(f->tymed & TYMED_HGLOBAL)) return DV_E_FORMATETC;
+        if (f->cfFormat == CF_HDROP) return S_OK;
+        if (g_cfPreferred && f->cfFormat == (CLIPFORMAT)g_cfPreferred) return S_OK;
+        return DV_E_FORMATETC;
     }
     STDMETHODIMP GetCanonicalFormatEtc(FORMATETC*, FORMATETC* out) {
         if (!out) return E_INVALIDARG;
         return DATA_S_SAMEFORMATETC;
     }
     STDMETHODIMP SetData(FORMATETC*, STGMEDIUM*, BOOL) { return E_NOTIMPL; }
-    STDMETHODIMP EnumFormatEtc(DWORD, IEnumFORMATETC**) { return E_NOTIMPL; }
+    STDMETHODIMP EnumFormatEtc(DWORD dir, IEnumFORMATETC** pp) {
+        if (!pp) return E_POINTER;
+        if (dir != DATADIR_GET) return E_NOTIMPL;
+        FORMATETC a{}, b{};
+        PreferredFormatEtc(a);
+        HdropFormatEtc(b);
+        CEnumFmt* e = new (std::nothrow) CEnumFmt(a, b);
+        if (!e) return E_OUTOFMEMORY;
+        *pp = e;
+        return S_OK;
+    }
     STDMETHODIMP DAdvise(FORMATETC*, DWORD, IAdviseSink*, DWORD*) {
         return OLE_E_ADVISENOTSUPPORTED;
     }
@@ -2724,6 +2998,7 @@ static void MoveRowDrag(HWND, POINT pt) {
     if (!DragPathForRow(row, path)) return;
     EnsureOle(); // belt-and-braces: ShowPalette already called it
     if (!g_oleInit) return;
+    PreferredEffectFormat(); // register up front: targets may query before enumerating
     HdropDataObject* data = new (std::nothrow) HdropDataObject(path);
     DropSource* src = new (std::nothrow) DropSource();
     if (!data || !src) {
@@ -2763,6 +3038,17 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         SendMessageW(g_hwndEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
                      MAKELPARAM(Dpx(10), Dpx(10)));
         SetWindowSubclass(g_hwndEdit, EditSubclass, 1, 0);
+        // Belt-and-braces: wrapping needs exactly MULTILINE + AUTOVSCROLL
+        // with no horizontal scroll mode. Reassert after creation so the
+        // wrap path can never silently revert to a scrolling single line.
+        {
+            LONG_PTR st = GetWindowLongPtrW(g_hwndEdit, GWL_STYLE);
+            st |= ES_MULTILINE | ES_AUTOVSCROLL;
+            st &= ~(LONG_PTR)(ES_AUTOHSCROLL | WS_HSCROLL | WS_VSCROLL);
+            SetWindowLongPtrW(g_hwndEdit, GWL_STYLE, st);
+            SetWindowPos(g_hwndEdit, NULL, 0, 0, 0, 0,
+                         SWP_NOZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
+        }
 
         g_hwndChip = CreateWindowExW(0, kChipClass, L"",
             WS_CHILD | WS_CLIPSIBLINGS,
@@ -2937,6 +3223,9 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         // Click-outside-to-dismiss. Child focus keeps the top-level active,
         // so typing never hides. Settings is exempt. Open menus and modal
         // drag loops own their activation: never dismiss under them.
+        // A media window owns activation too: the palette must not dismiss
+        // itself the moment media takes focus (single g_mediaActive guard).
+        if (g_mediaActive) break;
         if (g_inMenu || g_dragging) break;
         if (LOWORD(w) == WA_INACTIVE) {
             HWND now = (HWND)l;
@@ -2945,7 +3234,9 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         }
         break;
     case WM_ACTIVATEAPP:
-        // App switch / click onto another app always dismisses.
+        // App switch / click onto another app always dismisses — unless a
+        // media window is open (same guard as WM_ACTIVATE above).
+        if (g_mediaActive) break;
         if (!w && IsWindowVisible(hwnd) && !g_inMenu && !g_dragging)
             HidePalette();
         break;
@@ -2992,7 +3283,20 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         // palette menu on headers and empty areas. (The edit box shows its
         // native Cut/Copy/Paste menu via its own proc and never reaches here.)
         POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
-        if (pt.x == -1 && pt.y == -1) GetCursorPos(&pt); // keyboard: use cursor
+        if (pt.x == -1 && pt.y == -1) {
+            // Keyboard menu key: act on the current selection like Explorer,
+            // never on whatever the cursor happens to hover.
+            int sel = CurrentSelection();
+            if (sel >= 0 && sel < (int)g_results.size() &&
+                g_results[(size_t)sel].kind != ResultKind::Header) {
+                POINT rp = RowScreenPoint(sel);
+                ShowRowMenu(sel, rp.x, rp.y);
+            } else {
+                GetCursorPos(&pt);
+                ShowPaletteMenu(pt.x, pt.y);
+            }
+            return 0;
+        }
         POINT cl = pt;
         ScreenToClient(hwnd, &cl);
         int row = -1;
@@ -3221,6 +3525,13 @@ static void FillBrowserCombo() {
     }
     SendMessageW(g_hwndBrowserCombo, CB_ADDSTRING, 0, (LPARAM)L"Browse...");
     SendMessageW(g_hwndBrowserCombo, CB_SETCURSEL, sel, 0);
+}
+
+// Hardware video-decode diagnostic: probed lazily here (one registry read,
+// cached process-wide) so boot and idle never pay for it.
+static void FillDecodeLabel() {
+    if (g_hwndDecodeLabel)
+        SetWindowTextW(g_hwndDecodeLabel, MediaDecodeLabel().c_str());
 }
 
 static void FillAppsList() {
@@ -3549,8 +3860,12 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 L"Web + bang + quick links open in the chosen browser.\r\n"
                 L"Every change saves automatically.",
                 WS_VISIBLE, 24, 214, 536, 44, hwnd, 0));
+            g_hwndDecodeLabel = page(g_pageGeneral, NewCtrl(L"STATIC",
+                L"Video decode: ...",
+                WS_VISIBLE, 24, 262, 536, 20, hwnd, 0));
             FillEngineCombo();
             FillBrowserCombo();
+            FillDecodeLabel(); // lazy hardware probe (registry read, never at boot)
         }
 
         // ---- Hidden apps page (checkbox list)
@@ -3960,6 +4275,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         g_hwndSettings = NULL;
         g_hwndCellEdit = NULL;
         g_hwndSavedLabel = NULL;
+        g_hwndDecodeLabel = NULL;
         g_cellLv = 0; g_cellRow = -1; g_cellCol = 0;
         g_hwndEngineCombo = g_hwndEngineUrl = g_hwndBrowserCombo = NULL;
         g_hwndRowsVal = g_hwndColsVal = NULL;
@@ -4112,6 +4428,20 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     wcGrid.style = CS_DBLCLKS; // double-click drills/opens
     RegisterClassExW(&wcGrid);
 
+    // Built-in media viewer: registered always (zero cost — the class is just
+    // a name until MediaOpen creates the window and maps the media DLLs).
+    WNDCLASSEXW wcMedia{};
+    wcMedia.cbSize = sizeof(wcMedia);
+    wcMedia.hInstance = hInst;
+    wcMedia.lpszClassName = kMediaClass;
+    wcMedia.lpfnWndProc = MediaWndProc;
+    wcMedia.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wcMedia.hIcon = g_hIconBig;
+    wcMedia.hIconSm = g_hIconSmall;
+    wcMedia.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wcMedia.style = CS_DBLCLKS; // double-click: fullscreen / back-to-fit
+    RegisterClassExW(&wcMedia);
+
     g_hwndPalette = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_COMPOSITED, // topmost, no taskbar, smooth
         kPaletteClass, L"SneekPeek",
@@ -4152,6 +4482,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     }
 
     g_quitting.store(true); // deferred startup work must stand down too
+    if (HWND mh = MediaHwnd()) DestroyWindow(mh); // viewer teardown skips restore: quitting
     if (g_hwndPalette) KillTimer(g_hwndPalette, IDT_DEFERRED_REFRESH);
     g_indexStop.store(true); // stop the indexer, then join it (bounded: ~2s)
     if (g_indexThread.joinable()) g_indexThread.join();

@@ -16,13 +16,15 @@ endif()
 add_executable(SneekPeek WIN32
     src/main.cpp
     src/app_index.cpp
+    src/media_win.cpp
     src/app.rc
 )
 
 target_include_directories(SneekPeek PRIVATE src)
 
 target_link_libraries(SneekPeek PRIVATE
-    user32 shell32 gdi32 advapi32 shlwapi comctl32 comdlg32 powrprof ole32 gdiplus
+    user32 shell32 gdi32 advapi32 shlwapi comctl32 comdlg32 powrprof ole32 oleaut32 gdiplus
+    d2d1 dwrite mfplat mfreadwrite mfuuid windowscodecs dxgi d3d11
 )
 
 if(MINGW)
@@ -32,7 +34,8 @@ endif()
 
 # MSVC: delay-load rarely-used DLLs so the loader maps less at logon
 # (gdiplus paints chips, comdlg32 is Browse-only, powrprof/comctl32 load on
-# first use). Needs delayimp.lib; MinGW keeps eager linking.
+# first use; the media stack — WIC/MF/D3D/D2D — maps only when a media file
+# is actually opened). Needs delayimp.lib; MinGW keeps eager linking.
 if(MSVC)
     target_link_libraries(SneekPeek PRIVATE delayimp)
     target_link_options(SneekPeek PRIVATE
@@ -40,6 +43,13 @@ if(MSVC)
         "/DELAYLOAD:comdlg32.dll"
         "/DELAYLOAD:powrprof.dll"
         "/DELAYLOAD:comctl32.dll"
+        "/DELAYLOAD:windowscodecs.dll"
+        "/DELAYLOAD:mfplat.dll"
+        "/DELAYLOAD:mfreadwrite.dll"
+        "/DELAYLOAD:d3d11.dll"
+        "/DELAYLOAD:dxgi.dll"
+        "/DELAYLOAD:d2d1.dll"
+        "/DELAYLOAD:dwrite.dll"
     )
 endif()
 

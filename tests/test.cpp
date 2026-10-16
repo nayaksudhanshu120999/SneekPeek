@@ -14,6 +14,7 @@
 #include "settings.h"
 #include "results.h"
 #include "verbs.h"
+#include "media.h"
 #include "app_index.h"
 
 static int g_fail = 0;
@@ -483,6 +484,122 @@ int main() {
         CHECK(!LoadAppCache(f, c) && c.empty());
         CHECK(!LoadAppCache(L"Z:\\no\\such\\file.bin", c));
         DeleteFileW(f.c_str());
+    }
+    // media.h: extension classification (Win10 19045 codec reality)
+    {
+        CHECK(ClassifyMedia(L"C:\\p\\a.jpg") == MediaKind::Image);
+        CHECK(ClassifyMedia(L"C:\\p\\A.JPEG") == MediaKind::Image);
+        CHECK(ClassifyMedia(L"C:\\p\\a.png") == MediaKind::Image);
+        CHECK(ClassifyMedia(L"C:\\p\\a.bmp") == MediaKind::Image);
+        CHECK(ClassifyMedia(L"C:\\p\\a.gif") == MediaKind::Image);
+        CHECK(ClassifyMedia(L"C:\\p\\a.tif") == MediaKind::Image);
+        CHECK(ClassifyMedia(L"C:\\p\\a.ico") == MediaKind::Image);
+        CHECK(ClassifyMedia(L"C:\\p\\a.mp4") == MediaKind::Video);
+        CHECK(ClassifyMedia(L"C:\\p\\a.MKV") == MediaKind::Video);
+        CHECK(ClassifyMedia(L"C:\\p\\a.avi") == MediaKind::Video);
+        CHECK(ClassifyMedia(L"C:\\p\\a.mov") == MediaKind::Video);
+        CHECK(ClassifyMedia(L"C:\\p\\a.wmv") == MediaKind::Video);
+        CHECK(ClassifyMedia(L"C:\\p\\a.mpg") == MediaKind::Video);
+        CHECK(ClassifyMedia(L"C:\\p\\a.webm") == MediaKind::Video);
+        CHECK(ClassifyMedia(L"C:\\p\\a.heic") == MediaKind::Unsupported);
+        CHECK(ClassifyMedia(L"C:\\p\\a.heif") == MediaKind::Unsupported);
+        CHECK(ClassifyMedia(L"C:\\p\\a.avif") == MediaKind::Unsupported);
+        CHECK(ClassifyMedia(L"C:\\p\\a.webp") == MediaKind::Unsupported);
+        CHECK(ClassifyMedia(L"C:\\p\\a.txt") == MediaKind::None);
+        CHECK(ClassifyMedia(L"C:\\p\\a.exe") == MediaKind::None);
+        CHECK(ClassifyMedia(L"C:\\p\\noext") == MediaKind::None);
+        CHECK(ClassifyMedia(L"C:\\p\\a.") == MediaKind::None);
+        CHECK(MediaExt(L"C:\\p\\A.JPG") == L"jpg");
+        CHECK(MediaExt(L"noext") == L"");
+    }
+    // media.h: snapshot round-trip + row lookup by action
+    {
+        PaletteSnapshot s;
+        s.valid = true;
+        s.fileActive = true;
+        s.fileDir = L"C:\\pics\\";
+        s.query = L"beach";
+        s.selAction = L"C:\\pics\\beach.png";
+        s.selIndex = 3;
+        s.gridTopRow = 2;
+        s.listTop = 1;
+        s.rect = {10, 20, 610, 420};
+        PaletteSnapshot r = s; // round-trip preserves every field
+        CHECK(r.valid && r.fileActive && r.fileDir == L"C:\\pics\\" &&
+              r.query == L"beach" && r.selAction == L"C:\\pics\\beach.png" &&
+              r.selIndex == 3 && r.gridTopRow == 2 && r.listTop == 1 &&
+              r.rect.left == 10 && r.rect.bottom == 420);
+        std::vector<std::wstring> acts = {L"a", L"C:\\pics\\beach.png", L"b"};
+        CHECK(MediaFindRowByAction(acts, L"C:\\pics\\beach.png") == 1);
+        CHECK(MediaFindRowByAction(acts, L"missing") == -1);
+        CHECK(MediaFindRowByAction(acts, L"") == -1);
+        std::vector<std::wstring> empty;
+        CHECK(MediaFindRowByAction(empty, L"a") == -1);
+        std::vector<std::wstring> dup = {L"x", L"x"};
+        CHECK(MediaFindRowByAction(dup, L"x") == 0); // first match wins
+        // action match survives reordering; a deleted file resolves to -1
+        std::vector<std::wstring> re = {L"b", L"C:\\pics\\beach.png", L"a"};
+        CHECK(MediaResolveSelection(re, L"C:\\pics\\beach.png", 1) == 1);
+        CHECK(MediaResolveSelection(re, L"gone", 1) == -1);
+        CHECK(MediaResolveSelection(empty, L"a", 0) == -1);
+    }
+    // media.h: zoom / fit / pan / rotate math
+    {
+        CHECK(MediaClampZoom(1.0) == 1.0);
+        CHECK(MediaClampZoom(0.0) == 1.0);
+        CHECK(MediaClampZoom(-2.0) == 1.0);
+        CHECK(MediaClampZoom(0.01) == 0.05);
+        CHECK(MediaClampZoom(100.0) == 32.0);
+        CHECK(fabs(MediaFitScale(800, 600, 1920, 1080) - 1.8) < 1e-9);
+        CHECK(MediaFitScale(0, 600, 1920, 1080) == 1.0);
+        CHECK(MediaFitScale(800, 600, 0, 1080) == 1.0);
+        int fw = 0, fh = 0;
+        MediaFitWindow(800, 600, 1920, 1040, fw, fh);
+        CHECK(fw == 800 && fh == 600); // small image: native 1:1
+        MediaFitWindow(4000, 3000, 1920, 1040, fw, fh);
+        CHECK(fw == 1387 && fh == 1040); // clamped, aspect kept
+        MediaFitWindow(0, 0, 1920, 1040, fw, fh);
+        CHECK(fw == 640 && fh == 480); // degenerate: safe default
+        double ox = 999.0, oy = -999.0;
+        MediaClampPan(ox, oy, 100, 100, 400, 400); // smaller: centered
+        CHECK(ox == 150.0 && oy == 150.0);
+        ox = 50.0; oy = 50.0;
+        MediaClampPan(ox, oy, 800, 800, 400, 400); // larger: pinned to 0
+        CHECK(ox == 0.0 && oy == 0.0);
+        ox = -500.0; oy = -500.0;
+        MediaClampPan(ox, oy, 800, 800, 400, 400); // larger: pinned to far edge
+        CHECK(ox == -400.0 && oy == -400.0);
+        int rw = 0, rh = 0;
+        MediaRotatedSize(800, 600, 1, rw, rh);
+        CHECK(rw == 600 && rh == 800);
+        MediaRotatedSize(800, 600, 2, rw, rh);
+        CHECK(rw == 800 && rh == 600);
+    }
+    // media.h: time formatting incl. edge cases
+    {
+        CHECK(MediaFormatTime(0.0) == L"0:00");
+        CHECK(MediaFormatTime(5.0) == L"0:05");
+        CHECK(MediaFormatTime(65.0) == L"1:05");
+        CHECK(MediaFormatTime(3599.0) == L"59:59");
+        CHECK(MediaFormatTime(3600.0) == L"1:00:00");
+        CHECK(MediaFormatTime(3723.0) == L"1:02:03");
+        CHECK(MediaFormatTime(-1.0) == L"0:00");
+        CHECK(MediaFormatTimePair(65.0, 760.0) == L"1:05 / 12:40");
+    }
+    // media.h: speed table ordering, round-trip, clamping
+    {
+        CHECK(MediaSpeedCount() == 8);
+        CHECK(MediaSpeedDefaultIndex() == 3);
+        CHECK(kMediaSpeeds[MediaSpeedDefaultIndex()] == 1.0);
+        for (int i = 1; i < MediaSpeedCount(); i++)
+            CHECK(kMediaSpeeds[i] > kMediaSpeeds[i - 1]);
+        CHECK(MediaSpeedClamp(-5) == 0);
+        CHECK(MediaSpeedClamp(99) == MediaSpeedCount() - 1);
+        CHECK(MediaSpeedClamp(2) == 2);
+        CHECK(MediaFormatSpeed(1.0) == L"1x");
+        CHECK(MediaFormatSpeed(1.5) == L"1.5x");
+        CHECK(MediaVolumeLabel(true, 0.7) == L"Muted");
+        CHECK(MediaVolumeLabel(false, 0.7) == L"70%");
     }
     if (g_fail == 0) printf("ALL TESTS PASSED\n");
     return g_fail ? 1 : 0;

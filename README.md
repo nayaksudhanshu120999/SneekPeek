@@ -7,7 +7,7 @@ One hotkey. One text box. Zero idle cost.
 - **Enter** always runs the top *actionable* result (never a section heading — with nothing selected it searches the typed text) — the palette hides instantly, before the app even opens. Click anywhere outside (or `Esc`) → it disappears. Failed launches report a tray balloon; clicking it reopens the palette to retry.
 - Next **Ctrl+Space** → fresh empty bar.
 - Tray icon → **Settings… / Refresh apps / Run at startup / Quit**.
-- Background: a single blocking `GetMessage` loop — **0% CPU**, **~1–3 MB RAM**, no polling, no hooks, no services.
+- Background: a single blocking `GetMessage` loop — **0% CPU**, **~1–3 MB RAM** at idle, no polling, no hooks, no services. (While a video is playing, SneekPeek behaves like a video player and uses CPU/GPU accordingly — see Viewer below.)
 
 Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 
@@ -25,12 +25,38 @@ Pure Win32 C++17, no frameworks, no installer, one ~100 KB `.exe`.
 | `bluetooth` | matching Windows Settings pages under their own header — Enter opens the page |
 | `gmail` | quick-link chips (fixed URLs, no query) work the same way — Enter opens |
 | `12*8` | calculator (Enter copies result; undefined math like `1/0` shows nothing) |
-| `:` + `Space` | names-only file browser (hidden items excluded): drives show as `Name (C:)` — type to filter, `Space`/`Enter` on a folder drills in (stays open), `Space`/`Enter` on a file opens it; slim bottom bar + `Shift+Enter` opens the current folder in Explorer; long lists scroll with `↑` `↓` or mouse wheel (no scrollbar); grid view by default; `..` / empty-box `Backspace` goes up, `x` or drive-level `Backspace` exits — one folder scanned at a time, no sizes/icons/recursion |
+| `:` + `Space` | names-only file browser (hidden items excluded): drives show as `Name (C:)` — type to filter, `Space`/`Enter` on a folder drills in (stays open), `Space`/`Enter` on an image or video opens the built-in viewer (see below), `Ctrl+Enter` opens any file with the default app; slim bottom bar + `Shift+Enter` opens the current folder in Explorer; long lists scroll with `↑` `↓` or mouse wheel (no scrollbar); grid view by default; `..` / empty-box `Backspace` goes up, `x` or drive-level `Backspace` exits — one folder scanned at a time, no sizes/icons/recursion |
 | `↑` `↓` | move selection (mirrors into the box without refiltering; wraps past either end back to your typed text; Up from the first row jumps back to the chips), `Enter` open, `Shift+Enter` force web search, `Esc` dismiss, `F5` rescan apps |
 | Right-click | dark context menu on any row (Open / Run as administrator / Open file location / Copy path / Properties / Hide app…, per-type: Play, Open with…, Eject, Extract all…, engine switch), palette menu on headers and empty areas, same theme as the tray menu |
 | Drag & drop | drag files, folders, drives, or classic app targets out of the list/grid into Explorer (copy-only); drop a folder onto the palette to browse it, drop a file to paste its path |
 
 Bang aliases are editable in Settings (default: `yt`/`youtube`, `gh`/`github`, `w`/`wiki`, `r`, `m`, `t`, `a`, `x`, `so`, `d`, `g` — each with its own color).
+
+## Viewer (built-in images + video)
+
+No FFmpeg, no codecs shipped — Windows already has them. Images decode via WIC (scaled **during** decode, so a 24 MP photo never materialises ~72 MB), video plays via Media Foundation with a D3D11 device manager (hardware decode when the GPU offers it, software fallback otherwise — there is deliberately no CPU/GPU toggle). Every media DLL is delay-loaded: the media window does not exist — and no media DLL is mapped — until you actually open a media file. Settings → General shows `Video decode: Hardware (GPU)` or `Software (CPU)`.
+
+- In file mode, `Enter`/`Space` on an image or video hides the palette and opens the frameless viewer (no title bar, no border, no taskbar button; resizable, `Win+←/→` snap works). Closing (`Esc` or click-outside) restores the palette with the exact same folder, query, selection, scroll and window position.
+- `Ctrl+Space` while media is open brings the palette up above it (media stays); closing media afterwards restores the snapshot.
+- Formats without an in-box codec on your Windows build (HEIC/WebP/AVIF on Win10, AV1 on old GPUs, N editions without Media Feature Pack) report a tray balloon instead of a black window — `Ctrl+Enter` opens the default app.
+
+| Keys | Images | Video |
+|---|---|---|
+| `←` `→` | prev / next image in folder | seek ∓5 s (frame-step when paused) |
+| wheel | zoom at cursor | volume |
+| `+` / `-` | zoom | — |
+| `Ctrl+0` / `Ctrl+1` | fit / 100% | — |
+| drag | pan when zoomed | scrub bar |
+| `R` / `Del` | rotate 90° / recycle file (confirm) | — |
+| `Shift+←` `→` | — | speed down / up |
+| `PgUp` / `PgDn` | — | prev / next video |
+| `M`, `↑` `↓` | — | mute, volume |
+| `F` | fullscreen | fullscreen |
+| `Enter` | open in default app | open in default app |
+| `Esc` / click outside | close | close (immediately) |
+| double-click | back to fit | fullscreen |
+
+Video controls (scrub bar, time, volume, speed) draw inside the frame and auto-hide after ~2.5 s idle; they stay visible while paused or scrubbing. Animated GIFs show frame 1 only.
 
 ## Build
 

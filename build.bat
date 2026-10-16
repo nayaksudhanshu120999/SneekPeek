@@ -4,7 +4,7 @@ REM Usage: build.bat        (Release exe -> .\SneekPeek.exe)
 setlocal
 
 set OUT=SneekPeek.exe
-set SRC=src\main.cpp src\app_index.cpp
+set SRC=src\main.cpp src\app_index.cpp src\media_win.cpp
 set RES_OBJS=
 
 where cl >nul 2>nul
@@ -19,8 +19,11 @@ if %ERRORLEVEL%==0 (
         if exist src\app.res set RES_OBJS=src\app.res
     )
     cl /std:c++17 /O1 /Os /EHsc /utf-8 /DUNICODE /D_UNICODE /MT %SRC% %RES_OBJS% ^
-       /link user32.lib shell32.lib gdi32.lib advapi32.lib shlwapi.lib comctl32.lib comdlg32.lib powrprof.lib ole32.lib gdiplus.lib delayimp.lib ^
+       /link user32.lib shell32.lib gdi32.lib advapi32.lib shlwapi.lib comctl32.lib comdlg32.lib powrprof.lib ole32.lib oleaut32.lib gdiplus.lib delayimp.lib ^
+       d2d1.lib dwrite.lib mfplat.lib mfreadwrite.lib mfuuid.lib windowscodecs.lib dxgi.lib d3d11.lib ^
        /DELAYLOAD:gdiplus.dll /DELAYLOAD:comdlg32.dll /DELAYLOAD:powrprof.dll /DELAYLOAD:comctl32.dll ^
+       /DELAYLOAD:windowscodecs.dll /DELAYLOAD:mfplat.dll /DELAYLOAD:mfreadwrite.dll ^
+       /DELAYLOAD:d3d11.dll /DELAYLOAD:dxgi.dll /DELAYLOAD:d2d1.dll /DELAYLOAD:dwrite.dll ^
        /SUBSYSTEM:WINDOWS /MANIFEST:NO /OUT:%OUT%
     if %ERRORLEVEL%==0 echo [build] OK -^> %OUT%
     exit /b %ERRORLEVEL%
@@ -38,7 +41,7 @@ if %ERRORLEVEL%==0 (
         if exist src\app.o set RES_OBJS=src\app.o
     )
     g++ -std=c++17 -Os -s -DUNICODE -D_UNICODE -finput-charset=UTF-8 %SRC% %RES_OBJS% -o %OUT% ^
-        -mwindows -municode -luser32 -lshell32 -lgdi32 -ladvapi32 -lshlwapi -lcomctl32 -lcomdlg32 -lpowrprof -lole32 -lgdiplus -static
+        -mwindows -municode -luser32 -lshell32 -lgdi32 -ladvapi32 -lshlwapi -lcomctl32 -lcomdlg32 -lpowrprof -lole32 -loleaut32 -lgdiplus -ld2d1 -ldwrite -lmfplat -lmfreadwrite -lmfuuid -lwindowscodecs -ld3d11 -ldxgi -static
     if %ERRORLEVEL%==0 echo [build] OK -^> %OUT%
     exit /b %ERRORLEVEL%
 )
