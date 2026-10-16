@@ -2529,14 +2529,11 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             std::wstring shown = FitTileText(dc, ri.title,
                                              nr.right - nr.left,
                                              nr.bottom - nr.top);
-            // Single-word names (no spaces to break on) render left-aligned
-            // and start-anchored: a centered overflowing line would clip both
-            // ends and show only the middle. Multi-word names stay centered.
-            bool oneWord = ri.title.find_first_of(L" \t") == std::wstring::npos;
-            if (oneWord) {
-                // Single rendered line that's still too wide: end it with a
-                // real "..." instead of a hard cut (two-line results already
-                // fit their width via wrapping).
+            // Width cap: a single rendered line that's still too wide ends
+            // with a real "..." instead of overflowing (two-line results
+            // already fit their width via wrapping). With both caps holding,
+            // centered text can never clip either end.
+            {
                 RECT oneL{0, 0, 0, 0};
                 DrawTextW(dc, L"X", -1, &oneL,
                           DT_CALCRECT | DT_SINGLELINE | DT_LEFT | DT_TOP);
@@ -2546,8 +2543,9 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 if (hr3.bottom - hr3.top <= oneL.bottom - oneL.top)
                     shown = FitOneLine(dc, shown, nr.right - nr.left);
             }
+            // Tile names are always centered.
             DrawTextW(dc, shown.c_str(), -1, &nr,
-                      (oneWord ? DT_LEFT : DT_CENTER) | DT_TOP | DT_WORDBREAK);
+                      DT_CENTER | DT_TOP | DT_WORDBREAK);
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -3897,6 +3895,10 @@ static void OpenSettings() {
     EnsureSettingsLists();
     EnsureAppFonts();
     EnsureComCtl(); // listview/tab classes needed below; deferred past boot
+    // Normal window, not tool-palette owned: unowned so it takes a regular
+    // z-position (minimizable, goes behind other windows). The topmost
+    // palette would cover it, so it hides first (hotkey brings it back).
+    if (g_hwndPalette && IsWindowVisible(g_hwndPalette)) HidePalette();
     int W = 600, H = 590;
     POINT pt{}; GetCursorPos(&pt); // open on the monitor being used
     HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
@@ -3908,8 +3910,8 @@ static void OpenSettings() {
     int y = mi.rcWork.top + (mh - H) / 2;
     if (y < mi.rcWork.top) y = mi.rcWork.top;
     g_hwndSettings = CreateWindowExW(0, kSettingsClass, L"SneekPeek Settings",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        x, y, W, H, g_hwndPalette, NULL, g_hInst, NULL);
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        x, y, W, H, NULL, NULL, g_hInst, NULL);
     ShowWindow(g_hwndSettings, SW_SHOW);
     DarkTitleBar(g_hwndSettings);
     UpdateWindow(g_hwndSettings);
