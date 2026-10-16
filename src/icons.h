@@ -439,12 +439,24 @@ inline void PaintGlyph(HDC dc, const RECT& cell, const FileGlyph& g,
         GlyphFillEllipse(dc, x + 11, y + 11, x + 13, y + 13, lite);
         break;
     }
-    case GlyphStyle::Web:
-        GlyphFrameEllipse(dc, x + 3, y + 3, x + s - 3, y + s - 3, 2, base);
-        GlyphHiArc(dc, x + 3, y + 3, x + s - 3, y + s - 3, base);
-        GlyphFrameEllipse(dc, x + 7, y + 3, x + s - 7, y + s - 3, 1, base); // meridian
-        GlyphLine(dc, x + 3, cy, x + s - 3, cy, 1, base); // equator
+    case GlyphStyle::Web: {
+        // Search magnifier: ring lens + handle. Reads as "search" at a
+        // glance; the single definition serves list rows, tiles, and
+        // history alike. Geometry derives from s so DPI follows.
+        int B = s * 12 / 20; // lens diameter
+        if (B < 8) B = 8;
+        int lw = s >= 26 ? 3 : 2; // ring width
+        int lx = x + 2, ly = y + 1; // lens box top-left
+        GlyphFrameEllipse(dc, lx + 1, ly + 2, lx + B + 1, ly + B + 2, lw, dark);
+        GlyphFrameEllipse(dc, lx, ly, lx + B, ly + B, lw, base); // ring
+        GlyphHiArc(dc, lx, ly, lx + B, ly + B, base); // gloss
+        GlyphFillEllipse(dc, lx + B / 4, ly + B / 4 - 1,
+                         lx + B / 4 + 2, ly + B / 4 + 1, W); // specular dot
+        int hx = lx + B - 2, hy = ly + B - 2; // handle root at the ring
+        GlyphLine(dc, hx + 1, hy + 1, x + s - 2, y + s - 1, lw + 1, dark);
+        GlyphLine(dc, hx, hy, x + s - 3, y + s - 2, lw, base); // handle
         break;
+    }
     case GlyphStyle::Bang: {
         COLORREF lite = GlyphLighten(base, 45);
         GlyphTile3D(dc, x + 1, y + 1, x + s - 2, y + s - 2, 5, lite, base, dark);

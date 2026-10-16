@@ -561,22 +561,60 @@ int main() {
         CHECK(ClampMoveSel(headsOnly, 0, +1) == -1); // nothing selectable
         CHECK(LastSelectable(headsOnly) == -1);
     }
-    // history: move-to-front, case-insensitive dedupe, capped, no empties
+    // history: typed entries, move-to-front, dedupe, cap, line round-trip
     {
-        std::vector<std::wstring> h;
-        HistoryPush(h, L"");
+        std::vector<HistoryItem> h;
+        HistoryItem empty;
+        HistoryAdd(h, empty);
         CHECK(h.empty());
-        HistoryPush(h, L"C:\\a.txt");
-        HistoryPush(h, L"D:\\docs\\");
-        CHECK(h.size() == 2 && h[0] == L"D:\\docs\\" && h[1] == L"C:\\a.txt");
-        HistoryPush(h, L"c:\\A.TXT"); // same path, other case: moves to front
-        CHECK(h.size() == 2 && h[0] == L"c:\\A.TXT");
+        HistoryItem f{ResultKind::File, L"a.txt", L"C:\\a.txt", false};
+        HistoryItem d{ResultKind::Folder, L"docs", L"D:\\docs\\", false};
+        HistoryAdd(h, f);
+        HistoryAdd(h, d);
+        CHECK(h.size() == 2 && h[0].title == L"docs" && h[1].title == L"a.txt");
+        HistoryItem f2{ResultKind::File, L"A.TXT", L"c:\\A.TXT", false};
+        HistoryAdd(h, f2); // same target, other case: moves to front
+        CHECK(h.size() == 2 && h[0].action == L"c:\\A.TXT");
+        // kinds don't collide: same path as file vs app stays separate
+        HistoryItem a{ResultKind::App, L"a.txt", L"C:\\a.txt", false};
+        HistoryAdd(h, a);
+        CHECK(h.size() == 3 && h[0].kind == ResultKind::App);
+        // engine searches dedupe on the query, not the empty action
+        HistoryItem w1{ResultKind::Web, L"cats", L"", false};
+        HistoryItem w2{ResultKind::Web, L"Cats", L"", false};
+        HistoryAdd(h, w1);
+        HistoryAdd(h, w2);
+        CHECK(h.size() == 4 && h[0].title == L"Cats");
         for (int i = 0; i < 30; i++) {
             wchar_t b[32];
             swprintf_s(b, 32, L"C:\\f%d.txt", i);
-            HistoryPush(h, b);
+            HistoryItem fi{ResultKind::File, b, b, false};
+            HistoryAdd(h, fi);
         }
-        CHECK(h.size() == kMaxHistory && h[0] == L"C:\\f29.txt");
+        CHECK(h.size() == kMaxHistory && h[0].title == L"C:\\f29.txt");
+        // line format round-trips, legacy bare lines load as files
+        CHECK(SerializeHistoryItem(a) == L"A|a.txt|C:\\a.txt|0");
+        HistoryItem st{ResultKind::App, L"Cam", L"shell:x", true};
+        CHECK(SerializeHistoryItem(st) == L"A|Cam|shell:x|1");
+        CHECK(SerializeHistoryItem(w1) == L"W|cats|");
+        CHECK(SerializeHistoryItem(d) == L"D|D:\\docs\\");
+        CHECK(SerializeHistoryItem(f) == L"F|C:\\a.txt");
+        HistoryItem p;
+        CHECK(ParseHistoryLine(L"A|Notepad|C:\\n.lnk|0", p) &&
+              p.kind == ResultKind::App && p.title == L"Notepad" && !p.isStore);
+        CHECK(ParseHistoryLine(L"A|Cam|shell:x|1", p) && p.isStore);
+        CHECK(ParseHistoryLine(L"W|cats|", p) && p.kind == ResultKind::Web &&
+              p.title == L"cats" && p.action.empty());
+        CHECK(ParseHistoryLine(L"W|q|https://x.y/?q=%s", p) &&
+              p.action == L"https://x.y/?q=%s");
+        CHECK(ParseHistoryLine(L"D|D:\\docs\\", p) && p.kind == ResultKind::Folder);
+        CHECK(ParseHistoryLine(L"C:\\a.txt", p) && p.kind == ResultKind::File &&
+              p.title == L"a.txt"); // legacy bare line
+        CHECK(!ParseHistoryLine(L"", p) && !ParseHistoryLine(L"X|y", p));
+        CHECK(!ParseHistoryLine(L"A|only", p) && !ParseHistoryLine(L"A|n|t|x", p));
+        // web rows still route to the Web glyph (search icon rework pin)
+        CHECK(GlyphForResult(ResultKind::Web, L"q", L"http://x",
+                             RGB(46, 224, 158)).style == GlyphStyle::Web);
     }
     if (g_fail == 0) printf("ALL TESTS PASSED\n");
     return g_fail ? 1 : 0;

@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include "bangs.h"
+#include "results.h"
 
 // ------------------------------------------------- quick links (name -> URL)
 // Declared before Settings: the struct stores a vector of these.
@@ -117,19 +118,123 @@ inline bool operator==(const Theme& a, const Theme& b) {
 inline bool operator!=(const Theme& a, const Theme& b) { return !(a == b); }
 
 // ------------------------------------------------- Up-on-empty history
-// Recently opened file/folder paths (move-to-front, capped). Pure logic so
-// push/dedupe/cap is unit-testable; persistence is [History] Count + ItemN.
+// One merged recency list across apps, files/folders, and web searches.
+// Move-to-front, capped, pure logic (unit-tested); persistence is [History]
+// Count + ItemN, one typed line each. Bare legacy lines load as files.
+struct HistoryItem {
+    ResultKind kind = ResultKind::File; // App, Web, File, or Folder
+    std::wstring title;   // display name only (app/query/base name)
+    std::wstring action;  // app target | file path | URL ("" = engine-search title)
+    bool isStore = false; // apps only
+};
 inline constexpr size_t kMaxHistory = 20;
-inline void HistoryPush(std::vector<std::wstring>& h, const std::wstring& path) {
-    if (path.empty()) return;
+// Dedupe identity: same kind + same target (engine searches match on title).
+inline std::wstring HistoryKey(const HistoryItem& h) {
+    std::wstring key;
+    key += (h.kind == ResultKind::App) ? L'A' : (h.kind == ResultKind::Web) ? L'W' : L'F';
+    key += L'|';
+    key += h.action;
+    if (h.kind == ResultKind::Web && h.action.empty()) {
+        key += L'|';
+        key += h.title;
+    }
+    return key;
+}
+inline void HistoryAdd(std::vector<HistoryItem>& h, const HistoryItem& item) {
+    if (item.title.empty() && item.action.empty()) return;
+    if (item.kind != ResultKind::App && item.kind != ResultKind::Web &&
+        item.kind != ResultKind::File && item.kind != ResultKind::Folder)
+        return;
+    std::wstring key = HistoryKey(item);
     for (auto it = h.begin(); it != h.end(); ++it) {
-        if (_wcsicmp(it->c_str(), path.c_str()) == 0) {
+        if (_wcsicmp(HistoryKey(*it).c_str(), key.c_str()) == 0) {
             h.erase(it);
             break;
         }
     }
-    h.insert(h.begin(), path);
+    h.insert(h.begin(), item);
     if (h.size() > kMaxHistory) h.resize(kMaxHistory);
+}
+// "C:\a\b.txt" -> "b.txt"; drive roots ("C:\") keep full text.
+inline std::wstring HistoryBaseName(const std::wstring& path) {
+    size_t s = path.find_last_of(L"\\/");
+    std::wstring t = (s == std::wstring::npos) ? path : path.substr(s + 1);
+    return t.empty() ? path : t;
+}
+// A|name|target|0or1, W|title|url-or-empty, F|path, D|dirpath.
+// Bare lines load as files (legacy format).
+inline std::wstring SerializeHistoryItem(const HistoryItem& h) {
+    if (h.kind == ResultKind::App)
+        return L"A|" + h.title + L"|" + h.action + (h.isStore ? L"|1" : L"|0");
+    if (h.kind == ResultKind::Web)
+        return L"W|" + h.title + L"|" + h.action;
+    if (h.kind == ResultKind::Folder)
+        return L"D|" + h.action;
+    return L"F|" + h.action;
+}
+inline bool ParseHistoryLine(const std::wstring& line, HistoryItem& out) {
+    if (line.empty()) return false;
+    if (line.find(L'|') == std::wstring::npos) { // legacy bare path
+        HistoryItem h;
+        h.kind = ResultKind::File;
+        h.action = line;
+        h.title = HistoryBaseName(line);
+        if (h.action.empty() || h.title.empty()) return false;
+        out = std::move(h);
+        return true;
+    }
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    for (;;) {
+        size_t p = line.find(L'|', start);
+        parts.push_back(line.substr(start, p == std::wstring::npos ? p : p - start));
+        if (p == std::wstring::npos) break;
+        start = p + 1;
+    }
+    if (parts.empty()) return false;
+    if (parts[0] == L"A" && parts.size() >= 4 &&
+        (parts.back() == L"0" || parts.back() == L"1")) {
+        HistoryItem h;
+        h.kind = ResultKind::App;
+        h.isStore = parts.back() == L"1";
+        h.action = parts[parts.size() - 2];
+        h.title = parts[1];
+        for (size_t i = 2; i + 2 < parts.size(); i++) h.title += L"|" + parts[i];
+        if (h.title.empty() || h.action.empty()) return false;
+        out = std::move(h);
+        return true;
+    }
+    if (parts[0] == L"W" && parts.size() >= 2) {
+        HistoryItem h;
+        h.kind = ResultKind::Web;
+        h.title = parts[1];
+        h.action = L"";
+        for (size_t i = 2; i < parts.size(); i++) h.action += (i > 2 ? L"|" : L"") + parts[i];
+        if (h.title.empty()) return false;
+        out = std::move(h);
+        return true;
+    }
+    if (parts[0] == L"F" && parts.size() >= 2) {
+        HistoryItem h;
+        h.kind = ResultKind::File;
+        h.action = parts[1];
+        for (size_t i = 2; i < parts.size(); i++) h.action += L"|" + parts[i];
+        h.title = HistoryBaseName(h.action);
+        if (h.action.empty() || h.title.empty()) return false;
+        out = std::move(h);
+        return true;
+    }
+    if (parts[0] == L"D" && parts.size() >= 2) {
+        HistoryItem h;
+        h.kind = ResultKind::Folder;
+        h.action = parts[1];
+        for (size_t i = 2; i < parts.size(); i++) h.action += L"|" + parts[i];
+        h.title = HistoryBaseName(h.action);
+        if (h.action.empty() || h.title.empty()) return false;
+        out = std::move(h);
+        return true;
+    }
+    return false;
 }
 
 inline bool ParseQuickLine(const std::wstring& line, QuickLink& out) {
@@ -156,7 +261,7 @@ struct Settings {
     bool includePathExes = false;
     bool runAtStartup = false;
     Theme theme = DefaultTheme();
-    std::vector<std::wstring> history; // recent file/folder paths (Up-on-empty)
+    std::vector<HistoryItem> history; // merged recency: apps, files, searches
 };
 
 inline std::wstring SettingsPath() {
@@ -285,18 +390,21 @@ inline void LoadSettingsLists(Settings& s) {
         s.quicks.clear();
     }
 
-    // Up-on-empty history: recent paths, newest first. Missing/empty entries
-    // are skipped so a hand-edited INI can never show dead rows.
+    // Up-on-empty history: typed lines, newest first. Bad lines are skipped
+    // so a hand-edited INI can never show dead rows; bare legacy lines load
+    // as files.
     s.history.clear();
     int histCount = GetPrivateProfileIntW(L"History", L"Count", 0, ini.c_str());
     if (histCount < 0) histCount = 0;
     if (histCount > (int)kMaxHistory) histCount = (int)kMaxHistory;
     {
         wchar_t key[32];
-        for (int i = 0; i < histCount; i++) {
+        for (int i = 0; i < histCount && s.history.size() < kMaxHistory; i++) {
             swprintf_s(key, 32, L"Item%d", i);
             GetPrivateProfileStringW(L"History", key, L"", buf, 4096, ini.c_str());
-            if (buf[0]) s.history.push_back(buf);
+            if (!buf[0]) continue;
+            HistoryItem h;
+            if (ParseHistoryLine(buf, h)) s.history.push_back(std::move(h));
         }
     }
 }
@@ -366,7 +474,8 @@ inline void SaveSettings(const Settings& s) {
     WritePrivateProfileStringW(L"History", L"Count", hcount, ini.c_str());
     for (size_t i = 0; i < nhist; i++) {
         swprintf_s(key, 32, L"Item%d", (int)i);
-        WritePrivateProfileStringW(L"History", key, s.history[i].c_str(), ini.c_str());
+        WritePrivateProfileStringW(L"History", key,
+            SerializeHistoryItem(s.history[i]).c_str(), ini.c_str());
     }
 }
 

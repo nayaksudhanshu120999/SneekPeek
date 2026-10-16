@@ -547,7 +547,7 @@ static void ActivateFileMode(const std::wstring& dir);
 static void DeactivateFileMode();
 static void UpdateFileResults(const std::wstring& filter);
 static void ExecuteFileSelected(bool inExplorer);
-static void HistoryRecord(const std::wstring& path);
+static void HistoryRecord(const HistoryItem& item);
 static void KeyboardContextMenu();
 static std::wstring SystemExe(const wchar_t* name);
 static void RebuildListControl();
@@ -950,7 +950,7 @@ static void DeactivateFileMode() {
 
 // File-mode list: header carries "<path> - N items" (count + names only),
 // rows carry names only. Current path alone is scanned; filter narrows it.
-// ".." returns only when the filter is empty (Backspace also goes up).
+// Backspace goes up (empty box or a mirrored name); there is no ".." row.
 static void UpdateFileResults(const std::wstring& filter) {
     g_results.clear();
     g_results.reserve(9);
@@ -1025,12 +1025,7 @@ static void UpdateFileResults(const std::wstring& filter) {
     }
     ResultItem hh{ResultKind::Header, head, L"", L"", kHintCol};
     g_results.push_back(std::move(hh));
-    if (filter.empty()) {
-        // Up entry: back to parent, or to drive list from a drive root.
-        std::wstring parent = ParentDirOf(g_fileDir);
-        ResultItem up{ResultKind::Folder, L"..", L"", parent, kFolderCol};
-        g_results.push_back(std::move(up));
-    }
+    // No ".." Up entry: Backspace goes up (empty filter or mirrored name).
     // Matches go in (capped): the window stays 9 rows tall and the list
     // scrolls internally (no scrollbar, arrows + wheel work). The header
     // always reports the true count, so narrowing the filter reveals the rest.
@@ -1081,7 +1076,13 @@ static void ExecuteFileSelected(bool inExplorer) {
         g_fileDir = r.action.empty() ? L"" : EnsureTrailingSlash(r.action);
         if (g_fileDir.empty()) RefreshDriveCache(); // back at drives: re-read labels
         g_navigating = false;
-        HistoryRecord(r.action); // Up-on-empty can jump straight back here
+        if (!r.action.empty()) {
+            HistoryItem dh; // Up-on-empty can jump straight back here
+            dh.kind = ResultKind::Folder;
+            dh.action = r.action;
+            dh.title = HistoryBaseName(r.action);
+            HistoryRecord(dh);
+        }
         if (g_hwndEdit) {
             g_changingEdit = true;
             SetWindowTextW(g_hwndEdit, L"");
@@ -1095,7 +1096,11 @@ static void ExecuteFileSelected(bool inExplorer) {
     if (r.kind == ResultKind::File) {
         if (r.action.empty()) return;
         std::wstring full = r.action; // copy: HidePalette clears file state
-        HistoryRecord(full); // Up-on-empty can jump straight back here
+        HistoryItem fh; // Up-on-empty can jump straight back here
+        fh.kind = ResultKind::File;
+        fh.action = full;
+        fh.title = HistoryBaseName(full);
+        HistoryRecord(fh);
         HidePalette(); // hide first: never wait for the target
         if ((UINT_PTR)ShellExecuteW(NULL, L"open", full.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
             NotifyLaunchFailed(L"Couldn't open this file");
@@ -1112,42 +1117,49 @@ static void ExecuteFileSelected(bool inExplorer) {
 }
 
 // ------------------------------------------------- Up-on-empty history
-// Remember opened files + drilled folders (persisted in [History]), so Up on
-// an empty box can jump straight back to any recent path.
-static void HistoryRecord(const std::wstring& path) {
-    if (path.empty()) return;
+// One merged recency list across apps, files/folders, and web searches
+// (persisted in [History]). Up on an empty box shows it newest-first;
+// Enter acts per row kind. Names only, never paths or URLs.
+static void HistoryRecord(const HistoryItem& item) {
+    if (item.title.empty() && item.action.empty()) return;
     EnsureSettingsLists(); // SaveSettings rewrites every section
-    HistoryPush(g_settings.history, path);
+    HistoryAdd(g_settings.history, item);
     SaveNow(); // instant persist, like the rest of Settings
 }
-// Up on an empty box: replace results with recent paths (newest first).
+// Up on an empty box: replace results with the merged recency list.
 // Returns false when there is nothing to show (caller falls through to
-// normal navigation). Vanished paths are hidden, never shown dead.
+// normal navigation). Vanished files are hidden, never shown dead.
 static bool ShowHistory() {
     EnsureSettingsLists();
     if (g_settings.history.empty()) return false;
-    std::vector<std::pair<std::wstring, bool>> live; // path, isDir
-    for (const auto& p : g_settings.history) {
-        DWORD a = GetFileAttributesW(p.c_str());
-        if (a == INVALID_FILE_ATTRIBUTES) continue;
-        live.push_back({p, (a & FILE_ATTRIBUTE_DIRECTORY) != 0});
-        if (live.size() >= kMaxHistory) break;
-    }
-    if (live.empty()) return false;
     g_results.clear();
     ResultItem hh{ResultKind::Header, L"Recent", L"", L"", kHintCol};
     g_results.push_back(std::move(hh));
-    for (const auto& e : live) {
+    for (const auto& e : g_settings.history) {
+        if (e.kind != ResultKind::App && e.kind != ResultKind::Web &&
+            e.kind != ResultKind::File && e.kind != ResultKind::Folder)
+            continue;
+        ResultKind kind = e.kind;
+        if (kind == ResultKind::File || kind == ResultKind::Folder) {
+            // Resolve dir-ness live (covers legacy bare lines + FS changes);
+            // missing paths never show.
+            DWORD a = GetFileAttributesW(e.action.c_str());
+            if (a == INVALID_FILE_ATTRIBUTES) continue;
+            kind = (a & FILE_ATTRIBUTE_DIRECTORY) ? ResultKind::Folder
+                                                  : ResultKind::File;
+        }
         ResultItem r;
-        r.kind = e.second ? ResultKind::Folder : ResultKind::File;
-        size_t s = e.first.find_last_of(L"\\/");
-        r.title = (s == std::wstring::npos) ? e.first : e.first.substr(s + 1);
-        if (r.title.empty()) r.title = e.first; // drive roots keep full text
+        r.kind = kind;
+        r.title = e.title; // short name only
         r.sub = L"";
-        r.action = e.first;
-        r.color = e.second ? kFolderCol : kFileCol;
+        r.action = e.action;
+        r.isStore = e.isStore;
+        r.color = (kind == ResultKind::App) ? kAppCol
+                : (kind == ResultKind::Web) ? kWebCol
+                : (kind == ResultKind::Folder) ? kFolderCol : kFileCol;
         g_results.push_back(std::move(r));
     }
+    if (g_results.size() <= 1) return false; // everything vanished
     g_histActive = true;
     g_navigating = false;
     g_chipsFocus = false;
@@ -1630,27 +1642,74 @@ static void ExecuteChip(int idx) {
         NotifyLaunchFailed(L"Browser launch failed");
 }
 
+// Launch an app row (Store apps via explorer, classic via ShellExecute).
+// Callers hide the palette first: never wait for the target app.
+static void LaunchAppRow(const ResultItem& r) {
+    if (r.action.empty()) { NotifyLaunchFailed(L"Couldn't open this app"); return; }
+    if (r.isStore) {
+        wchar_t winDir[MAX_PATH];
+        HINSTANCE ok = NULL;
+        if (GetWindowsDirectoryW(winDir, MAX_PATH)) {
+            std::wstring exe = std::wstring(winDir) + L"\\explorer.exe";
+            ok = ShellExecuteW(NULL, L"open", exe.c_str(), r.action.c_str(), NULL, SW_SHOWNORMAL);
+        }
+        if ((UINT_PTR)ok <= 32) NotifyLaunchFailed(L"Couldn't open this app");
+    } else {
+        if ((UINT_PTR)ShellExecuteW(NULL, L"open", r.action.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
+            NotifyLaunchFailed(L"Couldn't open this app");
+    }
+}
+
 static void ExecuteSelected(bool forceWeb) {
-    // History recall: Enter jumps straight to the picked path (folders
-    // drill and stay open, files open and close). Shift is ignored here.
+    // History recall: Enter acts per row kind (apps launch, files open,
+    // folders drill and stay open, searches re-run). Shift is ignored here.
     if (g_histActive) {
         g_histActive = false;
         int hidx = EffectiveSelection(CurrentSelection(), g_results);
         if (hidx < 0) { UpdateResults(); return; }
         ResultItem hr = g_results[(size_t)hidx]; // copy: paths below rebuild
+        HistoryItem rec; // re-entered history refreshes recency
+        rec.kind = hr.kind; rec.title = hr.title;
+        rec.action = hr.action; rec.isStore = hr.isStore;
         if (hr.kind == ResultKind::Folder && !hr.action.empty()) {
+            HistoryRecord(rec);
             ActivateFileMode(hr.action); // drills, stays open
             return;
         }
-        if (!hr.action.empty()) {
+        if (hr.kind == ResultKind::App && !hr.action.empty()) {
+            HistoryRecord(rec);
+            HidePalette(); // hide first: never wait for the target
+            LaunchAppRow(hr);
+            return;
+        }
+        if (hr.kind == ResultKind::Web) {
+            if (!hr.action.empty()) {
+                HistoryRecord(rec);
+                HidePalette(); // hide first: never wait for the browser
+                if ((UINT_PTR)OpenUrl(hr.action, g_settings.browserPath) <= 32)
+                    NotifyLaunchFailed(L"Browser launch failed");
+            } else if (!hr.title.empty()) {
+                HistoryRecord(rec);
+                std::wstring url = ExpandUrl(g_settings.engineUrl,
+                                             UrlEncodeQuery(hr.title));
+                HidePalette(); // hide first: never wait for the browser
+                if ((UINT_PTR)OpenUrl(url, g_settings.browserPath) <= 32)
+                    NotifyLaunchFailed(L"Browser launch failed");
+            } else {
+                UpdateResults();
+            }
+            return;
+        }
+        if (hr.kind == ResultKind::File && !hr.action.empty()) {
+            HistoryRecord(rec);
             std::wstring full = hr.action;
             HidePalette(); // hide first: never wait for the target
             if ((UINT_PTR)ShellExecuteW(NULL, L"open", full.c_str(), NULL, NULL,
                                         SW_SHOWNORMAL) <= 32)
                 NotifyLaunchFailed(L"Couldn't open this file");
-        } else {
-            UpdateResults();
+            return;
         }
+        UpdateResults();
         return;
     }
     std::wstring q = Trim(GetEditText(g_hwndEdit));
@@ -1692,6 +1751,9 @@ static void ExecuteSelected(bool forceWeb) {
         } else {
             url = ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q));
         }
+        HistoryItem wh; // executed searches lead the merged history
+        wh.kind = ResultKind::Web; wh.title = q; wh.action = L"";
+        HistoryRecord(wh);
         HidePalette(); // hide first: never wait for the browser
         if ((UINT_PTR)OpenUrl(url, g_settings.browserPath) <= 32)
             NotifyLaunchFailed(L"Browser launch failed");
@@ -1702,6 +1764,9 @@ static void ExecuteSelected(bool forceWeb) {
     if (idx < 0) {
         // No actionable selection (none, or a section heading): normal
         // fallback runs the typed query as a web search.
+        HistoryItem wh; // executed searches lead the merged history
+        wh.kind = ResultKind::Web; wh.title = q; wh.action = L"";
+        HistoryRecord(wh);
         std::wstring url = ExpandUrl(g_settings.engineUrl, UrlEncodeQuery(q));
         HidePalette();
         if ((UINT_PTR)OpenUrl(url, g_settings.browserPath) <= 32)
@@ -1711,26 +1776,23 @@ static void ExecuteSelected(bool forceWeb) {
     ResultItem r = g_results[(size_t)idx]; // copy: HidePalette clears the vector
     HidePalette(); // hide first: never wait for the target app
     switch (r.kind) {
-    case ResultKind::App:
-        if (r.action.empty()) { NotifyLaunchFailed(L"Couldn't open this app"); break; }
-        if (r.isStore) {
-            wchar_t winDir[MAX_PATH];
-            HINSTANCE ok = NULL;
-            if (GetWindowsDirectoryW(winDir, MAX_PATH)) {
-                std::wstring exe = std::wstring(winDir) + L"\\explorer.exe";
-                ok = ShellExecuteW(NULL, L"open", exe.c_str(), r.action.c_str(), NULL, SW_SHOWNORMAL);
-            }
-            if ((UINT_PTR)ok <= 32) NotifyLaunchFailed(L"Couldn't open this app");
-        } else {
-            if ((UINT_PTR)ShellExecuteW(NULL, L"open", r.action.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
-                NotifyLaunchFailed(L"Couldn't open this app");
-        }
+    case ResultKind::App: {
+        HistoryItem ah; // launched apps lead the merged history
+        ah.kind = ResultKind::App; ah.title = r.title;
+        ah.action = r.action; ah.isStore = r.isStore;
+        HistoryRecord(ah);
+        LaunchAppRow(r);
         break;
+    }
     case ResultKind::Web:
-    case ResultKind::Bang:
+    case ResultKind::Bang: {
+        HistoryItem wh; // searches + direct links, re-runnable from history
+        wh.kind = ResultKind::Web; wh.title = r.title; wh.action = r.action;
+        HistoryRecord(wh);
         if ((UINT_PTR)OpenUrl(r.action, g_settings.browserPath) <= 32)
             NotifyLaunchFailed(L"Browser launch failed");
         break;
+    }
     case ResultKind::Setting:
         if (!r.action.empty() &&
             (UINT_PTR)ShellExecuteW(NULL, L"open", r.action.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
@@ -2564,10 +2626,20 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         SetFocus(g_hwndEdit);
         return 0;
     }
-    case WM_LBUTTONDBLCLK:
+    case WM_LBUTTONDBLCLK: {
+        // Only a tile double-click acts: blank-space double-clicks do
+        // nothing (they must never fire the cursor's row). The hit tile
+        // becomes the cursor first, so Enter-logic sees the right row.
         CancelRowDrag();
+        int idx = GridHitTest(GET_X_LPARAM(l), GET_Y_LPARAM(l));
+        if (idx < 0 || idx >= (int)g_results.size() ||
+            g_results[(size_t)idx].kind == ResultKind::Header)
+            return 0;
+        EnsureNavStart();
+        SendMessageW(g_hwndList, LB_SETCURSEL, idx, 0);
         ExecuteSelected(false);
         return 0;
+    }
     case WM_MOUSEMOVE: {
         POINT dpt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
         MoveRowDrag(hwnd, dpt);
@@ -3437,7 +3509,17 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             UpdateResults();
         } else if ((HWND)l == g_hwndList) {
             if (code == LBN_DBLCLK) {
+                // Only a row double-click acts: blank-space double-clicks
+                // do nothing (they must never fire the cursor's row). The
+                // hit row becomes the cursor first.
+                DWORD pos = GetMessagePos();
+                POINT p{(int)(short)LOWORD(pos), (int)(short)HIWORD(pos)};
+                ScreenToClient(g_hwndList, &p);
+                int row = ListRowFromPoint(g_hwndList, MAKELPARAM(p.x, p.y));
+                if (row < 0 || g_results[(size_t)row].kind == ResultKind::Header)
+                    break;
                 g_chipsFocus = false;
+                SendMessageW(g_hwndList, LB_SETCURSEL, row, 0);
                 ExecuteSelected(false);
             } else if (code == LBN_SELCHANGE) {
                 g_confirmPower = -1;
