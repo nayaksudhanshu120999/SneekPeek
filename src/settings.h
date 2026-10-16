@@ -77,6 +77,22 @@ inline bool operator==(const Theme& a, const Theme& b) {
 }
 inline bool operator!=(const Theme& a, const Theme& b) { return !(a == b); }
 
+// ------------------------------------------------- Up-on-empty history
+// Recently opened file/folder paths (move-to-front, capped). Pure logic so
+// push/dedupe/cap is unit-testable; persistence is [History] Count + ItemN.
+inline constexpr size_t kMaxHistory = 20;
+inline void HistoryPush(std::vector<std::wstring>& h, const std::wstring& path) {
+    if (path.empty()) return;
+    for (auto it = h.begin(); it != h.end(); ++it) {
+        if (_wcsicmp(it->c_str(), path.c_str()) == 0) {
+            h.erase(it);
+            break;
+        }
+    }
+    h.insert(h.begin(), path);
+    if (h.size() > kMaxHistory) h.resize(kMaxHistory);
+}
+
 inline bool ParseQuickLine(const std::wstring& line, QuickLink& out) {
     size_t p = line.find(L'|');
     if (p == std::wstring::npos) return false;
@@ -101,6 +117,7 @@ struct Settings {
     bool includePathExes = false;
     bool runAtStartup = false;
     Theme theme = DefaultTheme();
+    std::vector<std::wstring> history; // recent file/folder paths (Up-on-empty)
 };
 
 inline std::wstring SettingsPath() {
@@ -239,6 +256,21 @@ inline void LoadSettingsLists(Settings& s) {
     } else if (qcount == 0) {
         s.quicks.clear();
     }
+
+    // Up-on-empty history: recent paths, newest first. Missing/empty entries
+    // are skipped so a hand-edited INI can never show dead rows.
+    s.history.clear();
+    int hcount = GetPrivateProfileIntW(L"History", L"Count", 0, ini.c_str());
+    if (hcount < 0) hcount = 0;
+    if (hcount > (int)kMaxHistory) hcount = (int)kMaxHistory;
+    {
+        wchar_t key[32];
+        for (int i = 0; i < hcount; i++) {
+            swprintf_s(key, 32, L"Item%d", i);
+            GetPrivateProfileStringW(L"History", key, L"", buf, 4096, ini.c_str());
+            if (buf[0]) s.history.push_back(buf);
+        }
+    }
 }
 
 inline void LoadSettings(Settings& s) {
@@ -308,6 +340,14 @@ inline void SaveSettings(const Settings& s) {
         swprintf_s(key, 32, L"Quick%d", (int)i);
         std::wstring line = s.quicks[i].name + L" | " + s.quicks[i].url;
         WritePrivateProfileStringW(L"Quick", key, line.c_str(), ini.c_str());
+    }
+    size_t nhist = s.history.size() < kMaxHistory ? s.history.size() : kMaxHistory;
+    wchar_t hcount[16];
+    swprintf_s(hcount, 16, L"%d", (int)nhist);
+    WritePrivateProfileStringW(L"History", L"Count", hcount, ini.c_str());
+    for (size_t i = 0; i < nhist; i++) {
+        swprintf_s(key, 32, L"Item%d", (int)i);
+        WritePrivateProfileStringW(L"History", key, s.history[i].c_str(), ini.c_str());
     }
 }
 

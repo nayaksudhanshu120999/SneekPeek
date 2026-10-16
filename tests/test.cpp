@@ -539,6 +539,23 @@ int main() {
         CHECK(ClampMoveSel(headsOnly, 0, +1) == -1); // nothing selectable
         CHECK(LastSelectable(headsOnly) == -1);
     }
+    // history: move-to-front, case-insensitive dedupe, capped, no empties
+    {
+        std::vector<std::wstring> h;
+        HistoryPush(h, L"");
+        CHECK(h.empty());
+        HistoryPush(h, L"C:\\a.txt");
+        HistoryPush(h, L"D:\\docs\\");
+        CHECK(h.size() == 2 && h[0] == L"D:\\docs\\" && h[1] == L"C:\\a.txt");
+        HistoryPush(h, L"c:\\A.TXT"); // same path, other case: moves to front
+        CHECK(h.size() == 2 && h[0] == L"c:\\A.TXT");
+        for (int i = 0; i < 30; i++) {
+            wchar_t b[32];
+            swprintf_s(b, 32, L"C:\\f%d.txt", i);
+            HistoryPush(h, b);
+        }
+        CHECK(h.size() == kMaxHistory && h[0] == L"C:\\f29.txt");
+    }
     if (g_fail == 0) printf("ALL TESTS PASSED\n");
     return g_fail ? 1 : 0;
 }

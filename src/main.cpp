@@ -293,7 +293,9 @@ static void CreateAppFonts() {
         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     // Row-height floor from the real font metrics: at any DPI the title text
     // must fit its row with padding, so glyphs can never clip vertically or
-    // overlap. UpdateLayoutMetrics() owns the DPI base; this only raises it.
+    // overlap. The search box gets the same treatment (typed "g"/"q"
+    // descenders must clear the edit control). UpdateLayoutMetrics() owns
+    // the DPI base; this only raises it.
     {
         HDC dc = GetDC(NULL);
         if (dc) {
@@ -311,6 +313,16 @@ static void CreateAppFonts() {
                 if (GetTextMetricsW(dc, &tm)) {
                     int need = tm.tmHeight + Dpx(10);
                     if (need > kHeadH) kHeadH = need;
+                }
+                SelectObject(dc, old);
+            }
+            if (g_fontInput) {
+                HGDIOBJ old = SelectObject(dc, g_fontInput);
+                if (GetTextMetricsW(dc, &tm)) {
+                    // Full line (ascent + descent + leading) plus air above
+                    // and below: the query's descenders never touch the edge.
+                    int need = tm.tmHeight + tm.tmExternalLeading + Dpx(18);
+                    if (need > kInputH) kInputH = need;
                 }
                 SelectObject(dc, old);
             }
@@ -391,6 +403,9 @@ static int g_gridTopRow = 0; // first visible tile row in grid mode
 // Arrow navigation: original typed text, restored when wrapping past the ends.
 static std::wstring g_origQuery;
 static bool g_navigating = false;
+// History recall (Up on an empty box): when true, g_results holds recent
+// paths instead of search results; typing/esc/hide exits back to normal.
+static bool g_histActive = false;
 // (g_gdiplusToken is defined above, next to the font globals.)
 
 // ------------------------------------------------------- power + quick chips
@@ -527,10 +542,8 @@ static void ActivateFileMode(const std::wstring& dir);
 static void DeactivateFileMode();
 static void UpdateFileResults(const std::wstring& filter);
 static void ExecuteFileSelected(bool inExplorer);
-static void OpenPathList(const std::vector<std::wstring>& paths);
-static void MultiClear();
-static bool MultiHas(int idx);
-static std::vector<int> MultiRows();
+static void HistoryRecord(const std::wstring& path);
+static void KeyboardContextMenu();
 static std::wstring SystemExe(const wchar_t* name);
 static void RebuildListControl();
 static int CurrentSelection();
@@ -759,6 +772,7 @@ static void ShowPalette() {
     DeactivateFileMode();
     g_chips.clear();
     g_chipsFocus = false;
+    g_histActive = false;
     PlacePalette();
     ApplyRoundCorners();
     g_changingEdit = true;
@@ -773,8 +787,8 @@ static void ShowPalette() {
 static void HidePalette() {
     DeactivateBang();
     DeactivateFileMode();
-    MultiClear(); // selections never leak into the next open
     g_hoverRow = -1;
+    g_histActive = false;
     g_chips.clear();
     g_chipsFocus = false;
     if (g_hwndChipRow) ShowWindow(g_hwndChipRow, SW_HIDE);
@@ -905,7 +919,6 @@ static void ActivateFileMode(const std::wstring& dir) {
     DeactivateBang(); // mutually exclusive with bang-chip mode
     g_fileActive = true;
     g_fileDir = dir.empty() ? L"" : EnsureTrailingSlash(dir);
-    MultiClear(); // fresh folder, fresh selection
     g_navigating = false;
     g_confirmPower = -1;
     RefreshDriveCache(); // labels once per entry, not per keystroke
@@ -921,7 +934,6 @@ static void DeactivateFileMode() {
     if (!g_fileActive) return; // don't hide an armed bang chip
     g_fileActive = false;
     g_fileDir.clear();
-    MultiClear();
     g_navigating = false;
     g_bangChipW = 0;
     if (g_hwndChip) ShowWindow(g_hwndChip, SW_HIDE);
@@ -935,14 +947,6 @@ static void DeactivateFileMode() {
 // rows carry names only. Current path alone is scanned; filter narrows it.
 // ".." returns only when the filter is empty (Backspace also goes up).
 static void UpdateFileResults(const std::wstring& filter) {
-    // A new filter invalidates picked paths (they may not even match
-    // anymore): the set belongs to the filter that picked it. Navigation,
-    // clicks, and hover never clear — only typing/drilling does.
-    static std::wstring lastFilter;
-    if (filter != lastFilter) {
-        lastFilter = filter;
-        MultiClear();
-    }
     g_results.clear();
     g_results.reserve(9);
     std::wstring fl = FileLower(filter);
@@ -1066,25 +1070,13 @@ static void ExecuteFileSelected(bool inExplorer) {
         }
         return; // nothing picked: stay open
     }
-    // Multi-selection wins only when the cursor row is a member: Enter/Space
-    // opens every picked file + folder (folders open in Explorer), then
-    // closes. Otherwise the cursor row acts alone, exactly as before.
-    if (idx >= 0 && MultiHas(idx)) {
-        std::vector<int> rows = MultiRows();
-        std::vector<std::wstring> paths;
-        for (size_t k = 0; k < rows.size(); k++)
-            paths.push_back(g_results[(size_t)rows[k]].action);
-        MultiClear();
-        OpenPathList(paths); // hides first, toasts only on failures
-        return;
-    }
     if (idx < 0) return; // header or nothing: stay open
     ResultItem r = g_results[(size_t)idx]; // copy: HidePalette clears state
     if (r.kind == ResultKind::Folder) {
         g_fileDir = r.action.empty() ? L"" : EnsureTrailingSlash(r.action);
         if (g_fileDir.empty()) RefreshDriveCache(); // back at drives: re-read labels
         g_navigating = false;
-        MultiClear(); // drilled elsewhere: selection belonged to the old folder
+        HistoryRecord(r.action); // Up-on-empty can jump straight back here
         if (g_hwndEdit) {
             g_changingEdit = true;
             SetWindowTextW(g_hwndEdit, L"");
@@ -1098,6 +1090,7 @@ static void ExecuteFileSelected(bool inExplorer) {
     if (r.kind == ResultKind::File) {
         if (r.action.empty()) return;
         std::wstring full = r.action; // copy: HidePalette clears file state
+        HistoryRecord(full); // Up-on-empty can jump straight back here
         HidePalette(); // hide first: never wait for the target
         if ((UINT_PTR)ShellExecuteW(NULL, L"open", full.c_str(), NULL, NULL, SW_SHOWNORMAL) <= 32)
             NotifyLaunchFailed(L"Couldn't open this file");
@@ -1113,6 +1106,51 @@ static void ExecuteFileSelected(bool inExplorer) {
     }
 }
 
+// ------------------------------------------------- Up-on-empty history
+// Remember opened files + drilled folders (persisted in [History]), so Up on
+// an empty box can jump straight back to any recent path.
+static void HistoryRecord(const std::wstring& path) {
+    if (path.empty()) return;
+    EnsureSettingsLists(); // SaveSettings rewrites every section
+    HistoryPush(g_settings.history, path);
+    SaveNow(); // instant persist, like the rest of Settings
+}
+// Up on an empty box: replace results with recent paths (newest first).
+// Returns false when there is nothing to show (caller falls through to
+// normal navigation). Vanished paths are hidden, never shown dead.
+static bool ShowHistory() {
+    EnsureSettingsLists();
+    if (g_settings.history.empty()) return false;
+    std::vector<std::pair<std::wstring, bool>> live; // path, isDir
+    for (const auto& p : g_settings.history) {
+        DWORD a = GetFileAttributesW(p.c_str());
+        if (a == INVALID_FILE_ATTRIBUTES) continue;
+        live.push_back({p, (a & FILE_ATTRIBUTE_DIRECTORY) != 0});
+        if (live.size() >= kMaxHistory) break;
+    }
+    if (live.empty()) return false;
+    g_results.clear();
+    ResultItem hh{ResultKind::Header, L"Recent", L"", L"", kHintCol};
+    g_results.push_back(std::move(hh));
+    for (const auto& e : live) {
+        ResultItem r;
+        r.kind = e.second ? ResultKind::Folder : ResultKind::File;
+        size_t s = e.first.find_last_of(L"\\/");
+        r.title = (s == std::wstring::npos) ? e.first : e.first.substr(s + 1);
+        if (r.title.empty()) r.title = e.first; // drive roots keep full text
+        r.sub = L"";
+        r.action = e.first;
+        r.color = e.second ? kFolderCol : kFileCol;
+        g_results.push_back(std::move(r));
+    }
+    g_histActive = true;
+    g_navigating = false;
+    g_chipsFocus = false;
+    g_gridTopRow = 0; // history always starts at the top
+    RebuildListControl();
+    return true;
+}
+
 // ------------------------------------------------------- file grid metrics
 // Grid is file-mode-only and setting-gated (rows/columns from Settings).
 // Tiles map 1:1 onto g_results indices (after one header).
@@ -1126,14 +1164,9 @@ static int GridColsEff() {
     return EffectiveGridCols(kWidth - kPadX * 2, GridColumns(), Dpx(110));
 }
 
-// ------------------------------------------------- file-mode multi-selection
-// Ctrl+Click toggles a row, Shift+Click extends from the anchor, plain
-// click/arrow keys collapse (Explorer rule). The set holds action paths, so
-// it survives refiltering within one folder; it clears on folder change,
-// mode exit, and palette hide. Enter opens the set only when the cursor row
-// itself is a member — a stale set can never hijack a plain Enter.
-static std::set<std::wstring> g_multiSel;
-static int g_multiAnchor = -1; // Shift-range anchor (results index)
+// ------------------------------------------------- hover preview helpers
+// Hover highlights a row/tile visually only: selection, drag, and Enter
+// targets are never disturbed by the mouse position.
 static void TrackHoverLeave(HWND h) {
     TRACKMOUSEEVENT tme{};
     tme.cbSize = sizeof(tme);
@@ -1148,43 +1181,6 @@ static int ListRowFromPoint(HWND h, LPARAM l) {
     LRESULT data = SendMessageW(h, LB_GETITEMDATA, LOWORD(idx), 0);
     if (data < 0 || data >= (LRESULT)g_results.size()) return -1;
     return (int)data;
-}
-// readable mark color on any accent fill (white on dark, near-black on light)
-static COLORREF ContrastOn(COLORREF c) {
-    int lum = (GetRValue(c) * 299 + GetGValue(c) * 587 + GetBValue(c) * 114) / 1000;
-    return lum > 128 ? RGB(10, 10, 12) : RGB(255, 255, 255);
-}
-static bool MultiSelectable(int idx) {
-    return InFileMode() && idx >= 0 && idx < (int)g_results.size() &&
-           MultiKeySelectable(g_results[(size_t)idx]);
-}
-static bool MultiHas(int idx) {
-    return MultiSelectable(idx) &&
-           g_multiSel.count(g_results[(size_t)idx].action) != 0;
-}
-static void MultiClear() { g_multiSel.clear(); g_multiAnchor = -1; }
-static void MultiToggleIdx(int idx) {
-    if (!MultiSelectable(idx)) return;
-    MultiToggle(g_multiSel, g_results[(size_t)idx].action);
-    g_multiAnchor = idx;
-}
-static void MultiRangeTo(int idx) {
-    if (!InFileMode() || idx < 0 || idx >= (int)g_results.size()) return;
-    if (g_multiAnchor < 0 || g_multiAnchor >= (int)g_results.size())
-        g_multiAnchor = idx;
-    MultiRangeAdd(g_multiSel, g_results, g_multiAnchor, idx);
-}
-static void MultiSelectAll() {
-    if (!InFileMode()) return;
-    for (size_t i = 0; i < g_results.size(); i++)
-        if (MultiKeySelectable(g_results[i])) g_multiSel.insert(g_results[i].action);
-    g_multiAnchor = -1;
-}
-static std::vector<int> MultiRows() { return MultiMemberRows(g_multiSel, g_results); }
-static void MultiChanged() { // repaint everything that shows membership
-    if (g_hwndList && IsWindow(g_hwndList)) InvalidateRect(g_hwndList, NULL, FALSE);
-    if (g_hwndFileGrid && IsWindow(g_hwndFileGrid)) InvalidateRect(g_hwndFileGrid, NULL, FALSE);
-    if (g_hwndFileBar && IsWindow(g_hwndFileBar)) InvalidateRect(g_hwndFileBar, NULL, FALSE);
 }
 static int GridContentH() {
     bool head = !g_results.empty() && g_results.front().kind == ResultKind::Header;
@@ -1456,6 +1452,8 @@ static void MatchSysPages(const std::wstring& qlower, std::vector<ResultItem>& o
 }
 
 static void UpdateResults() {
+    // Any real refilter leaves history view (typing exits back to normal).
+    g_histActive = false;
     g_results.clear();
     g_results.reserve(8);
     std::wstring raw = GetEditText(g_hwndEdit);
@@ -1628,6 +1626,28 @@ static void ExecuteChip(int idx) {
 }
 
 static void ExecuteSelected(bool forceWeb) {
+    // History recall: Enter jumps straight to the picked path (folders
+    // drill and stay open, files open and close). Shift is ignored here.
+    if (g_histActive) {
+        g_histActive = false;
+        int hidx = EffectiveSelection(CurrentSelection(), g_results);
+        if (hidx < 0) { UpdateResults(); return; }
+        ResultItem hr = g_results[(size_t)hidx]; // copy: paths below rebuild
+        if (hr.kind == ResultKind::Folder && !hr.action.empty()) {
+            ActivateFileMode(hr.action); // drills, stays open
+            return;
+        }
+        if (!hr.action.empty()) {
+            std::wstring full = hr.action;
+            HidePalette(); // hide first: never wait for the target
+            if ((UINT_PTR)ShellExecuteW(NULL, L"open", full.c_str(), NULL, NULL,
+                                        SW_SHOWNORMAL) <= 32)
+                NotifyLaunchFailed(L"Couldn't open this file");
+        } else {
+            UpdateResults();
+        }
+        return;
+    }
     std::wstring q = Trim(GetEditText(g_hwndEdit));
     if (g_navigating) {
         // Arrow-mirrored text is a preview, not input: web search below uses
@@ -1837,7 +1857,6 @@ static void MoveSelSteps(int steps) {
         SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
         SyncSelToBox(to);
         EnsureVisible(to);
-        g_multiAnchor = to; // wheel re-anchors the Shift range, keeps the set
     }
     InvalidateRect(g_hwndList, NULL, FALSE);
     if (!g_chips.empty()) InvalidateRect(g_hwndChipRow, NULL, FALSE);
@@ -1880,8 +1899,6 @@ static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
     // Drag-out arming: default click selection first, then track moves past
     // the system drag threshold (files, folders, drives, classic app targets).
     if (m == WM_LBUTTONDOWN) {
-        bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         LRESULT r = DefSubclassProc(h, m, w, l);
         int idx = (int)SendMessageW(h, LB_ITEMFROMPOINT, 0, l);
         if (HIWORD(idx) == 0) {
@@ -1890,15 +1907,6 @@ static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                           ? (int)data : -1;
             POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
             ArmRowDrag(row, pt);
-            // File-mode multi-select: Ctrl toggles, Shift extends, plain
-            // click just re-anchors (the set survives navigation now; only
-            // filter/dir changes clear it).
-            if (InFileMode() && !GridActive() && row >= 0) {
-                if (ctrl && !shift) MultiToggleIdx(row);
-                else if (shift && !ctrl) MultiRangeTo(row);
-                else g_multiAnchor = row;
-                MultiChanged();
-            }
         } else {
             CancelRowDrag();
         }
@@ -1980,6 +1988,16 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
         bool haveChips = !g_chips.empty();
         switch (w) {
         case VK_ESCAPE: HidePalette(); return 0;
+        case VK_APPS:
+            KeyboardContextMenu(); // row/file menu, not the edit's own menu
+            return 0;
+        case VK_F10:
+            // Shift+F10 is the Menu-key equivalent: same row menu.
+            if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+                KeyboardContextMenu();
+                return 0;
+            }
+            break;
         case VK_RETURN: {
             bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
             if (g_chipsFocus && haveChips && !shift) ExecuteChip(g_chipSel);
@@ -2019,10 +2037,10 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                 InvalidateRect(g_hwndList, NULL, FALSE);
             } else if (count > 0) {
                 EnsureNavStart();
-                if (InFileMode()) {
-                    // File mode never dead-ends: clamp onto the nearest
-                    // selectable row, so arrows always leave a live target
-                    // for Enter and never disturb the multi-set.
+                if (InFileMode() || g_histActive) {
+                    // File mode and history never dead-end: clamp onto the
+                    // nearest selectable row, so arrows always leave a live
+                    // target for Enter.
                     int step = GridActive() ? GridColsEff() : 1;
                     int to = sel;
                     for (int i = 0; i < step; i++) {
@@ -2030,7 +2048,6 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                         if (nx < 0 || nx == to) break;
                         to = nx;
                     }
-                    g_multiAnchor = to;
                     SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
                     SyncSelToBox(to);
                     EnsureVisible(to);
@@ -2058,6 +2075,11 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
             }
             return 0;
         case VK_UP:
+            // Empty box + Up = history recall in any mode (nothing to show:
+            // fall through to normal navigation).
+            if (!g_histActive && !g_navigating && GetWindowTextLengthW(h) == 0) {
+                if (ShowHistory()) return 0;
+            }
             g_confirmPower = -1; // navigating disarms a pending confirm
             if (!g_chipsFocus && (sel <= 0) && haveChips) {
                 g_chipsFocus = true;
@@ -2067,8 +2089,8 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                 InvalidateRect(g_hwndList, NULL, FALSE);
             } else if (count > 0) {
                 EnsureNavStart();
-                if (InFileMode()) {
-                    // File mode never dead-ends: clamp, never clear.
+                if (InFileMode() || g_histActive) {
+                    // File mode and history never dead-end: clamp, never clear.
                     int step = GridActive() ? GridColsEff() : 1;
                     int to = sel;
                     for (int i = 0; i < step; i++) {
@@ -2076,7 +2098,6 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                         if (nx < 0 || nx == to) break;
                         to = nx;
                     }
-                    g_multiAnchor = to;
                     SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
                     SyncSelToBox(to);
                     EnsureVisible(to);
@@ -2112,7 +2133,6 @@ static LRESULT CALLBACK EditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                 // Grid is file-mode-only: clamp, never clear (no dead spot).
                 int to = ClampMoveSel(g_results, sel, (w == VK_RIGHT) ? +1 : -1);
                 if (to >= 0) {
-                    g_multiAnchor = to;
                     SendMessageW(g_hwndList, LB_SETCURSEL, to, 0);
                     SyncSelToBox(to);
                     EnsureVisible(to);
@@ -2304,17 +2324,8 @@ static LRESULT CALLBACK FileBarProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         SelectObject(dc, g_fontSub);
         SetTextColor(dc, kText);
         RECT tr = cl; tr.left += Dpx(34); tr.right -= Dpx(10);
-        size_t nm = g_multiSel.size();
-        if (InFileMode() && nm > 0) {
-            wchar_t b[128];
-            swprintf_s(b, 128, L"%u selected \u00B7 Enter opens all \u00B7 typing clears",
-                       (unsigned)nm);
-            DrawTextW(dc, b, -1, &tr,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        } else {
-            DrawTextW(dc, L"Enter/Space open \u00B7 Shift+Enter folder \u00B7 Ctrl+Click selects",
-                      -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        }
+        DrawTextW(dc, L"Enter/Space open \u00B7 Shift+Enter folder", -1, &tr,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -2404,6 +2415,30 @@ static std::wstring FitTileText(HDC dc, const std::wstring& s, int w, int maxH) 
     return best;
 }
 
+// Single-line fit with a true trailing ellipsis (keeps the start).
+// Used after FitTileText when everything fits on one line: guarantees the
+// line ends with "..." instead of a hard mid-glyph cut at the tile edge.
+static std::wstring FitOneLine(HDC dc, const std::wstring& s, int w) {
+    if (s.empty() || w <= 0) return s;
+    RECT r{0, 0, 0, 0};
+    DrawTextW(dc, s.c_str(), -1, &r,
+              DT_CALCRECT | DT_SINGLELINE | DT_LEFT | DT_TOP);
+    if (r.right - r.left <= w) return s;
+    std::wstring best = L"…";
+    size_t lo = 0, hi = s.size();
+    while (lo < hi) {
+        size_t mid = (lo + hi + 1) / 2;
+        std::wstring t = s.substr(0, mid) + L"…";
+        RECT r2{0, 0, 0, 0};
+        DrawTextW(dc, t.c_str(), -1, &r2,
+                  DT_CALCRECT | DT_SINGLELINE | DT_LEFT | DT_TOP);
+        if (r2.right - r2.left <= w) { best = t; lo = mid; }
+        else if (mid == 0) break;
+        else hi = mid - 1;
+    }
+    return best;
+}
+
 // Explorer-like tiles, file grid-view only. Paints + hit-tests; selection
 // lives in the hidden listbox (same indices), so nav/execute are untouched.
 static int GridHitTest(int fx, int fy) {
@@ -2464,7 +2499,6 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             const ResultItem& ri = g_results[i];
             if (ri.kind == ResultKind::Header) continue; // safety
             bool isCur = ((int)i == sel);
-            bool isMem = MultiHas((int)i);
             if (isCur) FillRect(dc, &tile, g_brSel);
             // Hover preview: subtle fill, visual only.
             if (!isCur && (int)i == g_hoverRow) {
@@ -2474,39 +2508,6 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                         (GetBValue(kBg) + GetBValue(kSel)) / 2));
                 FillRect(dc, &tile, brHov);
                 DeleteObject(brHov);
-            }
-            // Corner selection badge: empty outline = pickable, filled +
-            // check = member. Sits in the tile corner, clear of glyph/label.
-            if (MultiKeySelectable(ri)) {
-                int bs = Dpx(18);
-                RECT badge{tile.left + Dpx(4), tile.top + Dpx(4),
-                           tile.left + Dpx(4) + bs, tile.top + Dpx(4) + bs};
-                if (isMem) {
-                    HBRUSH fb = CreateSolidBrush(ri.color);
-                    HGDIOBJ oldB = SelectObject(dc, fb);
-                    HPEN pen = CreatePen(PS_SOLID, 1, ri.color);
-                    HGDIOBJ oldP = SelectObject(dc, pen);
-                    RoundRect(dc, badge.left, badge.top,
-                              badge.right, badge.bottom, 6, 6);
-                    SelectObject(dc, oldB);
-                    SelectObject(dc, oldP);
-                    DeleteObject(fb);
-                    DeleteObject(pen);
-                    COLORREF ck = ContrastOn(ri.color);
-                    int qx = badge.left + Dpx(4), qy = badge.top + bs / 2;
-                    GlyphLine(dc, qx, qy, qx + Dpx(3), qy + Dpx(3), 2, ck);
-                    GlyphLine(dc, qx + Dpx(3), qy + Dpx(3),
-                              qx + Dpx(7), qy - Dpx(3), 2, ck);
-                } else {
-                    HPEN pen = CreatePen(PS_SOLID, 1, kSub);
-                    HGDIOBJ oldP = SelectObject(dc, pen);
-                    HGDIOBJ oldB = SelectObject(dc, GetStockObject(NULL_BRUSH));
-                    RoundRect(dc, badge.left, badge.top,
-                              badge.right, badge.bottom, 6, 6);
-                    SelectObject(dc, oldP);
-                    SelectObject(dc, oldB);
-                    DeleteObject(pen);
-                }
             }
             int gz = Dpx(32);
             int gx = tile.left + (tile.right - tile.left - gz) / 2;
@@ -2523,8 +2524,25 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             std::wstring shown = FitTileText(dc, ri.title,
                                              nr.right - nr.left,
                                              nr.bottom - nr.top);
+            // Single-word names (no spaces to break on) render left-aligned
+            // and start-anchored: a centered overflowing line would clip both
+            // ends and show only the middle. Multi-word names stay centered.
+            bool oneWord = ri.title.find_first_of(L" \t") == std::wstring::npos;
+            if (oneWord) {
+                // Single rendered line that's still too wide: end it with a
+                // real "..." instead of a hard cut (two-line results already
+                // fit their width via wrapping).
+                RECT oneL{0, 0, 0, 0};
+                DrawTextW(dc, L"X", -1, &oneL,
+                          DT_CALCRECT | DT_SINGLELINE | DT_LEFT | DT_TOP);
+                RECT hr3{0, 0, nr.right - nr.left, 0};
+                DrawTextW(dc, shown.c_str(), -1, &hr3,
+                          DT_CALCRECT | DT_WORDBREAK | DT_LEFT | DT_TOP);
+                if (hr3.bottom - hr3.top <= oneL.bottom - oneL.top)
+                    shown = FitOneLine(dc, shown, nr.right - nr.left);
+            }
             DrawTextW(dc, shown.c_str(), -1, &nr,
-                      DT_CENTER | DT_TOP | DT_WORDBREAK);
+                      (oneWord ? DT_LEFT : DT_CENTER) | DT_TOP | DT_WORDBREAK);
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -2536,15 +2554,6 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             SendMessageW(g_hwndList, LB_SETCURSEL, idx, 0);
             SyncSelToBox(idx);
             EnsureVisible(idx);
-            // Ctrl toggles, Shift extends, plain click just re-anchors
-            // (the set survives navigation now; only filter/dir changes
-            // clear it).
-            bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-            if (ctrl && !shift) MultiToggleIdx(idx);
-            else if (shift && !ctrl) MultiRangeTo(idx);
-            else g_multiAnchor = idx;
-            MultiChanged();
             InvalidateRect(hwnd, NULL, FALSE);
         }
         POINT dpt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
@@ -2601,7 +2610,6 @@ static bool g_dragging = false; // suppress dismiss-while-dragging
 static int g_menuRow = -1;
 static const UINT kMenuVerbBase = 3000;   // wID = base + (int)VerbId
 static const UINT kMenuEngineBase = 3200; // wID = base + engine index
-static const UINT kMenuMultiBase = 3260;  // wID = base + multi verb (0..3)
 static void ShowPaletteMenu(int x, int y); // defined below ShowRowMenu
 
 struct EnginePreset { const wchar_t* name; const wchar_t* url; };
@@ -2748,49 +2756,6 @@ static void ApplyEnginePreset(int idx) {
     UpdateResults();
 }
 
-// Open a batch of file/folder/drive paths (multi-select Enter + menu).
-// Hides first, opens each with ShellExecute, and toasts only on failures.
-static void OpenPathList(const std::vector<std::wstring>& paths) {
-    if (paths.empty()) return;
-    HidePalette(); // hide first: never wait for the targets
-    int failed = 0;
-    for (size_t k = 0; k < paths.size(); k++) {
-        if (paths[k].empty()) { failed++; continue; }
-        if ((UINT_PTR)ShellExecuteW(NULL, L"open", paths[k].c_str(), NULL, NULL,
-                                    SW_SHOWNORMAL) <= 32)
-            failed++;
-    }
-    if (failed > 0) {
-        wchar_t b[128];
-        swprintf_s(b, 128, L"Couldn't open %d of %u selected item%s", failed,
-                   (unsigned)paths.size(), paths.size() == 1 ? L"" : L"s");
-        NotifyLaunchFailed(b);
-    }
-}
-
-// File-mode multi-select menu verbs (kMenuMultiBase + id):
-// 0 = open all, 1 = copy all paths, 2 = clear, 3 = select all.
-static void RunMultiVerb(int which) {
-    if (which == 3) { MultiSelectAll(); MultiChanged(); return; }
-    if (which == 2) { MultiClear(); MultiChanged(); return; }
-    std::vector<int> rows = MultiRows();
-    if (rows.empty()) return;
-    if (which == 0) {
-        std::vector<std::wstring> paths;
-        for (size_t k = 0; k < rows.size(); k++)
-            paths.push_back(g_results[(size_t)rows[k]].action);
-        MultiClear();
-        OpenPathList(paths);
-        return;
-    }
-    std::wstring all;
-    for (size_t k = 0; k < rows.size(); k++) {
-        if (!all.empty()) all += L"\r\n";
-        all += g_results[(size_t)rows[k]].action;
-    }
-    CopyTextToClipboard(all);
-}
-
 static void RunRowVerb(int rowIdx, VerbId verb) {
     if (rowIdx < 0 || rowIdx >= (int)g_results.size()) return;
     ResultItem r = g_results[(size_t)rowIdx]; // copy: some verbs rebuild results
@@ -2918,29 +2883,6 @@ static void ShowRowMenu(int row, int x, int y) {
         if (!g_chips.empty()) InvalidateRect(g_hwndChipRow, NULL, FALSE);
         g_menuRow = row;
         g_menuItems.clear();
-        // File-mode multi-select actions ride above the row verbs.
-        if (InFileMode() && MultiKeySelectable(rr)) {
-            size_t nm = g_multiSel.size();
-            if (nm > 0) {
-                wchar_t b[64];
-                swprintf_s(b, 64, L"Open %u selected", (unsigned)nm);
-                DarkMenuItem it0; it0.text = b; it0.accent = kFolderCol;
-                it0.wID = kMenuMultiBase;
-                g_menuItems.push_back(std::move(it0));
-                swprintf_s(b, 64, L"Copy %u paths", (unsigned)nm);
-                DarkMenuItem it1; it1.text = b; it1.accent = kFolderCol;
-                it1.wID = kMenuMultiBase + 1;
-                g_menuItems.push_back(std::move(it1));
-                DarkMenuItem it2; it2.text = L"Clear selection"; it2.accent = kSub;
-                it2.wID = kMenuMultiBase + 2;
-                g_menuItems.push_back(std::move(it2));
-            }
-            DarkMenuItem it3; it3.text = L"Select all"; it3.accent = kFolderCol;
-            it3.wID = kMenuMultiBase + 3;
-            g_menuItems.push_back(std::move(it3));
-            DarkMenuItem sep; sep.separator = true; sep.wID = 0;
-            g_menuItems.push_back(std::move(sep));
-        }
         size_t subAt = (size_t)-1;
         for (VerbId v : verbs) {
             DarkMenuItem it;
@@ -2979,9 +2921,7 @@ static void ShowRowMenu(int row, int x, int y) {
         }
         int cmd = TrackDarkMenu(hMenu, x, y);
         DestroyMenu(hMenu); // owned submenu goes with it
-        if (cmd >= (int)kMenuMultiBase && cmd < (int)kMenuMultiBase + 4)
-            RunMultiVerb(cmd - (int)kMenuMultiBase);
-        else if (cmd >= (int)kMenuEngineBase && cmd < (int)kMenuEngineBase + 16)
+        if (cmd >= (int)kMenuEngineBase && cmd < (int)kMenuEngineBase + 16)
             ApplyEnginePreset(cmd - (int)kMenuEngineBase);
         else if (cmd >= (int)kMenuVerbBase && cmd < (int)kMenuVerbBase + 256)
             RunRowVerb(g_menuRow, (VerbId)(cmd - (int)kMenuVerbBase));
@@ -3359,6 +3299,23 @@ static void CancelRowDrag() {
     g_dragRow = -1;
 }
 
+// Keyboard Menu key (VK_APPS / Shift+F10): act on the current selection like
+// Explorer, never on hover, and never the edit box's own Cut/Copy/Paste
+// menu (focus lives in the edit box, so the key is forwarded here from the
+// edit subclass). Shared by the palette WM_CONTEXTMENU keyboard branch.
+static void KeyboardContextMenu() {
+    int sel = CurrentSelection();
+    if (sel >= 0 && sel < (int)g_results.size() &&
+        g_results[(size_t)sel].kind != ResultKind::Header) {
+        POINT rp = RowScreenPoint(sel);
+        ShowRowMenu(sel, rp.x, rp.y);
+    } else {
+        POINT pt{};
+        GetCursorPos(&pt);
+        ShowPaletteMenu(pt.x, pt.y);
+    }
+}
+
 // ------------------------------------------------------------- palette wndproc
 static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
@@ -3541,34 +3498,6 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
                 return TRUE;
             }
-            // File-mode rows lead with a selection checkbox (uniform indent
-            // keeps every label aligned): empty box = pickable, filled box +
-            // check = member. ".." gets the indent but no box.
-            int lead = InFileMode() ? Dpx(22) : 0;
-            if (InFileMode() && MultiKeySelectable(r)) {
-                int cb = Dpx(14);
-                int cyy = (d->rcItem.top + d->rcItem.bottom) / 2;
-                RECT box{d->rcItem.left + Dpx(6), cyy - cb / 2,
-                         d->rcItem.left + Dpx(6) + cb, cyy + cb / 2};
-                bool mem = MultiHas((int)ri);
-                if (mem) {
-                    HBRUSH fb = CreateSolidBrush(r.color);
-                    FillRect(dc, &box, fb);
-                    DeleteObject(fb);
-                    COLORREF ck = ContrastOn(r.color);
-                    int qx = box.left + Dpx(3);
-                    GlyphLine(dc, qx, cyy, qx + Dpx(3), cyy + Dpx(3), 2, ck);
-                    GlyphLine(dc, qx + Dpx(3), cyy + Dpx(3),
-                              qx + Dpx(7), cyy - Dpx(3), 2, ck);
-                }
-                HPEN pen = CreatePen(PS_SOLID, 1, mem ? r.color : kSub);
-                HGDIOBJ oldP = SelectObject(dc, pen);
-                HGDIOBJ oldB = SelectObject(dc, GetStockObject(NULL_BRUSH));
-                Rectangle(dc, box.left, box.top, box.right, box.bottom);
-                SelectObject(dc, oldP);
-                SelectObject(dc, oldB);
-                DeleteObject(pen);
-            }
             // App rows keep the original v1 look (slim category bar);
             // every other kind paints its glyph.
             RECT tr = d->rcItem;
@@ -3584,10 +3513,10 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 FileGlyph fg = GlyphForResult(r.kind, r.title, r.action, r.color);
                 int isz = Dpx(20);
                 int icy = (d->rcItem.top + d->rcItem.bottom) / 2;
-                RECT cell{d->rcItem.left + Dpx(14) + lead, icy - isz / 2,
-                          d->rcItem.left + Dpx(14) + lead + isz, icy + isz / 2};
+                RECT cell{d->rcItem.left + Dpx(14), icy - isz / 2,
+                          d->rcItem.left + Dpx(14) + isz, icy + isz / 2};
                 PaintGlyph(dc, cell, fg, sel, r.title, g_fontChip);
-                tr.left += Dpx(44) + lead;
+                tr.left += Dpx(44);
             }
             tr.right -= Dpx(10);
             SetTextColor(dc, sel ? kText : RGB(218, 218, 226));
@@ -3657,17 +3586,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         // native Cut/Copy/Paste menu via its own proc and never reaches here.)
         POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
         if (pt.x == -1 && pt.y == -1) {
-            // Keyboard menu key: act on the current selection like Explorer,
-            // never on whatever the cursor happens to hover.
-            int sel = CurrentSelection();
-            if (sel >= 0 && sel < (int)g_results.size() &&
-                g_results[(size_t)sel].kind != ResultKind::Header) {
-                POINT rp = RowScreenPoint(sel);
-                ShowRowMenu(sel, rp.x, rp.y);
-            } else {
-                GetCursorPos(&pt);
-                ShowPaletteMenu(pt.x, pt.y);
-            }
+            KeyboardContextMenu(); // Menu key: selection menu, not hover
             return 0;
         }
         POINT cl = pt;
