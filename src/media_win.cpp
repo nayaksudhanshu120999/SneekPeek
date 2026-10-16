@@ -88,6 +88,7 @@ struct MediaCtx {
     ID2D1SolidColorBrush* bTrack = nullptr;
     double duration = 0.0;
     bool playing = false;
+    bool sizeKnown = false; // native size arrived (late sizes self-correct)
     bool muted = false;
     double volume = 1.0;
     int rateIdx = 3; // 1.0x
@@ -472,6 +473,9 @@ void ImagePaint(MediaCtx* m, HDC dc) {
     HBRUSH bg = (HBRUSH)GetStockObject(BLACK_BRUSH);
     FillRect(dc, &cl, bg);
     if (m->dib.empty() || m->dibW <= 0 || m->dibH <= 0 || m->zoom <= 0.0) return;
+    // Buffer/size mismatch (should be impossible): skip the blit rather than
+    // painting garbage.
+    if (m->dib.size() < (size_t)m->dibW * (size_t)m->dibH * 4) return;
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = m->dibW;
@@ -483,8 +487,14 @@ void ImagePaint(MediaCtx* m, HDC dc) {
     int dh = (int)(m->dibH * m->zoom + 0.5);
     int dx = (int)(m->offX + 0.5), dy = (int)(m->offY + 0.5);
     SetStretchBltMode(dc, HALFTONE);
-    StretchDIBits(dc, dx, dy, dw, dh, 0, 0, m->dibW, m->dibH,
-                  m->dib.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
+    if (StretchDIBits(dc, dx, dy, dw, dh, 0, 0, m->dibW, m->dibH,
+                      m->dib.data(), &bmi, DIB_RGB_COLORS, SRCCOPY) == 0) {
+        // GDI refused the blit: an honest error beats a mystery blank window.
+        // WM_DESTROY reports these via the identical restore path.
+        m->failed = true;
+        m->err = L"This image couldn't be drawn on this PC.";
+        PostMessageW(m->hwnd, WM_CLOSE, 0, 0);
+    }
 }
 
 // Native pixel size via header read only (GetSize parses headers, never
@@ -556,7 +566,9 @@ static bool OpenImage(const std::wstring& path) {
         return false;
     }
     int ww = 0, wh = 0;
-    MediaFitWindow(w, h, aw, ah, ww, wh);
+    // Initial window covers ~70% of the work area, centered (never
+    // edge-to-edge); small images still open at native 1:1.
+    MediaFitWindow(w, h, (aw * 7) / 10, (ah * 7) / 10, ww, wh);
     HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kMediaClass, L"SneekPeek",
                                 WS_POPUP | WS_THICKFRAME | WS_CLIPCHILDREN,
                                 (area.left + area.right - ww) / 2,
@@ -582,6 +594,7 @@ static bool OpenImage(const std::wstring& path) {
     MediaExtendFrame(hwnd);
     ShowWindow(hwnd, SW_SHOW);
     SetForegroundWindow(hwnd);
+    UpdateWindow(hwnd); // force the first paint now: never show an empty frame
     m->shown = true;
     return true;
 }
@@ -780,8 +793,10 @@ void VideoSetPlaying(MediaCtx* m, bool play) {
 
 // Poll the engine: errors, duration, first frame, end-of-stream, stalls.
 // Deterministic for local files; no reliance on callback plumbing.
-void VideoPoll(MediaCtx* m) {
-    if (!m->engine || m->closing) return;
+// 100 ms loader: duration, readiness, first frame. Runs only until shown;
+// the watchdog bounds the whole wait, so a stall can never hang silently.
+void VideoPollLoad(MediaCtx* m) {
+    if (!m->engine || m->closing || m->shown) return;
     if (m->duration <= 0.0) {
         double d = m->engine->GetDuration();
         if (d > 0.0) m->duration = d;
@@ -789,33 +804,52 @@ void VideoPoll(MediaCtx* m) {
     // Ready-state values mirror HTML (HAVE_CURRENT_DATA = 2); the watchdog
     // bounds any stall regardless.
     int rs = (int)m->engine->GetReadyState();
-    if (!m->shown) {
-        if (rs >= 2 /*HAVE_CURRENT_DATA*/) {
-            DWORD nw = 0, nh = 0;
-            if (SUCCEEDED(m->engine->GetNativeVideoSize(&nw, &nh)) && nw > 0 && nh > 0) {
-                RECT area{0, 0, 960, 540};
-                WorkAreaFor(m->hwnd, area);
-                int ww = 0, wh = 0;
-                MediaFitWindow((int)nw, (int)nh, area.right - area.left,
-                               area.bottom - area.top, ww, wh);
-                if (VideoCreateSwap(m)) {
-                    SetWindowPos(m->hwnd, HWND_TOP,
-                                 (area.left + area.right - ww) / 2,
-                                 (area.top + area.bottom - wh) / 2, ww, wh,
-                                 SWP_SHOWWINDOW);
-                    SetForegroundWindow(m->hwnd);
-                    m->shown = true;
-                    KillTimer(m->hwnd, IDT_WATCHDOG);
-                    VideoSetPlaying(m, true);
-                    return;
-                }
-            }
-            MediaFail(L"This video couldn't be played on this Windows build.");
-            return;
-        }
-        return; // still loading; the watchdog bounds the wait
+    if (rs < 2) return; // still loading
+    DWORD nw = 0, nh = 0;
+    bool sized = SUCCEEDED(m->engine->GetNativeVideoSize(&nw, &nh)) &&
+                 nw > 0 && nh > 0;
+    RECT area{0, 0, 960, 540};
+    WorkAreaFor(m->hwnd, area);
+    int aw = area.right - area.left, ah = area.bottom - area.top;
+    // Initial window covers ~70% of the work area (never edge-to-edge).
+    int ww = 960, wh = 540;
+    if (sized) {
+        MediaFitWindow((int)nw, (int)nh, (aw * 7) / 10, (ah * 7) / 10, ww, wh);
+        m->sizeKnown = true;
+    } else {
+        // Size unknown yet: show at a default size and play anyway. The
+        // letterbox rect corrects itself once the size arrives (no resize,
+        // no failure just for reporting late).
+        if (ww > aw) ww = aw;
+        if (wh > ah) wh = ah;
     }
-    if (!m->playing) return;
+    if (!VideoCreateSwap(m)) {
+        MediaFail(L"This video couldn't be played on this Windows build.");
+        return;
+    }
+    SetWindowPos(m->hwnd, HWND_TOP,
+                 (area.left + area.right - ww) / 2,
+                 (area.top + area.bottom - wh) / 2, ww, wh,
+                 SWP_SHOWWINDOW);
+    SetForegroundWindow(m->hwnd);
+    m->shown = true;
+    KillTimer(m->hwnd, IDT_WATCHDOG);
+    VideoSetPlaying(m, true);
+    if (!m->playing)
+        MediaFail(L"This video couldn't be started on this Windows build.");
+}
+
+// 16 ms pump while playing: present EVERY tick (the old code only presented
+// on second changes, freezing the picture), plus end-of-stream and stall
+// bookkeeping. Pausing kills this timer; nothing runs while paused.
+void VideoPumpFrame(MediaCtx* m) {
+    if (!m->engine || m->closing || !m->playing) return;
+    if (!m->sizeKnown) {
+        DWORD nw = 0, nh = 0; // late arrival: dst rect self-corrects, no resize
+        if (SUCCEEDED(m->engine->GetNativeVideoSize(&nw, &nh)) && nw > 0 && nh > 0)
+            m->sizeKnown = true;
+    }
+    VideoPresent(m, m->controls);
     double cur = m->engine->GetCurrentTime();
     if (m->duration > 0.0 && cur >= m->duration - 0.05) {
         // End of stream: hold the last frame, show controls.
@@ -837,10 +871,7 @@ void VideoPoll(MediaCtx* m) {
         m->lastAdvanceTick = now;
     }
     int sec = (int)cur;
-    if (sec != m->lastShownSec) {
-        m->lastShownSec = sec;
-        if (m->controls) VideoPresent(m, true);
-    }
+    if (sec != m->lastShownSec) m->lastShownSec = sec; // labels read live
 }
 
 void VideoSeekTo(MediaCtx* m, double t) {
@@ -1433,8 +1464,12 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_TIMER:
-        if (w == IDT_LOAD || w == IDT_PUMP) {
-            VideoPoll(mc); // all state decisions live there; safe post-close
+        if (w == IDT_LOAD) {
+            VideoPollLoad(mc); // pre-play polling only; safe post-close
+            return 0;
+        }
+        if (w == IDT_PUMP) {
+            VideoPumpFrame(mc); // present every tick while playing
             return 0;
         }
         if (w == IDT_HIDE) {

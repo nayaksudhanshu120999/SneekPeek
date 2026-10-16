@@ -1016,7 +1016,9 @@ static void SavePaletteSnapshot() {
     g_snapshot.valid = true;
     g_snapshot.fileActive = g_fileActive;
     g_snapshot.fileDir = g_fileDir; // HidePalette() clears this: read it first
-    g_snapshot.query = GetEditText(g_hwndEdit);
+    // Arrow-mirrored text is a preview, not the query: snapshot what was
+    // actually typed (g_origQuery), so restore doesn't "filter to 1 of 1".
+    g_snapshot.query = g_navigating ? Trim(g_origQuery) : GetEditText(g_hwndEdit);
     int sel = CurrentSelection();
     g_snapshot.selIndex = sel;
     g_snapshot.selAction.clear();
@@ -1072,6 +1074,10 @@ static void RestorePalette() {
                  (WPARAM)g_snapshot.query.size(), (LPARAM)g_snapshot.query.size());
     g_changingEdit = false;
     UpdateResults();
+    // Fresh explicit state: the mirrored-text preview (if any) is gone with
+    // the saved query; selection below is explicit, not navigated-to.
+    g_navigating = false;
+    g_origQuery.clear();
     // Re-select by action string (immune to reorder); a deleted file simply
     // falls back to the default row.
     std::vector<std::wstring> actions;
@@ -2131,7 +2137,7 @@ static LRESULT CALLBACK FileBarProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         SetBkMode(dc, TRANSPARENT);
         SelectObject(dc, g_fontSub);
         SetTextColor(dc, kText);
-        RECT tr = cl; tr.left += Dpx(30); tr.right -= Dpx(10);
+        RECT tr = cl; tr.left += Dpx(34); tr.right -= Dpx(10);
         DrawTextW(dc, L"Enter/Space view \u00B7 Ctrl+Enter open \u00B7 Shift+Enter folder", -1, &tr,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         EndPaint(hwnd, &ps);
