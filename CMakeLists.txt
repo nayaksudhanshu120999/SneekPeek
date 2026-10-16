@@ -24,7 +24,7 @@ target_include_directories(SneekPeek PRIVATE src)
 
 target_link_libraries(SneekPeek PRIVATE
     user32 shell32 gdi32 advapi32 shlwapi comctl32 comdlg32 powrprof ole32 gdiplus
-    mfplat evr mfuuid
+    mfplat mf evr mfuuid
 )
 
 if(MINGW)
@@ -34,7 +34,7 @@ endif()
 
 # MSVC: delay-load rarely-used DLLs so the loader maps less at logon
 # (gdiplus paints chips, comdlg32 is Browse-only, powrprof/comctl32 load on
-# first use; the media stack — MF + EVR — maps only when a video is actually
+# first use; the media stack — MF + MFPlat — maps only when a video is actually
 # opened, and photos need no DLL at all via stb_image). Needs delayimp.lib;
 # MinGW keeps eager linking.
 if(MSVC)
@@ -45,7 +45,7 @@ if(MSVC)
         "/DELAYLOAD:powrprof.dll"
         "/DELAYLOAD:comctl32.dll"
         "/DELAYLOAD:mfplat.dll"
-        "/DELAYLOAD:evr.dll"
+        "/DELAYLOAD:mf.dll"
     )
 endif()
 

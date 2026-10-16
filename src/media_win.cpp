@@ -60,11 +60,13 @@ __pragma(warning(pop))
 // CMakeLists.txt / build.bat, but a pragma travels with the source file, so
 // a stale build file can never silently drop them (which once produced 7
 // LNK2019s plus LNK4199 on evr.dll). Duplicate references are harmless.
-// MinGW ignores this block and uses its -l flags instead.
+// MF session/topology/renderer-activate helpers live in mf.lib (mf.dll);
+// MFStartup/source-resolver live in mfplat.lib. MinGW ignores this block
+// and uses its -l flags instead.
 #pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mf.lib")
 #pragma comment(lib, "evr.lib")
 #pragma comment(lib, "mfuuid.lib")
-#pragma comment(lib, "dxgi.lib") // IID_IDXGIFactory1 for the probe only
 #endif
 
 namespace {
@@ -201,7 +203,8 @@ int MediaHardwareDecode() {
         ? (CreateDevFn)GetProcAddress(d3dLib, "D3D11CreateDevice") : nullptr;
     if (pCreateDxgi && pCreateDev) {
         IDXGIFactory1* dxgi = nullptr;
-        if (SUCCEEDED(pCreateDxgi(IID_IDXGIFactory1, (void**)&dxgi)) && dxgi) {
+        // __uuidof needs no guid lib (IID_IDXGIFactory1 would require dxguid.lib).
+        if (SUCCEEDED(pCreateDxgi(__uuidof(IDXGIFactory1), (void**)&dxgi)) && dxgi) {
             static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1,
                                                        D3D_FEATURE_LEVEL_11_0};
             for (UINT i = 0;; i++) {
@@ -445,7 +448,8 @@ bool LoadImagePath(MediaCtx* m, const std::wstring& path) {
 
 // All-or-nothing gate: a missing media DLL must degrade to an honest
 // message, never a delay-load fault (which would terminate the process).
-// stb_image needs no DLL at all; video needs the MF + EVR stack.
+// stb_image needs no DLL at all; video needs the MF (mf.dll/mfplat.dll)
+// + EVR stack.
 bool MediaStackPresent(MediaKind mk, std::wstring& err) {
     auto need = [&](const wchar_t* dll, const wchar_t* what) {
         if (MediaDllPresent(dll)) return true;
@@ -454,6 +458,7 @@ bool MediaStackPresent(MediaKind mk, std::wstring& err) {
         return false;
     };
     if (mk == MediaKind::Video) {
+        if (!need(L"mf.dll", L"Media Feature Pack")) return false;
         if (!need(L"mfplat.dll", L"Media Feature Pack")) return false;
         if (!need(L"evr.dll", L"video renderer")) return false;
     }
