@@ -260,12 +260,12 @@ inline void LoadSettingsLists(Settings& s) {
     // Up-on-empty history: recent paths, newest first. Missing/empty entries
     // are skipped so a hand-edited INI can never show dead rows.
     s.history.clear();
-    int hcount = GetPrivateProfileIntW(L"History", L"Count", 0, ini.c_str());
-    if (hcount < 0) hcount = 0;
-    if (hcount > (int)kMaxHistory) hcount = (int)kMaxHistory;
+    int histCount = GetPrivateProfileIntW(L"History", L"Count", 0, ini.c_str());
+    if (histCount < 0) histCount = 0;
+    if (histCount > (int)kMaxHistory) histCount = (int)kMaxHistory;
     {
         wchar_t key[32];
-        for (int i = 0; i < hcount; i++) {
+        for (int i = 0; i < histCount; i++) {
             swprintf_s(key, 32, L"Item%d", i);
             GetPrivateProfileStringW(L"History", key, L"", buf, 4096, ini.c_str());
             if (buf[0]) s.history.push_back(buf);
