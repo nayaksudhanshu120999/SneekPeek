@@ -173,8 +173,10 @@ int MediaHardwareDecode() {
     bool uninit = false;
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED |
                                       COINIT_DISABLE_OLE1DDE);
-    if (hr == S_OK) uninit = true;
-    else if (hr != S_FALSE && hr != RPC_E_CHANGED_MODE) return g_hwProbe;
+    // S_OK and S_FALSE are both successful initializations and both take a
+    // reference: the UI thread is usually already STA via OleInitialize.
+    if (hr == S_OK || hr == S_FALSE) uninit = true;
+    else if (hr != RPC_E_CHANGED_MODE) return g_hwProbe;
     HMODULE dxgiLib = LoadLibraryW(L"dxgi.dll");
     HMODULE d3dLib = LoadLibraryW(L"d3d11.dll");
     typedef HRESULT (WINAPI *CreateDxgiFn)(REFIID, void**);
@@ -219,8 +221,10 @@ int MediaHardwareDecode() {
 }
 
 std::wstring MediaDecodeLabel() {
+    // Capability, not proof-of-use: a capable GPU may still fall back to
+    // software for a given file. This answers "could it", not "did it".
     int hw = MediaHardwareDecode();
-    if (hw > 0) return L"Video decode: Hardware (GPU)";
+    if (hw > 0) return L"Video decode: Hardware available (GPU)";
     if (hw == 0) return L"Video decode: Software (CPU)";
     return L"Video decode: Unknown";
 }
@@ -542,8 +546,8 @@ bool MediaOpen(HINSTANCE hInst, HWND owner, int dpi, const std::wstring& path,
     m->folder = (sep == std::wstring::npos) ? L"" : path.substr(0, sep + 1);
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED |
                                       COINIT_DISABLE_OLE1DDE);
-    if (hr == S_OK) m->comInit = true;
-    else if (hr != S_FALSE && hr != RPC_E_CHANGED_MODE) {
+    if (hr == S_OK || hr == S_FALSE) m->comInit = true;
+    else if (hr != RPC_E_CHANGED_MODE) {
         err = L"Couldn't start media playback";
         delete g_m;
         g_m = nullptr;
@@ -648,22 +652,22 @@ bool VideoBuildTopology(MediaCtx* m, IMFMediaSource* src) {
         if (SUCCEEDED(sd->GetMediaTypeHandler(&handler)) && handler)
             handler->GetMajorType(&major);
         SafeRelease(handler);
-        DWORD sid = 0;
-        sd->GetStreamIdentifier(&sid);
-        IMFActivate* act = nullptr;
-        bool want = false;
-        if (major == MFMediaType_Video) {
-            want = SUCCEEDED(MFCreateVideoRendererActivate(m->hwnd, &act)) && act;
-            pd->SelectStream(sid);
-        } else if (major == MFMediaType_Audio) {
-            want = SUCCEEDED(MFCreateAudioRendererActivate(&act)) && act;
-            pd->SelectStream(sid);
-        } else {
-            pd->DeselectStream(sid); // subtitles, scripts: not rendered
-        }
-        if (!want) {
+        // SelectStream/DeselectStream take the zero-based descriptor INDEX,
+        // not the stream identifier (they usually coincide, but not by
+        // contract). Select only after the sink links successfully.
+        bool isAV = (major == MFMediaType_Video || major == MFMediaType_Audio);
+        if (!isAV) {
+            pd->DeselectStream(i); // subtitles, scripts: not rendered (best effort)
             SafeRelease(sd);
             continue;
+        }
+        IMFActivate* act = nullptr;
+        HRESULT hrAct = (major == MFMediaType_Video)
+            ? MFCreateVideoRendererActivate(m->hwnd, &act)
+            : MFCreateAudioRendererActivate(&act);
+        if (FAILED(hrAct) || !act) {
+            SafeRelease(sd);
+            return false; // no sink for a stream we must render: fail honestly
         }
         IMFTopologyNode* srcNode = nullptr;
         IMFTopologyNode* outNode = nullptr;
@@ -677,7 +681,8 @@ bool VideoBuildTopology(MediaCtx* m, IMFMediaSource* src) {
             srcNode->SetUnknown(MF_TOPONODE_STREAM_DESCRIPTOR, (IUnknown*)sd);
             outNode->SetObject(act);
             if (SUCCEEDED(topo->AddNode(srcNode)) && SUCCEEDED(topo->AddNode(outNode)) &&
-                SUCCEEDED(srcNode->ConnectOutput(0, outNode, 0)))
+                SUCCEEDED(srcNode->ConnectOutput(0, outNode, 0)) &&
+                SUCCEEDED(pd->SelectStream(i)))
                 linked = true;
         }
         SafeRelease(srcNode);
@@ -907,6 +912,87 @@ void VideoTeardown(MediaCtx* m) {
     KillTimer(m->hwnd, IDT_WATCHDOG);
 }
 
+// Diagnosable failures: every MF error carries its stage and hex code, so
+// the next failure names itself instead of hiding behind a generic message.
+static std::wstring MediaHr(HRESULT hr) {
+    wchar_t b[16];
+    swprintf_s(b, 16, L"0x%08X", (unsigned)hr);
+    return b;
+}
+
+// Best-effort container/codec identification for failure messages: open the
+// source read-only, read the first video subtype, map known GUIDs to names.
+// Anything failing here just yields "" and the generic message stands.
+static std::wstring MediaVideoCodecName(const std::wstring& path) {
+    IMFSourceResolver* resolver = nullptr;
+    if (FAILED(MFCreateSourceResolver(&resolver)) || !resolver) return L"";
+    MF_OBJECT_TYPE objType = MF_OBJECT_INVALID;
+    IUnknown* unk = nullptr;
+    HRESULT hr = resolver->CreateObjectFromURL(path.c_str(), MF_RESOLUTION_MEDIASOURCE,
+                                               NULL, &objType, &unk);
+    SafeRelease(resolver);
+    if (FAILED(hr) || !unk || objType != MF_OBJECT_MEDIASOURCE) {
+        SafeRelease(unk);
+        return L"";
+    }
+    IMFMediaSource* src = nullptr;
+    hr = unk->QueryInterface(IID_PPV_ARGS(&src));
+    SafeRelease(unk);
+    std::wstring name;
+    if (SUCCEEDED(hr) && src) {
+        IMFPresentationDescriptor* pd = nullptr;
+        if (SUCCEEDED(src->CreatePresentationDescriptor(&pd)) && pd) {
+            DWORD count = 0;
+            if (SUCCEEDED(pd->GetStreamDescriptorCount(&count))) {
+                for (DWORD i = 0; i < count && name.empty(); i++) {
+                    IMFStreamDescriptor* sd = nullptr;
+                    BOOL sel = FALSE;
+                    if (FAILED(pd->GetStreamDescriptorByIndex(i, &sel, &sd)) || !sd)
+                        continue;
+                    IMFMediaTypeHandler* handler = nullptr;
+                    GUID major = GUID_NULL;
+                    if (SUCCEEDED(sd->GetMediaTypeHandler(&handler)) && handler)
+                        handler->GetMajorType(&major);
+                    IMFMediaType* mt = nullptr;
+                    if (major == MFMediaType_Video && handler) {
+                        if (FAILED(handler->GetCurrentMediaType(&mt)) || !mt)
+                            handler->GetMediaTypeByIndex(0, &mt);
+                    }
+                    SafeRelease(handler);
+                    GUID sub = GUID_NULL;
+                    if (mt && SUCCEEDED(mt->GetGUID(MF_MT_SUBTYPE, &sub))) {
+                        if (sub == MFVideoFormat_H264) name = L"H.264";
+                        else if (sub == MFVideoFormat_H265) name = L"H.265";
+                        else if (sub == MFVideoFormat_VP80) name = L"VP8";
+                        else if (sub == MFVideoFormat_VP90) name = L"VP9";
+                        else if (sub == MFVideoFormat_AV1) name = L"AV1";
+                        else if (sub == MFVideoFormat_MP4V) name = L"MPEG-4";
+                        else if (sub == MFVideoFormat_WMV1 || sub == MFVideoFormat_WMV2 ||
+                                 sub == MFVideoFormat_WMV3 || sub == MFVideoFormat_WVC1)
+                            name = L"WMV";
+                        else if (sub == MFVideoFormat_MPEG2) name = L"MPEG-2";
+                        else if (sub == MFVideoFormat_DVSL || sub == MFVideoFormat_DVSD ||
+                                 sub == MFVideoFormat_DVHD) name = L"DV";
+                    }
+                    SafeRelease(mt);
+                    SafeRelease(sd);
+                }
+            }
+            SafeRelease(pd);
+        }
+        src->Shutdown();
+        SafeRelease(src);
+    }
+    return name;
+}
+
+// Appended when known: " [video: AV1]". Empty string when unknowable.
+static std::wstring MediaCodecSuffix(const std::wstring& path) {
+    std::wstring name = MediaVideoCodecName(path);
+    if (name.empty()) return L"";
+    return L" [video: " + name + L"]";
+}
+
 bool VideoLoad(MediaCtx* m, const std::wstring& path) {
     VideoTeardown(m);
     m->path = path;
@@ -931,27 +1017,30 @@ bool VideoLoad(MediaCtx* m, const std::wstring& path) {
     SafeRelease(resolver);
     if (FAILED(hr) || !unk || objType != MF_OBJECT_MEDIASOURCE) {
         SafeRelease(unk);
-        m->err = L"This video couldn't be opened on this Windows build "
-                 L"(missing codec — try Ctrl+Enter).";
+        m->err = L"This video couldn't be opened (" + MediaHr(hr) +
+                 L"). Try Ctrl+Enter for the default app.";
         return false;
     }
     IMFMediaSource* src = nullptr;
     hr = unk->QueryInterface(IID_PPV_ARGS(&src));
     SafeRelease(unk);
     if (FAILED(hr) || !src) {
-        m->err = L"This video couldn't be opened on this Windows build "
-                 L"(missing codec — try Ctrl+Enter).";
+        m->err = L"This video couldn't be opened (" + MediaHr(hr) +
+                 L"). Try Ctrl+Enter for the default app.";
         return false;
     }
     m->source = src; // owned from here
     if (!VideoBuildTopology(m, src)) {
-        m->err = L"This video has no playable streams on this Windows build.";
+        m->err = L"This video has no playable streams on this Windows build" +
+                 MediaCodecSuffix(path) + L". Try Ctrl+Enter for the default app.";
         return false;
     }
     // Fresh session + events per source: the teardown above shut the old
     // session down, and a shut session never plays again.
-    if (FAILED(MFCreateMediaSession(NULL, &m->session)) || !m->session) {
-        m->err = L"Couldn't start video playback on this PC.";
+    HRESULT hrSession = MFCreateMediaSession(NULL, &m->session);
+    if (FAILED(hrSession) || !m->session) {
+        m->err = L"Couldn't start video playback on this PC (" +
+                 MediaHr(hrSession) + L").";
         return false;
     }
     m->events = new (std::nothrow) SessionEvents(m->session, m->hwnd);
@@ -959,8 +1048,11 @@ bool VideoLoad(MediaCtx* m, const std::wstring& path) {
         m->err = L"Out of memory";
         return false;
     }
-    if (FAILED(m->session->SetTopology(0, m->topo))) {
-        m->err = L"This video couldn't be played on this Windows build.";
+    HRESULT hrTopo = m->session->SetTopology(0, m->topo);
+    if (FAILED(hrTopo)) {
+        m->err = L"This video couldn't be played on this Windows build (" +
+                 MediaHr(hrTopo) + L")" + MediaCodecSuffix(path) +
+                 L". Try Ctrl+Enter for the default app.";
         return false;
     }
     // Events flow from here; READY starts playback (watchdog bounds it).
@@ -980,8 +1072,10 @@ static bool OpenVideo(const std::wstring& path) {
     if (!g_mfStarted) {
         // Process-lifetime MF: started on first video open (never at boot),
         // never shut down (reopen cost would return for zero benefit).
-        if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_FULL))) {
-            m->err = L"Couldn't start video playback on this Windows build.";
+        HRESULT hrMF = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+        if (FAILED(hrMF)) {
+            m->err = L"Couldn't start video playback on this Windows build (" +
+                     MediaHr(hrMF) + L").";
             return false;
         }
         g_mfStarted = true;
@@ -1023,8 +1117,11 @@ static bool OpenVideo(const std::wstring& path) {
         ShowWindow(m->hBar, SW_SHOW);
     }
     if (!VideoLoad(m, path)) {
-        // Window exists but nothing was shown: destroy it — WM_DESTROY runs
-        // the identical restore path, so MediaOpen just reports failure.
+        // Window exists but nothing was shown: mark the failure BEFORE
+        // destroying, so WM_DESTROY reports it through MediaOnClosed instead
+        // of restoring silently. Without this flag the palette just
+        // reappears and the real error stays hidden.
+        m->failed = true;
         DestroyWindow(hwnd);
         return false;
     }
@@ -1342,7 +1439,9 @@ void OnSessionEvent(MediaCtx* m, MediaEventType type, LONG_PTR data) {
         VideoUpdateBar(m);
         return;
     case MEError:
-        MediaFail(L"This video couldn't be played on this Windows build.");
+        // data carries the event's GetStatus HRESULT (posted by Invoke).
+        MediaFail(L"This video couldn't be played on this Windows build (" +
+                  MediaHr((HRESULT)data) + L").");
         return;
     default:
         return;
