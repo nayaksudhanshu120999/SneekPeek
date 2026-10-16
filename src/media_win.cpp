@@ -28,6 +28,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
+#include <shellapi.h> // ShellExecuteW, SHFileOperationW (recycle-bin delete)
 #include <shlobj.h> // SHFileOperationW (recycle-bin delete)
 #include <dwmapi.h> // MARGINS struct only (dwmapi.dll loaded dynamically)
 #include <d3d11.h>  // hardware-decode probe types only (dynamic load, no link)
@@ -693,18 +694,21 @@ bool VideoBuildTopology(MediaCtx* m, IMFMediaSource* src) {
 
 void VideoTrackClock(MediaCtx* m) {
     // Snapshot the clock base for position(). Called after every Start.
+    // IMFClock has no GetTime; position reads go through GetCorrelatedTime.
     SafeRelease(m->clock);
     if (m->session) m->session->GetClock(&m->clock);
     if (m->clock) {
         LONGLONG t = 0;
-        if (SUCCEEDED(m->clock->GetTime(&t))) m->segClock = t;
+        MFTIME sys = 0;
+        if (SUCCEEDED(m->clock->GetCorrelatedTime(0, &t, &sys))) m->segClock = t;
     }
 }
 
 double VideoPosition(MediaCtx* m) {
     if (!m->clock || !m->playing) return m->segPos; // frozen while paused
     LONGLONG t = 0;
-    if (FAILED(m->clock->GetTime(&t))) return m->segPos;
+    MFTIME sys = 0;
+    if (FAILED(m->clock->GetCorrelatedTime(0, &t, &sys))) return m->segPos;
     double p = m->segPos + (double)(t - m->segClock) / 10000000.0;
     if (p < 0.0) p = 0.0;
     if (m->duration > 0.0 && p > m->duration) p = m->duration;
@@ -959,7 +963,8 @@ bool VideoLoad(MediaCtx* m, const std::wstring& path) {
         return false;
     }
     // Events flow from here; READY starts playback (watchdog bounds it).
-    m->events->BeginGetEvent(m->events, NULL);
+    // NOTE: BeginGetEvent lives on the session, not the callback object.
+    m->session->BeginGetEvent(m->events, NULL);
     SetTimer(m->hwnd, IDT_WATCHDOG, 10000, NULL);
     return true;
 }
