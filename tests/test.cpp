@@ -510,6 +510,8 @@ int main() {
         CHECK(ClassifyMedia(L"C:\\p\\noext") == MediaKind::None);
         CHECK(ClassifyMedia(L"C:\\p\\a.") == MediaKind::None);
         CHECK(MediaExt(L"C:\\p\\A.JPG") == L"jpg");
+        CHECK(MediaExt(L"C:\\p\\photo.jpg ") == L"jpg"); // trailing space
+        CHECK(MediaExt(L"C:\\p\\photo. ") == L""); // stripped to no ext
         CHECK(MediaExt(L"noext") == L"");
     }
     // media.h: snapshot round-trip + row lookup by action

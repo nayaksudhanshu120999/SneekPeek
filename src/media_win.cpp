@@ -185,7 +185,8 @@ bool DecodeImageAt(const std::wstring& path, int maxW, int maxH, int turns,
                                                  WICDecodeMetadataCacheOnDemand, &dec)) && dec &&
         SUCCEEDED(dec->GetFrame(0, &frame)) && frame) {
         UINT nw = 0, nh = 0;
-        if (SUCCEEDED(frame->GetSize(&nw, &nh)) && nw > 0 && nh > 0) {
+        if (SUCCEEDED(frame->GetSize(&nw, &nh)) && nw > 0 && nh > 0 &&
+            nw <= 16384 && nh <= 16384) { // sanity: no OOM/overflow below
             double s = 1.0;
             if (maxW > 0 && maxH > 0) {
                 double sx = (double)maxW / (double)nw;
@@ -197,12 +198,19 @@ bool DecodeImageAt(const std::wstring& path, int maxW, int maxH, int turns,
             if (dw < 1) dw = 1;
             if (dh < 1) dh = 1;
             IWICBitmapSource* src = frame;
-            int tw = ((turns & 1) ? dh : dw), th = ((turns & 1) ? dw : dh);
+            // Scaler failure must fall back to NATIVE dims, never to a size
+            // mismatch: decoding native pixels into a smaller buffer would
+            // over-read the heap and paint garbage.
+            UINT sw = nw, sh = nh;
             if (SUCCEEDED(fac->CreateBitmapScaler(&scaler)) && scaler &&
                 SUCCEEDED(scaler->Initialize(frame, dw, dh,
                                              WICBitmapInterpolationModeFant))) {
                 src = scaler;
+                sw = dw;
+                sh = dh;
             }
+            int tw = (int)(((turns & 1) ? sh : sw));
+            int th = (int)(((turns & 1) ? sw : sh));
             if (turns & 3) {
                 WICBitmapTransformOptions opt = WICBitmapTransformRotate0;
                 int t = ((turns % 4) + 4) % 4;
@@ -357,6 +365,26 @@ static void MediaFail(const std::wstring& err) {
 static bool OpenImage(const std::wstring& path);
 static bool OpenVideo(const std::wstring& path);
 
+// All-or-nothing gate: a missing media DLL must degrade to an honest
+// message, never a delay-load fault (which would terminate the process).
+static bool MediaStackPresent(MediaKind mk, std::wstring& err) {
+    auto need = [&](const wchar_t* dll, const wchar_t* what) {
+        if (MediaDllPresent(dll)) return true;
+        err = std::wstring(L"Couldn't open this file (") + what +
+              L" missing on this Windows build).";
+        return false;
+    };
+    if (!need(L"windowscodecs.dll", L"image support")) return false;
+    if (mk == MediaKind::Video) {
+        if (!need(L"mfplat.dll", L"Media Feature Pack")) return false;
+        if (!need(L"d3d11.dll", L"video device support")) return false;
+        if (!need(L"dxgi.dll", L"video device support")) return false;
+        if (!need(L"d2d1.dll", L"video overlay support")) return false;
+        if (!need(L"dwrite.dll", L"video overlay support")) return false;
+    }
+    return true;
+}
+
 bool MediaOpen(HINSTANCE hInst, HWND owner, int dpi, const std::wstring& path,
                std::wstring& err) {
     (void)owner; // top-level window; kept in the signature for future use
@@ -370,11 +398,7 @@ bool MediaOpen(HINSTANCE hInst, HWND owner, int dpi, const std::wstring& path,
               L"Ctrl+Enter opens the default app.";
         return false;
     }
-    if (mk == MediaKind::Video && !MediaDllPresent(L"mfplat.dll")) {
-        err = L"Video playback isn't available on this Windows build "
-              L"(Media Feature Pack missing).";
-        return false;
-    }
+    if (!MediaStackPresent(mk, err)) return false;
     MediaCtx* m = new (std::nothrow) MediaCtx();
     if (!m) {
         err = L"Out of memory";

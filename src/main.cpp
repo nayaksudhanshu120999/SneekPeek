@@ -1107,10 +1107,14 @@ static void OpenMediaViewer(const std::wstring& path) {
     if (!MediaOpen(g_hInst, g_hwndPalette, g_dpi, path, err) && g_mediaActive) {
         // Windowless failure only (nothing was ever shown): restore here. A
         // windowed failure already restored via MediaOnClosed (WM_DESTROY),
-        // which clears g_mediaActive — restoring twice would balloon twice.
+        // which clears g_mediaActive — restoring twice would report twice.
         g_mediaActive = false;
-        NotifyLaunchFailed(err.empty() ? L"Couldn't open this file" : err.c_str());
         RestorePalette();
+        // Modal box, not a tray balloon: balloons can be swallowed by Focus
+        // Assist; a failed open must be unmissable (it names the stage).
+        MessageBoxW(g_hwndPalette,
+                    err.empty() ? L"Couldn't open this file" : err.c_str(),
+                    L"SneekPeek", MB_OK | MB_ICONWARNING);
     }
 }
 
@@ -1119,9 +1123,11 @@ static void OpenMediaViewer(const std::wstring& path) {
 void MediaOnClosed(bool failed, const std::wstring& err) {
     if (g_quitting.load()) { g_mediaActive = false; return; } // exiting: no restore
     g_mediaActive = false;
-    if (failed)
-        NotifyLaunchFailed(err.empty() ? L"Couldn't play this file" : err.c_str());
     RestorePalette();
+    if (failed)
+        MessageBoxW(g_hwndPalette,
+                    err.empty() ? L"Couldn't play this file" : err.c_str(),
+                    L"SneekPeek", MB_OK | MB_ICONWARNING);
 }
 
 // ------------------------------------------------------- file grid metrics

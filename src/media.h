@@ -18,14 +18,19 @@
 
 enum class MediaKind { None, Image, Video, Unsupported };
 
-// Lowercase extension without the dot ("" when none). Pure, unit-tested.
+// Lowercase extension without the dot ("" when none). Trailing spaces/dots
+// are stripped first: a name like "photo.jpg " (legal from zips/macOS)
+// must still classify as jpeg, or it falls through to the default app.
+// Pure, unit-tested.
 inline std::wstring MediaExt(const std::wstring& path) {
-    size_t sep = path.find_last_of(L"\\/");
-    size_t dot = path.find_last_of(L'.');
+    std::wstring p = path;
+    while (!p.empty() && (p.back() == L' ' || p.back() == L'.')) p.pop_back();
+    size_t sep = p.find_last_of(L"\\/");
+    size_t dot = p.find_last_of(L'.');
     if (dot == std::wstring::npos) return L"";
     if (sep != std::wstring::npos && dot < sep) return L"";
-    if (dot + 1 >= path.size()) return L"";
-    std::wstring e = path.substr(dot + 1);
+    if (dot + 1 >= p.size()) return L"";
+    std::wstring e = p.substr(dot + 1);
     for (auto& c : e) c = (wchar_t)towlower(c);
     return e;
 }

@@ -38,7 +38,7 @@ No FFmpeg, no codecs shipped — Windows already has them. Images decode via WIC
 
 - In file mode, `Enter`/`Space` on an image or video hides the palette and opens the frameless viewer (no title bar, no border, no taskbar button; resizable, `Win+←/→` snap works, opens at ~70% of the work area — small images still 1:1). Closing (`Esc` or click-outside) restores the palette with the exact same folder, typed query, selection, scroll and window position.
 - `Ctrl+Space` while media is open brings the palette up above it (media stays); closing media afterwards restores the snapshot.
-- Formats without an in-box codec on your Windows build (HEIC/WebP/AVIF on Win10, AV1 on old GPUs, N editions without Media Feature Pack) report a tray balloon instead of a black window — `Ctrl+Enter` opens the default app.
+- Formats without an in-box codec on your Windows build (HEIC/WebP/AVIF on Win10, AV1 on old GPUs, N editions without Media Feature Pack) show a message instead of a black window — `Ctrl+Enter` opens the default app.
 
 | Keys | Images | Video |
 |---|---|---|
