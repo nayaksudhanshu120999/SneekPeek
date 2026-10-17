@@ -25,6 +25,9 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure -C Release
+
       - name: Upload exe
         uses: actions/upload-artifact@v4
         with:
