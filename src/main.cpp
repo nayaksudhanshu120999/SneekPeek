@@ -130,7 +130,7 @@ enum {
     IDC_BANG_RESET = 119,
     IDC_QUICK_LIST = 120, IDC_QUICK_NAME = 121, IDC_QUICK_URL = 122,
     IDC_QUICK_ADD = 123, IDC_QUICK_UPDATE = 124, IDC_QUICK_DEL = 125,
-    IDC_SAVE = 201, IDC_RESCAN = 202, IDC_CLOSE = 203,
+    IDC_RESCAN = 202, IDC_CLOSE = 203,
     IDC_VIEW_LIST = 204, IDC_VIEW_GRID = 205,
     IDC_ROWS_DEC = 206, IDC_ROWS_INC = 207,
     IDC_COLS_DEC = 208, IDC_COLS_INC = 209,
@@ -593,15 +593,19 @@ static void BuildIndexAsync(bool full) {
     bool pathExes = g_settings.includePathExes; // captured on the UI thread
     g_indexThread = std::thread([pathExes, full]{
         SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
-        std::vector<AppEntry> fresh;
-        BuildAppIndex(fresh, pathExes, &g_indexStop, /*skipHeavy=*/!full);
-        if (!g_indexStop.load()) {
-            auto* old = g_pendingIndex.exchange(
-                new std::vector<AppEntry>(std::move(fresh)));
-            delete old; // drop a superseded pending index, if any
-            if (g_hwndPalette) PostMessageW(g_hwndPalette, WM_APP_INDEX, 0, 0);
+        try {
+            std::vector<AppEntry> fresh;
+            BuildAppIndex(fresh, pathExes, &g_indexStop, /*skipHeavy=*/!full);
+            if (!g_indexStop.load()) {
+                auto* old = g_pendingIndex.exchange(
+                    new std::vector<AppEntry>(std::move(fresh)));
+                delete old; // drop a superseded pending index, if any
+                if (g_hwndPalette) PostMessageW(g_hwndPalette, WM_APP_INDEX, 0, 0);
+            }
+        } catch (...) {
+            // Allocation failure (OOM) or any exception: publish nothing and
+            // always release the indexing flag so future scans aren't blocked.
         }
-        // Stopped: drop results silently instead of publishing mid-shutdown.
         g_indexing.store(false);
         SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
     });
@@ -1002,9 +1006,22 @@ static void UpdateFileResults(const std::wstring& filter) {
     for (const auto& e : entries) {
         if (FileMatchesFilter(FileLower(e.name), fl)) kept.push_back(e);
     }
-    SortFileEntries(kept, fl);
-    size_t shown = kept.size() < kMaxFileList ? kept.size() : kMaxFileList;
+    // Rank + cap: never fully sort more than kMaxFileList entries per
+    // keystroke, so huge folders (System32, etc.) can't stall typing.
+    // Folders first, then best fuzzy match first, then Explorer order.
+    auto fileLess = [&](const FileEntry& a, const FileEntry& b) {
+        if (a.isDir != b.isDir) return a.isDir > b.isDir;
+        return RankedNameLess(FileLower(a.name), FileLower(b.name), fl,
+                              a.name, b.name);
+    };
     bool listCapped = kept.size() > kMaxFileList;
+    if (listCapped)
+        std::partial_sort(kept.begin(), kept.begin() + kMaxFileList, kept.end(),
+                          fileLess);
+    else
+        std::sort(kept.begin(), kept.end(), fileLess);
+    kept.resize(std::min(kept.size(), kMaxFileList));
+    size_t shown = kept.size();
     std::wstring head;
     if (truncated) {
         wchar_t b[512];
@@ -3657,6 +3674,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         break;
     }
     case WM_HOTKEY:
+        if (g_hexOpen) return 0; // color-picker modal: don't toggle the palette
         if (w == HOTKEY_ID) {
             if (IsWindowVisible(hwnd)) HidePalette();
             else ShowPalette();
@@ -3721,7 +3739,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             g_startupDeferredArmed = false;
             // Single light refresh after boot settles. Skipped if the user
             // already triggered a scan (hotkey cache-miss / manual refresh).
-            if (!g_quitting.load() && !g_indexing.load() && g_indexReady.load())
+            if (!g_quitting.load() && !g_indexing.load())
                 BuildIndexAsync(false);
             break;
         }
@@ -4630,12 +4648,11 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         SelectObject(dc, g_fontUI);
         bool pressed = (d->itemState & ODS_SELECTED) != 0;
         bool focus = (d->itemState & ODS_FOCUS) != 0;
-        bool isSave = d->CtlID == (UINT)IDC_SAVE;
         bool isPage = d->CtlID >= (UINT)IDC_PAGE_0 && d->CtlID <= (UINT)IDC_PAGE_5;
         bool pageSel = isPage && (int)(d->CtlID - (UINT)IDC_PAGE_0) == g_settingsPage;
         bool isView = d->CtlID == (UINT)IDC_VIEW_LIST || d->CtlID == (UINT)IDC_VIEW_GRID;
         bool viewSel = isView && ((d->CtlID == (UINT)IDC_VIEW_GRID) == g_settings.fileGrid);
-        bool accent = isSave || pageSel || viewSel;
+        bool accent = pageSel || viewSel;
         FillRect(dc, &d->rcItem, g_brBg);
         COLORREF fill = accent ? (pressed ? kBtnSelHot : kBtnSel)
                                : (pressed ? kBtnFillHot : kBtnFill);
@@ -4793,7 +4810,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             if (sel == count - 1 && count > 1) { // "Browse..."
                 std::wstring picked;
                 if (BrowseForBrowser(hwnd, picked)) {
-                    g_browsers.push_back({ExeFileName(picked), picked});
+                    AddBrowserIfExists(g_browsers, ExeFileName(picked), picked);
                     SendMessageW(g_hwndBrowserCombo, CB_INSERTSTRING, count - 1,
                                  (LPARAM)g_browsers.back().name.c_str());
                     SendMessageW(g_hwndBrowserCombo, CB_SETCURSEL, count - 1, 0);
@@ -4805,7 +4822,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         } else if (id == IDC_BROWSER_BROWSE) {
             std::wstring picked;
             if (BrowseForBrowser(hwnd, picked)) {
-                g_browsers.push_back({ExeFileName(picked), picked});
+                AddBrowserIfExists(g_browsers, ExeFileName(picked), picked);
                 int count = (int)SendMessageW(g_hwndBrowserCombo, CB_GETCOUNT, 0, 0);
                 SendMessageW(g_hwndBrowserCombo, CB_INSERTSTRING, count - 1,
                              (LPARAM)g_browsers.back().name.c_str());
@@ -5063,16 +5080,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     }
     AddTrayIcon(g_hwndPalette);
 
-    if (launchedAtStartup && cacheLoaded) {
-        // Startup + warm cache: serve everything from cache, do zero scan
-        // work inside the startup window. One light refresh (no PowerShell
-        // child) fires after boot settles; the WM_TIMER handler skips it if
-        // the user already triggered a scan meanwhile.
+    if (launchedAtStartup) {
+        // Boot: never scan inside Windows' startup measurement window. Serve
+        // from the disk cache (empty results are fine on first run) and run a
+        // single light refresh after boot settles. A cold cache is populated
+        // on the user's first Ctrl+Space instead of at logon.
         SetTimer(g_hwndPalette, IDT_DEFERRED_REFRESH, DEFERRED_REFRESH_MS, NULL);
         g_startupDeferredArmed = true;
-    } else {
-        // Interactive launch, or cold cache: full scan now so the first
-        // Ctrl+Space is complete. Manual Refresh / F5 always use this path.
+    } else if (!cacheLoaded) {
+        // Manual launch, cold cache: scan now so the first Ctrl+Space is
+        // complete. Warm cache means the index is already ready.
         BuildIndexAsync(true);
     }
 
