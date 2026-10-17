@@ -180,11 +180,15 @@ inline std::wstring ExpandUrl(const std::wstring& tmpl, const std::wstring& enco
 // Domain-shaped input (google.com, not "weather today") opens directly,
 // like a browser address bar. No spaces; scheme optional (https assumed).
 // Pure string logic (uses BangLower above) so unit tests cover it.
-inline bool IsUrlLike(const std::wstring& q, std::wstring& outUrl) {
+//
+// The scheme probe is the only part that needs lowercase, so the bulk of the
+// work runs on the caller's `q` unchanged. IsUrlLikeLower lets the palette
+// hand over the query lowercased once per keystroke.
+inline bool IsUrlLikeLower(const std::wstring& q, const std::wstring& qlower,
+                           std::wstring& outUrl) {
     if (q.empty()) return false;
     if (q.find_first_of(L" \t\r\n") != std::wstring::npos) return false;
-    std::wstring low = BangLower(q);
-    if (low.compare(0, 7, L"http://") == 0 || low.compare(0, 8, L"https://") == 0) {
+    if (qlower.compare(0, 7, L"http://") == 0 || qlower.compare(0, 8, L"https://") == 0) {
         outUrl = q;
         return true;
     }
@@ -211,6 +215,10 @@ inline bool IsUrlLike(const std::wstring& q, std::wstring& outUrl) {
     }
     outUrl = L"https://" + q;
     return true;
+}
+
+inline bool IsUrlLike(const std::wstring& q, std::wstring& outUrl) {
+    return IsUrlLikeLower(q, BangLower(q), outUrl);
 }
 
 // Only plain web schemes survive: no file://, javascript:, data:, and no

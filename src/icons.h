@@ -7,6 +7,8 @@
 // saturated body, light top gloss, bright crest line. Mapping helpers are
 // pure and unit-tested.
 #include <windows.h>
+#include <cwctype> // towlower in FileGlyphFor
+#include <cwchar>   // _wcsnicmp in FileGlyphFor
 #include <string>
 #include "results.h"
 #include "files.h"
@@ -143,9 +145,21 @@ inline FileGlyph FileGlyphFor(const std::wstring& name, bool isDir) {
     size_t dot = name.find_last_of(L'.');
     if (dot == std::wstring::npos || dot + 1 >= name.size())
         return {GlyphStyle::FilePage, RGB(96, 165, 250)};
-    std::wstring ext = FileLower(name.substr(dot + 1));
-    for (size_t i = 0; i < sizeof(kExtTable) / sizeof(kExtTable[0]); i++)
-        if (ext == kExtTable[i].ext) return {kExtTable[i].style, kExtTable[i].color};
+    // Match the extension in place. This runs per row/tile per repaint, and the
+    // previous substr + FileLower allocated two strings on every call just to
+    // compare against the table.
+    const wchar_t* ext = name.c_str() + dot + 1;
+    size_t extLen = name.size() - (dot + 1);
+    for (size_t i = 0; i < sizeof(kExtTable) / sizeof(kExtTable[0]); i++) {
+        const wchar_t* cand = kExtTable[i].ext;
+        // Cheap reject on the first character (table entries are lowercase).
+        if (towlower((wchar_t)ext[0]) != cand[0]) continue;
+        size_t n = 0;
+        while (cand[n]) n++;
+        if (n != extLen) continue;
+        if (_wcsnicmp(cand, ext, n) == 0)
+            return {kExtTable[i].style, kExtTable[i].color};
+    }
     return {GlyphStyle::FilePage, RGB(96, 165, 250)};
 }
 
@@ -168,74 +182,143 @@ inline FileGlyph GlyphForResult(ResultKind kind, const std::wstring& title,
 }
 
 // ------------------------------------------------------- tiny GDI helpers
+// Every primitive below used to CreatePen / CreateSolidBrush, SelectObject and
+// DeleteObject on each call. PaintGlyph issues a dozen primitives for some
+// glyph styles (the Code glyph alone is ten lines), so a 9-row file list
+// churned ~90 GDI objects on every repaint - and the grid repaints on every
+// hover move. The objects are memoized by (color, width) instead. Colors are
+// baked into the created objects and never re-read, so an entry can only go
+// stale if its handle were deleted behind the cache's back, which nothing does.
+// ReleaseGlyphGdi() frees them on theme change and at teardown.
+//
+// Thread note: both caches are function-local statics with no locking. Painting
+// happens only on the UI thread (the palette, its children, and Settings), and
+// ReleaseGlyphGdi() is called from the UI thread too, so there is no concurrent
+// access. A future background painter would need a lock here.
+//
+// Lookup is a small linear scan, and there are always misses: one theme has
+// ~9 colors x 3 pen widths, so PaintGlyph asks for (color, width) pairs that
+// were never memoized on its first call after any theme change. ~12 compares
+// per primitive is far cheaper than CreatePen/CreateSolidBrush + DeleteObject,
+// which is what each miss used to cost. Once the cache is warm the scan still
+// starts at slot 0 and hits early.
+struct GlyphGdiCache {
+    static const int kSlots = 64; // palette is ~9 colors x 3 widths: never fills
+    struct PenKey { COLORREF col; int width; };
+    PenKey pKey[kSlots];
+    HPEN pVal[kSlots];
+    int pNext;
+    COLORREF bKey[kSlots];
+    HBRUSH bVal[kSlots];
+    int bNext;
+    GlyphGdiCache() : pNext(0), bNext(0) {
+        for (int i = 0; i < kSlots; i++) { pVal[i] = NULL; bVal[i] = NULL; }
+    }
+};
+inline GlyphGdiCache& GlyphGdi() {
+    static GlyphGdiCache c;
+    return c;
+}
+inline HPEN CachedPen(COLORREF c, int w) {
+    GlyphGdiCache& g = GlyphGdi();
+    for (int i = 0; i < GlyphGdiCache::kSlots; i++)
+        if (g.pVal[i] && g.pKey[i].col == c && g.pKey[i].width == w)
+            return g.pVal[i];
+    int slot = g.pNext++ % GlyphGdiCache::kSlots;
+    if (g.pVal[slot]) DeleteObject(g.pVal[slot]);
+    g.pVal[slot] = CreatePen(PS_SOLID, w, c);
+    g.pKey[slot].col = c;
+    g.pKey[slot].width = w;
+    return g.pVal[slot];
+}
+inline HBRUSH CachedBrush(COLORREF c) {
+    GlyphGdiCache& g = GlyphGdi();
+    for (int i = 0; i < GlyphGdiCache::kSlots; i++)
+        if (g.bVal[i] && g.bKey[i] == c) return g.bVal[i];
+    int slot = g.bNext++ % GlyphGdiCache::kSlots;
+    if (g.bVal[slot]) DeleteObject(g.bVal[slot]);
+    g.bVal[slot] = CreateSolidBrush(c);
+    g.bKey[slot] = c;
+    return g.bVal[slot];
+}
+// Free every cached GDI object. Call once at shutdown, and after any theme
+// change (colors are baked into the objects, so a stale entry would keep
+// painting the old color).
+inline void ReleaseGlyphGdi() {
+    GlyphGdiCache& g = GlyphGdi();
+    for (int i = 0; i < GlyphGdiCache::kSlots; i++) {
+        if (g.pVal[i]) DeleteObject(g.pVal[i]);
+        if (g.bVal[i]) DeleteObject(g.bVal[i]);
+        g.pVal[i] = NULL;
+        g.bVal[i] = NULL;
+        g.pKey[i].col = 0;
+        g.pKey[i].width = 0;
+        g.bKey[i] = 0;
+    }
+    g.pNext = 0;
+    g.bNext = 0;
+}
+
 inline void GlyphLine(HDC dc, int x1, int y1, int x2, int y2, int w, COLORREF c) {
-    HPEN p = CreatePen(PS_SOLID, w, c);
+    HPEN p = CachedPen(c, w);
     HGDIOBJ o = SelectObject(dc, p);
     MoveToEx(dc, x1, y1, NULL);
     LineTo(dc, x2, y2);
     SelectObject(dc, o);
-    DeleteObject(p);
 }
 inline void GlyphFillRect(HDC dc, int l, int t, int r, int b, COLORREF c) {
-    HBRUSH h = CreateSolidBrush(c);
+    HBRUSH h = CachedBrush(c);
     RECT rc{l, t, r, b};
     FillRect(dc, &rc, h);
-    DeleteObject(h);
 }
 inline void GlyphFrameRect(HDC dc, int l, int t, int r, int b, int w, COLORREF c) {
-    HPEN p = CreatePen(PS_SOLID, w, c);
+    HPEN p = CachedPen(c, w);
     HGDIOBJ o = SelectObject(dc, p);
     HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
     Rectangle(dc, l, t, r, b);
     SelectObject(dc, ob);
     SelectObject(dc, o);
-    DeleteObject(p);
 }
 inline void GlyphFillRound(HDC dc, int l, int t, int r, int b, int e, COLORREF c) {
-    HBRUSH h = CreateSolidBrush(c);
+    HBRUSH h = CachedBrush(c);
     HGDIOBJ o = SelectObject(dc, h);
     HGDIOBJ op = SelectObject(dc, GetStockObject(NULL_PEN));
     RoundRect(dc, l, t, r, b, e, e);
     SelectObject(dc, op);
     SelectObject(dc, o);
-    DeleteObject(h);
 }
 inline void GlyphFillEllipse(HDC dc, int l, int t, int r, int b, COLORREF c) {
-    HBRUSH h = CreateSolidBrush(c);
+    HBRUSH h = CachedBrush(c);
     HGDIOBJ o = SelectObject(dc, h);
     HGDIOBJ op = SelectObject(dc, GetStockObject(NULL_PEN));
     Ellipse(dc, l, t, r, b);
     SelectObject(dc, op);
     SelectObject(dc, o);
-    DeleteObject(h);
 }
 inline void GlyphFrameEllipse(HDC dc, int l, int t, int r, int b, int w, COLORREF c) {
-    HPEN p = CreatePen(PS_SOLID, w, c);
+    HPEN p = CachedPen(c, w);
     HGDIOBJ o = SelectObject(dc, p);
     HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
     Ellipse(dc, l, t, r, b);
     SelectObject(dc, ob);
     SelectObject(dc, o);
-    DeleteObject(p);
 }
 inline void GlyphFillPoly(HDC dc, POINT* pts, int n, COLORREF c) {
-    HBRUSH h = CreateSolidBrush(c);
+    HBRUSH h = CachedBrush(c);
     HGDIOBJ o = SelectObject(dc, h);
     HGDIOBJ op = SelectObject(dc, GetStockObject(NULL_PEN));
     Polygon(dc, pts, n);
     SelectObject(dc, op);
     SelectObject(dc, o);
-    DeleteObject(h);
 }
 inline void GlyphArc(HDC dc, int l, int t, int r, int b,
                      int x1, int y1, int x2, int y2, int w, COLORREF c) {
-    HPEN p = CreatePen(PS_SOLID, w, c);
+    HPEN p = CachedPen(c, w);
     HGDIOBJ o = SelectObject(dc, p);
     HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
     Arc(dc, l, t, r, b, x1, y1, x2, y2);
     SelectObject(dc, ob);
     SelectObject(dc, o);
-    DeleteObject(p);
 }
 
 // ------------------------------------------------------- rounded 3D language

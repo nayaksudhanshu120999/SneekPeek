@@ -35,6 +35,9 @@
 #include <cwctype>
 #include <cmath>
 #include <cstdio>
+#include <cstddef>
+#include <cstring> // memcpy in the tile ellipsis probe
+#include <new>     // std::nothrow
 #include <wchar.h>
 #include <string>
 #include <vector>
@@ -44,7 +47,7 @@
 #include <algorithm>
 #include <thread>
 #include <atomic>
-#include <algorithm>
+#include <utility> // std::move in the hot result/file paths
 
 #include "app_index.h"
 #include "bangs.h"
@@ -200,19 +203,35 @@ static COLORREF ChipFill(COLORREF c) {
     return lum > 170 ? Darken(c, 55) : c;
 }
 // Antialiased stadium pill (GDI shapes are jagged; GDI+ is not).
+// Held for the duration of one paint pass: constructing a Gdiplus::Graphics
+// saves/restores HDC state, and the chip row paints up to four pills per
+// WM_PAINT (once per keystroke while chips are visible), so one Graphics per
+// pass instead of one per pill. Lifetime is strictly bounded by the paint.
+struct PillPainter {
+    Gdiplus::Graphics* g;
+    explicit PillPainter(HDC dc) : g(new (std::nothrow) Gdiplus::Graphics(dc)) {
+        if (g) g->SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    }
+    ~PillPainter() { delete g; }
+    PillPainter(const PillPainter&) = delete;
+    PillPainter& operator=(const PillPainter&) = delete;
+    void Fill(const RECT& r, COLORREF col) {
+        if (!g) return;
+        int d = r.bottom - r.top;
+        if (d < 8) d = 8;
+        if (r.right - r.left < d) return;
+        Gdiplus::GraphicsPath path;
+        path.AddArc(r.left, r.top, d, d, 90.0f, 180.0f);
+        path.AddArc(r.right - d, r.top, d, d, 270.0f, 180.0f);
+        path.CloseFigure();
+        Gdiplus::SolidBrush br(Gdiplus::Color(255, GetRValue(col),
+                                              GetGValue(col), GetBValue(col)));
+        g->FillPath(&br, &path);
+    }
+};
 static void FillPill(HDC dc, const RECT& r, COLORREF col) {
-    int d = r.bottom - r.top;
-    if (d < 8) d = 8;
-    if (r.right - r.left < d) return;
-    Gdiplus::Graphics g(dc);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    Gdiplus::GraphicsPath path;
-    path.AddArc(r.left, r.top, d, d, 90.0f, 180.0f);
-    path.AddArc(r.right - d, r.top, d, d, 270.0f, 180.0f);
-    path.CloseFigure();
-    Gdiplus::SolidBrush br(Gdiplus::Color(255, GetRValue(col),
-                                          GetGValue(col), GetBValue(col)));
-    g.FillPath(&br, &path);
+    PillPainter p(dc);
+    p.Fill(r, col);
 }
 
 // Calculator lives in calc.h (shared with the unit tests).
@@ -233,6 +252,10 @@ static int         g_bangChipW = 0;  // 0 = hidden
 // Hover preview row (results index, -1 = none): painted as a subtle fill,
 // never touches selection or the multi-set.
 static int         g_hoverRow = -1;
+// Hover fill brush + the theme color it was built for (theme-derived: a theme
+// change must drop it, see ApplyThemeFromSettings).
+static HBRUSH      g_hoverBrush = NULL;
+static COLORREF    g_hoverBrushFor = (COLORREF)-1;
 static bool        g_hexOpen = false; // color-picker modal loop guard
 static HWND        g_hwndSettings = NULL;
 static int         g_settingsPage = 0;
@@ -492,6 +515,11 @@ static void ApplyThemeFromSettings() {
     kDanger = t.danger;
     kPowers[0].color = t.powdown; kPowers[1].color = t.powreboot;
     kPowers[2].color = t.powsleep; kPowers[3].color = t.powhib;
+    // Theme-derived paint resources: glyph pens/brushes and the hover fill
+    // bake their colors into the handles, so a theme change must drop them or
+    // they keep painting the previous palette.
+    ReleaseGlyphGdi();
+    ReleaseHoverBrush();
     if (g_brBg) DeleteObject(g_brBg);
     if (g_brInput) DeleteObject(g_brInput);
     if (g_brSel) DeleteObject(g_brSel);
@@ -538,9 +566,14 @@ static void RemoveTrayIcon(HWND hwnd);
 static void ShowTrayMenu(HWND hwnd);
 static void OpenSettings();
 static void CloseSettings();
+static void SaveNow();
 static void OnTrayCommand(UINT id);
+// Drop the theme-derived hover-fill brush. Defined with the painters further
+// down; declared here because ApplyThemeFromSettings and teardown both call it
+// before that point in the file.
+static void ReleaseHoverBrush();
 static void RebuildHiddenSet();
-static bool IsHiddenApp(const std::wstring& name);
+static bool IsHiddenAppLower(const std::wstring& nameLower);
 static void ActivateBang(int idx, const std::wstring& query);
 static void DeactivateBang();
 static bool InFileMode();
@@ -558,7 +591,6 @@ static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
                                      UINT_PTR id, DWORD_PTR ref);
 static void CloseCellEdit(bool commit);
 static void ApplyAwake();
-static void SaveNow();
 static void ApplyUIFont(HWND parent);
 static void NotifyLaunchFailed(const wchar_t* msg);
 static int MoveSelNoWrap(int from, int dir);
@@ -617,8 +649,11 @@ static void RebuildHiddenSet() {
     for (const auto& n : g_settings.hiddenApps)
         g_hidden.insert(BangLower(BangTrim(n)));
 }
-static bool IsHiddenApp(const std::wstring& name) {
-    return g_hidden.find(ToLower(name)) != g_hidden.end();
+// `nameLower` must already be lowercase. AppEntry caches it, and g_hidden
+// holds lowercased keys, so this needs no per-app temporary copy (the previous
+// ToLower-by-value allocated one string for every indexed app).
+static bool IsHiddenAppLower(const std::wstring& nameLower) {
+    return g_hidden.find(nameLower) != g_hidden.end();
 }
 
 // Refill the Hidden-apps checklist after a background index finishes,
@@ -648,14 +683,23 @@ static void LoadAppIcons() {
 // ------------------------------------------------------- rounded corners
 // Win11 native rounding via DWM (dynamically loaded, ignored on older OS)
 // + round-rect window region fallback so Win10 gets rounded corners too.
+//
+// dwmapi.dll is resolved once for the process and deliberately never freed.
+// Both call sites used to LoadLibrary + GetProcAddress + FreeLibrary on every
+// invocation, so EnableRoundCorners did that on every single Ctrl+Space.
+typedef HRESULT (WINAPI *FnDwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
+static FnDwmSetWindowAttribute DwmSetWindowAttribute() {
+    static FnDwmSetWindowAttribute fn = [] {
+        HMODULE d = LoadLibraryW(L"dwmapi.dll");
+        if (!d) return (FnDwmSetWindowAttribute)NULL;
+        return (FnDwmSetWindowAttribute)GetProcAddress(d, "DwmSetWindowAttribute");
+    }();
+    return fn;
+}
 static void EnableRoundCorners(HWND hwnd) {
-    if (HMODULE d = LoadLibraryW(L"dwmapi.dll")) {
-        typedef HRESULT (WINAPI *Fn)(HWND, DWORD, LPCVOID, DWORD);
-        if (Fn f = (Fn)GetProcAddress(d, "DwmSetWindowAttribute")) {
-            DWORD round = 2; // DWMWCP_ROUND
-            f(hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &round, sizeof(round));
-        }
-        FreeLibrary(d);
+    if (FnDwmSetWindowAttribute f = DwmSetWindowAttribute()) {
+        DWORD round = 2; // DWMWCP_ROUND
+        f(hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &round, sizeof(round));
     }
 }
 static void ApplyRoundCorners() {
@@ -704,9 +748,11 @@ static int RowH(size_t i) {
     if (i < g_results.size() && g_results[i].kind == ResultKind::Header) return kHeadH;
     return kItemH;
 }
-// Visible data rows from the current top index. Uses the listbox's real
-// measured heights (not the assumed metrics) so scroll math always matches
-// what is actually painted.
+// Visible data rows from the current top index. Row heights come from RowH(),
+// which is exactly what our WM_MEASUREITEM handler reports for the listbox —
+// so this matches what is painted, without a LB_GETITEMHEIGHT round-trip per
+// row (on LBS_OWNERDRAWVARIABLE that message dispatches WM_MEASUREITEM right
+// back to us, once per row, on every keystroke).
 static int VisibleRowCount() {
     if (!g_hwndList) return 1;
     RECT lr; GetClientRect(g_hwndList, &lr);
@@ -715,8 +761,7 @@ static int VisibleRowCount() {
     if (top < 0) top = 0;
     int n = 0, y = 0;
     for (size_t i = (size_t)top; i < g_results.size() && y < h; i++) {
-        LRESULT mh = SendMessageW(g_hwndList, LB_GETITEMHEIGHT, i, 0);
-        y += (mh > 0) ? (int)mh : RowH(i);
+        y += RowH(i);
         n++;
     }
     return n < 1 ? 1 : n;
@@ -886,18 +931,18 @@ static void DeactivateBang() {
 // listing. Only g_fileDir is ever scanned (one FindFirstFileW per refresh).
 static bool InFileMode() { return g_fileActive; }
 
-// Drive list cache: labels are read once per file-mode entry (and on return
-// to the drive list), never per keystroke, so volume I/O can't stall typing.
+// Drive list cache: pure enumeration, no volume I/O. Rows show the bare letter
+// ("C:\") rather than "Win 10 (C:)", because GetVolumeInformationW blocks for as
+// long as the OS retries a volume that isn't answering - an empty optical drive
+// or an offline network share froze the palette on the ": " that opens file mode.
+// Reading labels on a worker thread would keep them, at the cost of thread +
+// message state this design otherwise avoids; the bare letter is the better
+// trade for a launcher.
 static std::vector<DriveInfo> g_drives;
 static void RefreshDriveCache() {
     g_drives.clear();
-    for (const auto& root : GetLogicalDrivesWin32()) {
-        DriveInfo d;
-        d.root = root;
-        d.label = GetDriveLabel(root);
-        d.title = DriveTitle(root, d.label);
-        g_drives.push_back(std::move(d));
-    }
+    for (const auto& root : GetLogicalDrivesWin32())
+        g_drives.push_back(DriveInfo{root, root});
 }
 
 static void PositionFileChip() {
@@ -961,17 +1006,31 @@ static void UpdateFileResults(const std::wstring& filter) {
     g_results.reserve(9);
     std::wstring fl = FileLower(filter);
     if (g_fileDir.empty()) {
-        if (g_drives.empty()) RefreshDriveCache(); // safety: labels ready
+        if (g_drives.empty()) RefreshDriveCache(); // safety: enumeration ready
         const size_t totalDrives = g_drives.size();
+        // Keep the lowercased title alongside each drive: the filter and the
+        // rank comparator both need it, and FileLower(title) inside those
+        // loops allocated a string per drive per comparison.
         std::vector<DriveInfo> shown = g_drives; // copy: cache order untouched
-        shown.erase(std::remove_if(shown.begin(), shown.end(),
-            [&](const DriveInfo& d) {
-                return !FileMatchesFilter(FileLower(d.title), fl);
-            }), shown.end());
+        std::vector<std::wstring> shownLow;
+        shownLow.reserve(shown.size());
+        for (const auto& d : shown) shownLow.push_back(FileLower(d.title));
+        size_t keep = 0;
+        for (size_t i = 0; i < shown.size(); i++) {
+            if (FileMatchesFilter(shownLow[i], fl)) {
+                if (keep != i) {
+                    shown[keep] = shown[i];
+                    shownLow[keep] = shownLow[i];
+                }
+                keep++;
+            }
+        }
+        shown.resize(keep);
+        shownLow.resize(keep);
         // Empty filter: Explorer letter order (enumeration order, untouched).
-        // Filtered: best fuzzy match first ("all" still finds ALL FILES
-        // before instALLEd), ties keep letter order.
-        SortDrivesByRank(shown, fl);
+        // Filtered: best fuzzy match first ("g" surfaces G:\ ahead of the
+        // rest), ties keep letter order.
+        SortDrivesByRank(shown, shownLow, fl);
         std::vector<ResultItem> rows;
         for (const auto& d : shown) {
             ResultItem r{ResultKind::Folder, d.title, L"", d.root, kFolderCol};
@@ -1004,24 +1063,42 @@ static void UpdateFileResults(const std::wstring& filter) {
     }
     std::vector<FileEntry> kept;
     kept.reserve(entries.size());
+    // Lowercase each name exactly once. The previous version lowercased inside
+    // the filter loop AND inside the sort comparator, so ranking a 1000-entry
+    // folder allocated on the order of n log n throwaway strings.
+    std::vector<std::wstring> klow;
+    klow.reserve(entries.size());
     for (const auto& e : entries) {
-        if (FileMatchesFilter(FileLower(e.name), fl)) kept.push_back(e);
+        std::wstring low = FileLower(e.name);
+        if (FileMatchesFilter(low, fl)) {
+            kept.push_back(e);
+            klow.push_back(std::move(low));
+        }
     }
     // Rank + cap: never fully sort more than kMaxFileList entries per
     // keystroke, so huge folders (System32, etc.) can't stall typing.
     // Folders first, then best fuzzy match first, then Explorer order.
-    auto fileLess = [&](const FileEntry& a, const FileEntry& b) {
+    // Sorted as an index permutation so the comparator can stay allocation-free.
+    std::vector<size_t> order(kept.size());
+    for (size_t i = 0; i < order.size(); i++) order[i] = i;
+    auto fileLessIdx = [&](size_t x, size_t y) {
+        const FileEntry& a = kept[x];
+        const FileEntry& b = kept[y];
         if (a.isDir != b.isDir) return a.isDir > b.isDir;
-        return RankedNameLess(FileLower(a.name), FileLower(b.name), fl,
-                              a.name, b.name);
+        return RankedNameLess(klow[x], klow[y], fl, a.name, b.name);
     };
     bool listCapped = kept.size() > kMaxFileList;
     if (listCapped)
-        std::partial_sort(kept.begin(), kept.begin() + kMaxFileList, kept.end(),
-                          fileLess);
+        std::partial_sort(order.begin(), order.begin() + (std::ptrdiff_t)kMaxFileList,
+                          order.end(), fileLessIdx);
     else
-        std::sort(kept.begin(), kept.end(), fileLess);
-    kept.resize(std::min(kept.size(), kMaxFileList));
+        std::sort(order.begin(), order.end(), fileLessIdx);
+    // Materialize only the capped prefix, in rank order.
+    size_t want = kept.size() < kMaxFileList ? kept.size() : kMaxFileList;
+    std::vector<FileEntry> ranked;
+    ranked.reserve(want);
+    for (size_t i = 0; i < want; i++) ranked.push_back(std::move(kept[order[i]]));
+    kept.swap(ranked);
     size_t shown = kept.size();
     std::wstring head;
     if (truncated) {
@@ -1146,6 +1223,31 @@ static void HistoryRecord(const HistoryItem& item) {
     HistoryAdd(g_settings.history, item);
     g_historyDirty = true; // persist on next explicit SaveNow() or at exit
 }
+// Existence/dir-ness of one history path, with a short-lived cache.
+//
+// GetFileAttributesW blocks for as long as the filesystem takes, so an offline
+// network drive or an ejected volume could stall the UI thread for seconds on
+// every Up-press (up to 20 stats). Cached entries are only trusted briefly:
+// a long TTL would let a file opened then deleted keep showing, a zero TTL
+// would defeat the point. Hosts that need a tighter guarantee can clear the
+// cache from a file watcher; today the short TTL plus the live re-check on
+// Enter is the trade-off.
+struct HistPathState {
+    DWORD attrs = INVALID_FILE_ATTRIBUTES;
+    ULONGLONG checkedAt = 0;
+};
+static DWORD ProbeHistoryPath(const std::wstring& path) {
+    static const unsigned kTtlSeconds = 2;
+    static std::unordered_map<std::wstring, HistPathState> memo;
+    const ULONGLONG now = GetTickCount64() / 1000; // seconds, monotonic
+    auto it = memo.find(path);
+    if (it != memo.end() && now - it->second.checkedAt < kTtlSeconds)
+        return it->second.attrs;
+    DWORD a = GetFileAttributesW(path.c_str());
+    memo[path] = HistPathState{a, now};
+    return a;
+}
+
 // Up on an empty box: replace results with the merged recency list.
 // Returns false when there is nothing to show (caller falls through to
 // normal navigation). Vanished files are hidden, never shown dead.
@@ -1163,7 +1265,7 @@ static bool ShowHistory() {
         if (kind == ResultKind::File || kind == ResultKind::Folder) {
             // Resolve dir-ness live (covers legacy bare lines + FS changes);
             // missing paths never show.
-            DWORD a = GetFileAttributesW(e.action.c_str());
+            DWORD a = ProbeHistoryPath(e.action);
             if (a == INVALID_FILE_ATTRIBUTES) continue;
             kind = (a & FILE_ATTRIBUTE_DIRECTORY) ? ResultKind::Folder
                                                   : ResultKind::File;
@@ -1212,12 +1314,14 @@ static void TrackHoverLeave(HWND h) {
     TrackMouseEvent(&tme);
 }
 // List-box point -> results index, or -1 (shared by hover tracking).
+// Items are appended in g_results order, so the listbox index IS the results
+// index and no LB_GETITEMDATA lookup is needed.
 static int ListRowFromPoint(HWND h, LPARAM l) {
     int idx = (int)SendMessageW(h, LB_ITEMFROMPOINT, 0, l);
     if (HIWORD(idx) != 0) return -1;
-    LRESULT data = SendMessageW(h, LB_GETITEMDATA, LOWORD(idx), 0);
-    if (data < 0 || data >= (LRESULT)g_results.size()) return -1;
-    return (int)data;
+    int row = LOWORD(idx);
+    if (row < 0 || row >= (int)g_results.size()) return -1;
+    return row;
 }
 static int GridContentH() {
     bool head = !g_results.empty() && g_results.front().kind == ResultKind::Header;
@@ -1292,14 +1396,24 @@ static void PushAppRow(const AppEntry& app) {
     g_results.push_back(MakeAppRow(app));
 }
 
+// Case-insensitive "starts with" test against a literal or a stored name.
+// BuildChips runs on every keystroke and used to allocate a temporary
+// lowercase std::wstring per alias (and per quick link) just to compare a
+// short prefix.
+static bool PrefixMatchFold(const wchar_t* name, const std::wstring& qlower) {
+    size_t n = qlower.size();
+    size_t len = 0;
+    while (name[len]) len++;
+    return len >= n && _wcsnicmp(name, qlower.c_str(), n) == 0;
+}
+
 // Prefix-matched power + bang + quick-link chips (separate row above list).
 static void BuildChips(const std::wstring& qlower) {
     g_chips.clear();
     if (qlower.size() < 2 || qlower[0] == L'!') return;
     for (int i = 0; i < 4 && (int)g_chips.size() < kMaxChips; i++) {
         for (int a = 0; a < 4 && kPowers[i].aliases[a]; a++) {
-            std::wstring al = kPowers[i].aliases[a];
-            if (al.size() >= qlower.size() && al.compare(0, qlower.size(), qlower) == 0) {
+            if (PrefixMatchFold(kPowers[i].aliases[a], qlower)) {
                 std::wstring pt = kPowers[i].title;
                 if (g_confirmPower == i) pt += L"?"; // armed: second Enter runs it
                 g_chips.push_back({ChipKind::Power, pt, kPowers[i].color, i});
@@ -1310,8 +1424,7 @@ static void BuildChips(const std::wstring& qlower) {
     static const wchar_t* awakeAliases[] =
         {L"awake", L"stay awake", L"stayawake", L"screen on", L"keep awake"};
     for (int a = 0; a < 5 && (int)g_chips.size() < kMaxChips; a++) {
-        std::wstring al = awakeAliases[a];
-        if (al.size() >= qlower.size() && al.compare(0, qlower.size(), qlower) == 0) {
+        if (PrefixMatchFold(awakeAliases[a], qlower)) {
             g_chips.push_back({ChipKind::Awake,
                                g_awakeOn ? L"Awake: On" : L"Awake: Off",
                                kAwakeCol, 0});
@@ -1320,6 +1433,7 @@ static void BuildChips(const std::wstring& qlower) {
     }
     for (size_t i = 0; i < g_settings.bangs.size() && (int)g_chips.size() < kMaxChips; i++) {
         const Bang& b = g_settings.bangs[i];
+        // Bang aliases are stored lowercased already: no fold needed here.
         for (const auto& a : b.aliases) {
             if (!a.empty() && a.size() >= qlower.size() &&
                 a.compare(0, qlower.size(), qlower) == 0) {
@@ -1329,26 +1443,24 @@ static void BuildChips(const std::wstring& qlower) {
         }
     }
     for (size_t i = 0; i < g_settings.quicks.size() && (int)g_chips.size() < kMaxChips; i++) {
-        std::wstring n = BangLower(g_settings.quicks[i].name);
-        if (n.size() >= qlower.size() && n.compare(0, qlower.size(), qlower) == 0)
+        if (PrefixMatchFold(g_settings.quicks[i].name.c_str(), qlower))
             g_chips.push_back({ChipKind::Quick, g_settings.quicks[i].name, kQuickCol, (int)i});
     }
 }
 
-// Content height from the listbox's real measured item heights, starting at
-// the given top index (grid tiles keep their own uniform metric). Sizing from
-// ground truth instead of assumed constants means the last row — descenders
-// and all — always fits, at any DPI, scrolled or not.
+// Content height for the band starting at `top` (grid tiles keep their own
+// uniform metric). Heights come from RowH(), which is exactly what our
+// WM_MEASUREITEM handler reports for the listbox, so the last row always fits
+// at any DPI and scrolled or not — with no LB_GETITEMHEIGHT round-trip per
+// row (each of those dispatches WM_MEASUREITEM back to us).
 static int ContentHForTop(int top) {
     if (GridActive()) return GridContentH();
     int count = (int)g_results.size();
     int show = count > kMaxItems ? kMaxItems : count;
     if (top < 0) top = 0;
     int hgt = 0;
-    for (int k = 0; k < show && top + k < count; k++) {
-        LRESULT mh = SendMessageW(g_hwndList, LB_GETITEMHEIGHT, top + k, 0);
-        hgt += (mh > 0) ? (int)mh : RowH((size_t)(top + k));
-    }
+    for (int k = 0; k < show && top + k < count; k++)
+        hgt += RowH((size_t)(top + k));
     return hgt;
 }
 // Resize the palette window (round region + chip row follow) to fit content.
@@ -1393,13 +1505,34 @@ static void RefitListHeight() {
                      cr.right - kPadX * 2, barH, SWP_NOZORDER | SWP_SHOWWINDOW);
 }
 
+// Move a child only when its rectangle actually changes. RebuildListControl
+// runs on every keystroke, and an unconditional SetWindowPos (even with
+// identical geometry) still costs WM_WINDOWPOSCHANGING/CHANGED plus redraw
+// scheduling on any overlapping sibling.
+static void PlaceChild(HWND h, int x, int y, int w, int hh, bool show) {
+    if (!h) return;
+    if (!show) { ShowWindow(h, SW_HIDE); return; }
+    // Compare the window rect (not the client rect) against the target so this
+    // stays correct for any border style, then map to parent coordinates.
+    RECT pr;
+    GetWindowRect(h, &pr);
+    MapWindowPoints(NULL, GetParent(h), (POINT*)&pr, 2);
+    bool same = (pr.left == x && pr.top == y &&
+                 pr.right - pr.left == w && pr.bottom - pr.top == hh);
+    if (!same) {
+        SetWindowPos(h, NULL, x, y, w, hh, SWP_NOZORDER | SWP_SHOWWINDOW);
+    } else if (!IsWindowVisible(h)) {
+        ShowWindow(h, SW_SHOW);
+    }
+}
+
 static void RebuildListControl() {
     SendMessageW(g_hwndList, LB_RESETCONTENT, 0, 0);
-    for (size_t i = 0; i < g_results.size(); i++) {
-        int idx = (int)SendMessageW(g_hwndList, LB_ADDSTRING, 0, (LPARAM)L"");
-        if (idx >= 0)
-            SendMessageW(g_hwndList, LB_SETITEMDATA, idx, (LPARAM)i);
-    }
+    // Items are appended in g_results order, so listbox index == results index.
+    // No LB_SETITEMDATA: storing i was redundant, and in a 1000-row folder it
+    // doubled the per-keystroke message count on this rebuild.
+    for (size_t i = 0; i < g_results.size(); i++)
+        SendMessageW(g_hwndList, LB_ADDSTRING, 0, (LPARAM)L"");
     // Chips own the selection when they have focus; otherwise the first
     // selectable row (headers never take Enter).
     if (g_chipsFocus && !g_chips.empty())
@@ -1436,25 +1569,17 @@ static void RebuildListControl() {
                          inputH - Dpx(14), SWP_NOZORDER);
         if (gridOn) {
             if (IsWindowVisible(g_hwndList)) ShowWindow(g_hwndList, SW_HIDE);
-            SetWindowPos(g_hwndFileGrid, NULL, kPadX, listY,
-                         cr.right - kPadX * 2, contentH, SWP_NOZORDER | SWP_SHOWWINDOW);
+            PlaceChild(g_hwndFileGrid, kPadX, listY, cr.right - kPadX * 2, contentH, true);
         } else {
             if (IsWindowVisible(g_hwndFileGrid)) ShowWindow(g_hwndFileGrid, SW_HIDE);
-            if (rows == 0)
-                ShowWindow(g_hwndList, SW_HIDE); // bar-only: no list at all
-            else
-                SetWindowPos(g_hwndList, NULL, kPadX, listY, cr.right - kPadX * 2,
-                             contentH, SWP_NOZORDER | SWP_SHOWWINDOW);
+            PlaceChild(g_hwndList, kPadX, listY, cr.right - kPadX * 2, contentH, rows != 0);
         }
     }
     // Explorer bar docks under the content (positioned every refresh: cheap).
     {
         RECT cr; GetClientRect(g_hwndPalette, &cr);
-        if (showBar)
-            SetWindowPos(g_hwndFileBar, NULL, kPadX, listY + contentH,
-                         cr.right - kPadX * 2, barH, SWP_NOZORDER | SWP_SHOWWINDOW);
-        else if (g_hwndFileBar)
-            ShowWindow(g_hwndFileBar, SW_HIDE);
+        PlaceChild(g_hwndFileBar, kPadX, listY + contentH,
+                   cr.right - kPadX * 2, barH, showBar);
     }
     // No background erase (controls paint every pixel themselves).
     if (gridOn) InvalidateRect(g_hwndFileGrid, NULL, FALSE);
@@ -1471,16 +1596,25 @@ static void RebuildListControl() {
 static void MatchSysPages(const std::wstring& qlower, std::vector<ResultItem>& out,
                           size_t limit) {
     struct Hit { const SysPage* p; int score; };
+    if (limit == 0) return;
+    const std::vector<SysPageLower>& low = SysPagesLower();
     std::vector<Hit> hits;
     for (int i = 0; i < SysPageCount(); i++) {
-        const SysPage* p = &kSysPages[i];
-        int s1 = FuzzyScore(BangLower(p->name), qlower);
-        int s2 = FuzzyScore(BangLower(p->keywords), qlower);
+        if ((size_t)i >= low.size()) break; // table/lowercase-list mismatch
+        const SysPageLower& lp = low[(size_t)i];
+        int s1 = FuzzyScore(lp.name, qlower);
+        int s2 = FuzzyScore(lp.keywords, qlower);
         int s = s1 > s2 ? s1 : s2;
-        if (s >= 0) hits.push_back({p, s});
+        if (s >= 0) hits.push_back({&kSysPages[i], s});
     }
-    std::sort(hits.begin(), hits.end(),
-              [](const Hit& a, const Hit& b) { return a.score > b.score; });
+    // Only the best `limit` rows are ever read, so sort just that prefix
+    // instead of the whole match list.
+    if (limit && hits.size() > limit) {
+        std::partial_sort(hits.begin(), hits.begin() + (std::ptrdiff_t)limit,
+                          hits.end(),
+                          [](const Hit& a, const Hit& b) { return a.score > b.score; });
+        hits.resize(limit);
+    }
     for (size_t i = 0; i < hits.size() && out.size() < limit; i++) {
         ResultItem r{ResultKind::Setting, hits[i].p->name, L"",
                      hits[i].p->uri, kSetCol};
@@ -1521,8 +1655,13 @@ static void UpdateResults() {
         return;
     }
 
+    // One lowercase copy per keystroke, shared by chips, app search and the
+    // settings pages (each used to make its own copy). `q` keeps its original
+    // case: URLs and bang terms must not be case-folded.
+    std::wstring qlower = BangLower(q);
+
     // --- chips row (power + quick links), selected by default
-    BuildChips(BangLower(q));
+    BuildChips(qlower);
     g_chipsFocus = !g_chips.empty();
     g_chipSel = 0;
 
@@ -1554,7 +1693,9 @@ static void UpdateResults() {
             g_results.push_back(std::move(r));
         }
         if (!term.empty() && g_indexReady.load()) {
-            for (auto& h : SearchApps(g_apps, term, 6)) {
+            // term comes from ParseBangLeading on the raw query, so it still
+            // needs its own lowercase copy for SearchAppsLower.
+            for (auto& h : SearchAppsLower(g_apps, BangLower(term), 6)) {
                 if (g_hidden.count(h.app->lower) == 0) PushAppRow(*h.app);
             }
         }
@@ -1568,7 +1709,7 @@ static void UpdateResults() {
 
     std::vector<ResultItem> appRows;
     if (g_indexReady.load()) {
-        for (auto& h : SearchApps(g_apps, q, 4)) {
+        for (auto& h : SearchAppsLower(g_apps, qlower, 4)) {
             if (g_hidden.count(h.app->lower) == 0) appRows.push_back(MakeAppRow(*h.app));
         }
     } else {
@@ -1580,11 +1721,11 @@ static void UpdateResults() {
     }
 
     std::vector<ResultItem> setRows;
-    MatchSysPages(BangLower(q), setRows, 3);
+    MatchSysPages(qlower, setRows, 3);
 
     std::vector<ResultItem> webRows;
     std::wstring directUrl; // URL-shaped input: direct open only, no dupe search row
-    bool isUrl = IsUrlLike(q, directUrl);
+    bool isUrl = IsUrlLikeLower(q, qlower, directUrl);
     if (isUrl) g_chipsFocus = false; // Enter opens the URL, chips stay on Tab
     if (isUrl) {
         ResultItem r{ResultKind::Web, q, L"", directUrl, kWebCol};
@@ -1615,9 +1756,9 @@ static void UpdateResults() {
 static int CurrentSelection() {
     int sel = (int)SendMessageW(g_hwndList, LB_GETCURSEL, 0, 0);
     if (sel < 0) return -1; // nothing selected: caller runs the typed-query fallback
-    LPARAM data = SendMessageW(g_hwndList, LB_GETITEMDATA, sel, 0);
-    if (data < 0 || data >= (LPARAM)g_results.size()) return -1;
-    return (int)data;
+    // Listbox index == results index (items appended in g_results order).
+    if (sel >= (int)g_results.size()) return -1;
+    return sel;
 }
 
 static void ExecuteChip(int idx) {
@@ -1629,7 +1770,7 @@ static void ExecuteChip(int idx) {
         ApplyAwake();
         g_settings.awakeOn = g_awakeOn;
         EnsureSettingsLists(); // palette shown => loaded, but guard pre-save anyway
-        SaveSettings(g_settings);
+        SaveOrWarn(L"keep awake");
         UpdateResults(); // refresh the chip title, stay open
         return;
     }
@@ -1989,9 +2130,8 @@ static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
         LRESULT r = DefSubclassProc(h, m, w, l);
         int idx = (int)SendMessageW(h, LB_ITEMFROMPOINT, 0, l);
         if (HIWORD(idx) == 0) {
-            LRESULT data = SendMessageW(h, LB_GETITEMDATA, LOWORD(idx), 0);
-            int row = (data >= 0 && data < (LRESULT)g_results.size())
-                          ? (int)data : -1;
+            int row = LOWORD(idx); // listbox index == results index
+            if (row < 0 || row >= (int)g_results.size()) row = -1;
             POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
             ArmRowDrag(row, pt);
         } else {
@@ -2322,7 +2462,22 @@ static int ChipTextW(HDC dc, const std::wstring& text) {
     DrawTextW(dc, text.c_str(), -1, &r, DT_SINGLELINE | DT_CALCRECT);
     return (r.right - r.left) + Dpx(32);
 }
-static void LayoutChipRects(const RECT& client) {
+// Chip pill rectangles are measured once per chip-set/size, not on every paint
+// and every click. The chip row repaints on every keystroke while chips are
+// visible, and each measurement was a GetDC plus one DT_CALCRECT per chip.
+// Cache validity is derived from the live chip titles and the client width, so
+// it can never go stale; the titles it was built for are kept for comparison.
+static std::vector<std::wstring> g_chipLayoutTitles;
+static int g_chipLayoutW = -1;
+static int g_chipHintW = -1; // key-guide width, measured once per font/DPI
+
+static void EnsureChipRects(const RECT& client) {
+    if (g_chipLayoutW == client.right && g_chipLayoutTitles.size() == g_chips.size()) {
+        bool same = true;
+        for (size_t i = 0; i < g_chips.size(); i++)
+            if (g_chipLayoutTitles[i] != g_chips[i].title) { same = false; break; }
+        if (same) return;
+    }
     g_chipRects.clear();
     int x = Dpx(12);
     int h = 28;
@@ -2337,7 +2492,21 @@ static void LayoutChipRects(const RECT& client) {
     }
     SelectObject(dc, old);
     ReleaseDC(g_hwndChipRow, dc);
+    g_chipLayoutTitles.clear();
+    g_chipLayoutTitles.reserve(g_chips.size());
+    for (const auto& c : g_chips) g_chipLayoutTitles.push_back(c.title);
+    g_chipLayoutW = client.right;
 }
+
+// Chips + DPI change invalidates every cached measurement.
+static void InvalidateChipCaches() {
+    // Widths depend on g_fontChip, so a font rebuild invalidates them too
+    // (WM_DPICHANGED rebuilds fonts, then calls this).
+    g_chipLayoutW = -1;
+    g_chipLayoutTitles.clear();
+    g_chipHintW = -1;
+}
+
 static LRESULT CALLBACK ChipRowProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_ERASEBKGND:
@@ -2347,16 +2516,17 @@ static LRESULT CALLBACK ChipRowProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         HDC dc = BeginPaint(hwnd, &ps);
         RECT cl; GetClientRect(hwnd, &cl);
         FillRect(dc, &cl, g_brBg);
-        LayoutChipRects(cl);
+        EnsureChipRects(cl);
         SetBkMode(dc, TRANSPARENT);
         SelectObject(dc, g_fontChip);
+        PillPainter pills(dc); // one GDI+ Graphics for the whole pass
         for (size_t i = 0; i < g_chips.size() && i < g_chipRects.size(); i++) {
             const ChipItem& c = g_chips[i];
             const RECT& r = g_chipRects[i];
             bool sel = g_chipsFocus && (int)i == g_chipSel;
             COLORREF base = ChipFill(c.color);
             // Solid pills, white bold text; selection = full brightness.
-            FillPill(dc, r, sel ? base : Darken(base, 65));
+            pills.Fill(r, sel ? base : Darken(base, 65));
             SetTextColor(dc, kChipText);
             RECT tr = r;
             DrawTextW(dc, c.title.c_str(), -1, &tr,
@@ -2366,9 +2536,12 @@ static LRESULT CALLBACK ChipRowProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         if (!g_chipRects.empty()) {
             const wchar_t* hint = L"\u2191\u2193 move \u00B7 Enter open \u00B7 Shift+Enter web \u00B7 Esc close";
             SelectObject(dc, g_fontSub);
-            RECT hr{0, 0, 0, 0};
-            DrawTextW(dc, hint, -1, &hr, DT_SINGLELINE | DT_CALCRECT);
-            int hw = hr.right - hr.left;
+            if (g_chipHintW < 0) {
+                RECT hr{0, 0, 0, 0};
+                DrawTextW(dc, hint, -1, &hr, DT_SINGLELINE | DT_CALCRECT);
+                g_chipHintW = hr.right - hr.left;
+            }
+            int hw = g_chipHintW;
             if (g_chipRects.back().right + Dpx(12) + hw < cl.right - Dpx(8)) {
                 SetBkMode(dc, TRANSPARENT);
                 SetTextColor(dc, kSub);
@@ -2382,7 +2555,7 @@ static LRESULT CALLBACK ChipRowProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     case WM_LBUTTONDOWN: {
         POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
         RECT cl; GetClientRect(hwnd, &cl);
-        LayoutChipRects(cl);
+        EnsureChipRects(cl);
         for (size_t i = 0; i < g_chipRects.size(); i++) {
             if (PtInRect(&g_chipRects[i], pt)) { ExecuteChip((int)i); return 0; }
         }
@@ -2440,6 +2613,25 @@ static LRESULT CALLBACK FileBarProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(hwnd, m, w, l);
 }
 
+// Hover fill between background and highlight. Both painters used to build
+// this brush on every hover repaint; the globals up top cache it instead.
+static void PaintHoverFill(HDC dc, const RECT& r) {
+    COLORREF want = RGB((GetRValue(kBg) + GetRValue(kSel)) / 2,
+                         (GetGValue(kBg) + GetGValue(kSel)) / 2,
+                         (GetBValue(kBg) + GetBValue(kSel)) / 2);
+    if (want != g_hoverBrushFor) {
+        if (g_hoverBrush) DeleteObject(g_hoverBrush);
+        g_hoverBrush = CreateSolidBrush(want);
+        g_hoverBrushFor = want;
+    }
+    if (g_hoverBrush) FillRect(dc, r, g_hoverBrush);
+}
+// Drop the cached hover brush. Idempotent; safe even if it was never made.
+static void ReleaseHoverBrush() {
+    if (g_hoverBrush) { DeleteObject(g_hoverBrush); g_hoverBrush = NULL; }
+    g_hoverBrushFor = (COLORREF)-1;
+}
+
 // Screen point near a result row for the keyboard menu key: selected tile
 // center in grid mode, selected list-row center otherwise. Falls back to the
 // palette center when the row is scrolled out of view or unknown.
@@ -2490,21 +2682,38 @@ static POINT RowScreenPoint(int resultsIdx) {
 // Fit a tile name into at most two wrapped lines with a real ellipsis.
 // (DT_END_ELLIPSIS has no effect combined with DT_WORDBREAK, so overlong
 // names would otherwise clip mid-glyph at the tile edge.)
+//
+// The binary search probes a truncated prefix + ellipsis. Building that probe
+// as substr(0,n) + "..." allocated a std::wstring per probe, per tile, per
+// repaint. Probing a reused buffer with an explicit character count allocates
+// nothing after the first paint. All painting is single-threaded on the UI
+// thread, so one shared scratch buffer per function is safe.
+static const wchar_t kEllipsis = (wchar_t)0x2026;
+static std::vector<wchar_t>& EllipsisScratch(size_t need) {
+    static std::vector<wchar_t> buf;
+    if (buf.size() < need + 1) buf.resize(need + 1);
+    return buf;
+}
+
 static std::wstring FitTileText(HDC dc, const std::wstring& s, int w, int maxH) {
     if (s.empty() || w <= 0 || maxH <= 0) return s;
-    RECT r{0, 0, w, 0};
-    DrawTextW(dc, s.c_str(), -1, &r, DT_CALCRECT | DT_WORDBREAK | DT_CENTER | DT_TOP);
-    if (r.bottom - r.top <= maxH) return s;
+    {
+        RECT r{0, 0, w, 0};
+        DrawTextW(dc, s.c_str(), -1, &r,
+                  DT_CALCRECT | DT_WORDBREAK | DT_CENTER | DT_TOP);
+        if (r.bottom - r.top <= maxH) return s;
+    }
+    std::vector<wchar_t>& buf = EllipsisScratch(s.size());
     std::wstring best = L"…";
     size_t lo = 0, hi = s.size();
     while (lo < hi) {
-        size_t mid = (lo + hi + 1) / 2;
-        std::wstring t = s.substr(0, mid) + L"…";
+        size_t mid = (lo + hi + 1) / 2; // >= 1 here: s is non-empty
+        memcpy(buf.data(), s.c_str(), mid * sizeof(wchar_t));
+        buf[mid] = kEllipsis;
         RECT r2{0, 0, w, 0};
-        DrawTextW(dc, t.c_str(), -1, &r2,
+        DrawTextW(dc, buf.data(), (int)(mid + 1), &r2,
                   DT_CALCRECT | DT_WORDBREAK | DT_CENTER | DT_TOP);
-        if (r2.bottom - r2.top <= maxH) { best = t; lo = mid; }
-        else if (mid == 0) break;
+        if (r2.bottom - r2.top <= maxH) { best.assign(buf.data(), mid + 1); lo = mid; }
         else hi = mid - 1;
     }
     return best;
@@ -2515,20 +2724,23 @@ static std::wstring FitTileText(HDC dc, const std::wstring& s, int w, int maxH) 
 // line ends with "..." instead of a hard mid-glyph cut at the tile edge.
 static std::wstring FitOneLine(HDC dc, const std::wstring& s, int w) {
     if (s.empty() || w <= 0) return s;
-    RECT r{0, 0, 0, 0};
-    DrawTextW(dc, s.c_str(), -1, &r,
-              DT_CALCRECT | DT_SINGLELINE | DT_LEFT | DT_TOP);
-    if (r.right - r.left <= w) return s;
+    {
+        RECT r{0, 0, 0, 0};
+        DrawTextW(dc, s.c_str(), -1, &r,
+                  DT_CALCRECT | DT_SINGLELINE | DT_LEFT | DT_TOP);
+        if (r.right - r.left <= w) return s;
+    }
+    std::vector<wchar_t>& buf = EllipsisScratch(s.size());
     std::wstring best = L"…";
     size_t lo = 0, hi = s.size();
     while (lo < hi) {
         size_t mid = (lo + hi + 1) / 2;
-        std::wstring t = s.substr(0, mid) + L"…";
+        memcpy(buf.data(), s.c_str(), mid * sizeof(wchar_t));
+        buf[mid] = kEllipsis;
         RECT r2{0, 0, 0, 0};
-        DrawTextW(dc, t.c_str(), -1, &r2,
+        DrawTextW(dc, buf.data(), (int)(mid + 1), &r2,
                   DT_CALCRECT | DT_SINGLELINE | DT_LEFT | DT_TOP);
-        if (r2.right - r2.left <= w) { best = t; lo = mid; }
-        else if (mid == 0) break;
+        if (r2.right - r2.left <= w) { best.assign(buf.data(), mid + 1); lo = mid; }
         else hi = mid - 1;
     }
     return best;
@@ -2582,6 +2794,18 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         int tw = (cl.right - cl.left) / cols;
         int sel = (int)SendMessageW(g_hwndList, LB_GETCURSEL, 0, 0);
         size_t start = base + (size_t)g_gridTopRow * (size_t)cols;
+        // One line's height in g_fontSub: loop-invariant, but the old code
+        // re-measured a literal "X" with DT_CALCRECT for every tile, every
+        // repaint (and the grid repaints on every hover move).
+        int oneLineH;
+        {
+            HGDIOBJ keep = SelectObject(dc, g_fontSub);
+            RECT oneL{0, 0, 0, 0};
+            DrawTextW(dc, L"X", -1, &oneL,
+                      DT_CALCRECT | DT_SINGLELINE | DT_LEFT | DT_TOP);
+            oneLineH = oneL.bottom - oneL.top;
+            SelectObject(dc, keep);
+        }
         for (size_t i = start; i < g_results.size(); i++) {
             size_t t = i - base;
             int r = (int)(t / (size_t)cols) - g_gridTopRow;
@@ -2596,14 +2820,7 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             bool isCur = ((int)i == sel);
             if (isCur) FillRect(dc, &tile, g_brSel);
             // Hover preview: subtle fill, visual only.
-            if (!isCur && (int)i == g_hoverRow) {
-                HBRUSH brHov = CreateSolidBrush(
-                    RGB((GetRValue(kBg) + GetRValue(kSel)) / 2,
-                        (GetGValue(kBg) + GetGValue(kSel)) / 2,
-                        (GetBValue(kBg) + GetBValue(kSel)) / 2));
-                FillRect(dc, &tile, brHov);
-                DeleteObject(brHov);
-            }
+            if (!isCur && (int)i == g_hoverRow) PaintHoverFill(dc, &tile);
             int gz = Dpx(32);
             int gx = tile.left + (tile.right - tile.left - gz) / 2;
             RECT gcell{gx, tile.top + Dpx(8), gx + gz, tile.top + Dpx(8) + gz};
@@ -2624,13 +2841,10 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             // already fit their width via wrapping). With both caps holding,
             // centered text can never clip either end.
             {
-                RECT oneL{0, 0, 0, 0};
-                DrawTextW(dc, L"X", -1, &oneL,
-                          DT_CALCRECT | DT_SINGLELINE | DT_LEFT | DT_TOP);
                 RECT hr3{0, 0, nr.right - nr.left, 0};
                 DrawTextW(dc, shown.c_str(), -1, &hr3,
                           DT_CALCRECT | DT_WORDBREAK | DT_LEFT | DT_TOP);
-                if (hr3.bottom - hr3.top <= oneL.bottom - oneL.top)
+                if (hr3.bottom - hr3.top <= oneLineH)
                     shown = FitOneLine(dc, shown, nr.right - nr.left);
             }
             // Tile names are always centered.
@@ -2864,11 +3078,14 @@ static bool ShellVerbOn(const std::wstring& path, const wchar_t* verb, bool hide
 
 static void HideAppRow(const ResultItem& r) {
     EnsureSettingsLists(); // SaveSettings rewrites every section
-    std::wstring low = ToLower(r.title);
-    for (const auto& n : g_settings.hiddenApps)
-        if (ToLower(n) == low) { UpdateResults(); return; } // already hidden
+    // g_hidden already holds trimmed+lowercased names, so membership is an O(1)
+    // hash probe instead of an O(n) scan that lowercased every candidate.
+    if (g_hidden.count(BangLower(BangTrim(r.title)))) {
+        UpdateResults();
+        return; // already hidden
+    }
     g_settings.hiddenApps.push_back(r.title);
-    SaveSettings(g_settings);
+    SaveOrWarn(L"hidden apps");
     RebuildHiddenSet();
     RefreshAppsListPreservingChecks();
     UpdateResults(); // stay open, list refreshes without the app
@@ -2880,7 +3097,7 @@ static void ApplyEnginePreset(int idx) {
     EnsureSettingsLists(); // SaveSettings rewrites every section
     g_settings.engineName = kEnginePresets[(size_t)idx].name;
     g_settings.engineUrl = kEnginePresets[(size_t)idx].url;
-    SaveSettings(g_settings);
+    SaveOrWarn(L"search engine");
     UpdateResults();
 }
 
@@ -2987,7 +3204,7 @@ static void RunRowVerb(int rowIdx, VerbId verb) {
     case VerbId::ToggleStartup:
         g_settings.runAtStartup = !g_settings.runAtStartup;
         EnsureSettingsLists();
-        SaveSettings(g_settings);
+        SaveOrWarn(L"run at startup");
         ApplyRunAtStartup(g_settings.runAtStartup);
         return;
     case VerbId::Quit:
@@ -3287,7 +3504,10 @@ static bool HasHdrop(IDataObject* o) {
 static void DropPathsOnPalette(HDROP h) {
     if (!h || !g_hwndPalette || !IsWindowVisible(g_hwndPalette)) return;
     if (DragQueryFileW(h, 0xFFFFFFFF, NULL, 0) < 1) return;
-    std::vector<wchar_t> buf(32768);
+    // Ask for the first path's length instead of always allocating 32K chars.
+    UINT need = DragQueryFileW(h, 0, NULL, 0); // chars, excluding the NUL
+    if (need == 0) return;
+    std::vector<wchar_t> buf((size_t)need + 1);
     if (!DragQueryFileW(h, 0, buf.data(), (UINT)buf.size())) return;
     std::wstring path = buf.data();
     if (path.empty()) return;
@@ -3617,14 +3837,8 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         FillRect(dc, &d->rcItem, (!isHead && sel) ? g_brSel : g_brBg);
         // Hover preview: a half-step between background and highlight.
         // Visual only — selection and the multi-set are untouched.
-        if (!isHead && !sel && (int)ri == g_hoverRow) {
-            HBRUSH brHov = CreateSolidBrush(
-                RGB((GetRValue(kBg) + GetRValue(kSel)) / 2,
-                    (GetGValue(kBg) + GetGValue(kSel)) / 2,
-                    (GetBValue(kBg) + GetBValue(kSel)) / 2));
-            FillRect(dc, &d->rcItem, brHov);
-            DeleteObject(brHov);
-        }
+        if (!isHead && !sel && (int)ri == g_hoverRow)
+            PaintHoverFill(dc, &d->rcItem);
         if ((int)ri < (int)g_results.size()) {
             const ResultItem& r = g_results[ri];
             SetBkMode(dc, TRANSPARENT);
@@ -3683,6 +3897,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
     case WM_DPICHANGED: {
         g_dpi = HIWORD(w);
         UpdateLayoutMetrics();
+        InvalidateChipCaches(); // cached chip rects + hint width are DPI-sized
         if (g_appFontsReady) { CreateAppFonts(); RefreshEditLineH(); } // lazy: nothing pre-first-show
         RECT* pr = (RECT*)l; // system-suggested rect for the new DPI
         SetWindowPos(hwnd, HWND_TOPMOST, pr->left, pr->top,
@@ -3744,10 +3959,9 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
                 LPARAM lp = MAKELPARAM(cl.x - lr.left, cl.y - lr.top);
                 LRESULT hit = SendMessageW(g_hwndList, LB_ITEMFROMPOINT, 0, lp);
                 if (HIWORD(hit) == 0) {
-                    LRESULT data = SendMessageW(g_hwndList, LB_GETITEMDATA,
-                                                LOWORD(hit), 0);
-                    if (data >= 0 && data < (LRESULT)g_results.size())
-                        row = (int)data;
+                    int r = LOWORD(hit); // listbox index == results index
+                    if (r >= 0 && r < (int)g_results.size())
+                        row = r;
                 }
             }
         }
@@ -3966,7 +4180,7 @@ static void FillAppsList() {
     ListView_DeleteAllItems(g_hwndAppsList);
     for (size_t i = 0; i < g_apps.size(); i++) {
         int row = LVAppendRow(g_hwndAppsList, g_apps[i].name.c_str());
-        ListView_SetCheckState(g_hwndAppsList, row, IsHiddenApp(g_apps[i].name));
+        ListView_SetCheckState(g_hwndAppsList, row, IsHiddenAppLower(g_apps[i].lower));
     }
 }
 
@@ -4020,13 +4234,9 @@ static void ApplyUIFont(HWND parent) {
 }
 
 static void DarkTitleBar(HWND hwnd) {
-    if (HMODULE d = LoadLibraryW(L"dwmapi.dll")) {
-        typedef HRESULT (WINAPI *Fn)(HWND, DWORD, LPCVOID, DWORD);
-        if (Fn f = (Fn)GetProcAddress(d, "DwmSetWindowAttribute")) {
-            BOOL dark = TRUE;
-            f(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
-        }
-        FreeLibrary(d);
+    if (FnDwmSetWindowAttribute f = DwmSetWindowAttribute()) {
+        BOOL dark = TRUE;
+        f(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
     }
 }
 
@@ -4085,16 +4295,32 @@ static void ReadHiddenFromList() {
             g_settings.hiddenApps.push_back(LVGetCell(g_hwndAppsList, i, 0));
 }
 
+// Persist now; on failure tell the user, since these are all actions where
+// they expect the change to survive a restart.
+static void SaveOrWarn(const wchar_t* what) {
+    if (SaveSettings(g_settings)) return;
+    std::wstring msg = std::wstring(L"Couldn't save settings (") + what +
+                       L").\nThe change applies now but may be lost on restart.";
+    MessageBoxW(g_hwndPalette, msg.c_str(), L"SneekPeek",
+                MB_OK | MB_ICONWARNING);
+}
+
 // Every change persists immediately: there is no Save button.
 static void SaveNow() {
     EnsureSettingsLists(); // never persist defaults over real lists
-    SaveSettings(g_settings);
+    // A failed write must not claim success in the UI. g_settings stays the
+    // source of truth, so the app keeps working; only persistence is lost.
+    bool ok = SaveSettings(g_settings);
     RebuildHiddenSet();
     if (g_hwndSavedLabel) {
         SYSTEMTIME st{};
         GetLocalTime(&st);
         wchar_t t[64];
-        swprintf_s(t, 64, L"Saved %02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+        if (ok)
+            swprintf_s(t, 64, L"Saved %02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+        else
+            swprintf_s(t, 64, L"Save failed %02d:%02d:%02d",
+                       st.wHour, st.wMinute, st.wSecond);
         SetWindowTextW(g_hwndSavedLabel, t);
     }
 }
@@ -4977,12 +5203,12 @@ static void OnTrayCommand(UINT id) {
         ApplyAwake();
         g_settings.awakeOn = g_awakeOn;
         EnsureSettingsLists();
-        SaveSettings(g_settings);
+        SaveOrWarn(L"keep awake");
         break;
     case ID_TRAY_STARTUP:
         g_settings.runAtStartup = !g_settings.runAtStartup;
         EnsureSettingsLists();
-        SaveSettings(g_settings);
+        SaveOrWarn(L"run at startup");
         ApplyRunAtStartup(g_settings.runAtStartup);
         break;
     case ID_TRAY_QUIT:
@@ -5155,9 +5381,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
     if (g_oleInit) OleUninitialize(); // drop-target revoked in WM_DESTROY
     g_oleInit = false;
     SetThreadExecutionState(ES_CONTINUOUS); // release any Awake hold
-    DeleteObject(g_fontInput); DeleteObject(g_fontTitle);
-    DeleteObject(g_fontSub); DeleteObject(g_fontChip); DeleteObject(g_fontGrid); DeleteObject(g_fontUI);
+    DeleteAppFonts(); // single source of truth for the six palette/UI fonts
     DeleteObject(g_brBg); DeleteObject(g_brInput); DeleteObject(g_brSel);
+    ReleaseHoverBrush();
+    ReleaseGlyphGdi(); // memoized glyph pens/brushes
     if (g_hIconBig) DestroyIcon(g_hIconBig);
     if (g_hIconSmall) DestroyIcon(g_hIconSmall);
     if (g_gdiplusStarted) Gdiplus::GdiplusShutdown(g_gdiplusToken);

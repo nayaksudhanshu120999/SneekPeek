@@ -4,6 +4,8 @@
 // URIs are the long-stable set; a few may vary across Windows builds.
 #include <string>
 #include <vector>
+#include <utility> // std::move in SysPagesLower
+#include "bangs.h" // BangLower: the table is matched already lowercased
 
 struct SysPage {
     const wchar_t* name;
@@ -76,4 +78,28 @@ inline const SysPage kSysPages[] = {
 
 inline int SysPageCount() {
     return (int)(sizeof(kSysPages) / sizeof(kSysPages[0]));
+}
+
+// Lowercased name+keywords, built once on first search. Matching runs on every
+// keystroke, and lowercasing the static table in place meant 2 * SysPageCount()
+// heap allocations per character typed to lowercase literals that are already
+// lowercase.
+struct SysPageLower {
+    std::wstring name;
+    std::wstring keywords;
+};
+
+inline const std::vector<SysPageLower>& SysPagesLower() {
+    static const std::vector<SysPageLower> table = [] {
+        std::vector<SysPageLower> v;
+        v.reserve((size_t)SysPageCount());
+        for (int i = 0; i < SysPageCount(); i++) {
+            SysPageLower e;
+            e.name = BangLower(kSysPages[i].name);
+            e.keywords = BangLower(kSysPages[i].keywords);
+            v.push_back(std::move(e));
+        }
+        return v;
+    }();
+    return table;
 }

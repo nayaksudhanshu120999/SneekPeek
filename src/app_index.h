@@ -43,9 +43,18 @@ std::vector<ScoredApp> SearchApps(const std::vector<AppEntry>& apps,
                                  const std::wstring& query,
                                  size_t limit = 7);
 
+// Same, but `query` must already be lowercased and trimmed. The palette
+// lowercases the typed text once per keystroke and shares it with the settings
+// pages and chips, so this variant avoids re-copying it per call.
+std::vector<ScoredApp> SearchAppsLower(const std::vector<AppEntry>& apps,
+                                       const std::wstring& queryLower,
+                                       size_t limit = 7);
+
 // Persisted index cache (%APPDATA%\\SneekPeek\\apps.cache): versioned binary,
 // exact-size validated on load. lower[] is recomputed, not stored.
 bool SaveAppCache(const std::wstring& path, const std::vector<AppEntry>& apps);
 bool LoadAppCache(const std::wstring& path, std::vector<AppEntry>& out);
 
-std::wstring ToLower(std::wstring s);
+std::wstring ToLower(const std::wstring& s);
+// Fold to lowercase in place: same result, no temporary copy.
+void ToLowerInPlace(std::wstring& s);

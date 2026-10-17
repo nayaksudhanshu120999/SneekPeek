@@ -2,15 +2,25 @@
 #include "minjson.h"
 #include <windows.h>
 #include <cstdint>
+#include <cstddef>
+#include <cwctype> // towlower in ToLower
+#include <cwchar>   // _wcsnicmp in IsRunnableTarget / StartsWithUninstall
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <shlguid.h>
 #include <shlwapi.h>
 #include <algorithm>
 
-std::wstring ToLower(std::wstring s) {
+std::wstring ToLower(const std::wstring& s) {
+    std::wstring out = s;
+    for (auto& c : out) c = (wchar_t)towlower(c);
+    return out;
+}
+
+// Same transform, in place: no second buffer, and callers that only need the
+// folded form stop allocating a temporary copy per item.
+void ToLowerInPlace(std::wstring& s) {
     for (auto& c : s) c = (wchar_t)towlower(c);
-    return s;
 }
 
 static std::wstring ExpandEnvLocal(const std::wstring& s) {
@@ -25,27 +35,55 @@ static std::wstring ExpandEnvLocal(const std::wstring& s) {
 
 // Resolve a .lnk to its target path. False when unresolvable (special shell
 // links) - callers keep those; they are usually real system tools.
-static bool ResolveLnk(const std::wstring& lnk, std::wstring& target) {
-    IShellLinkW* sl = NULL;
-    if (CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
-                         IID_IShellLinkW, (void**)&sl) != S_OK)
-        return false;
-    IPersistFile* pf = NULL;
-    bool ok = false;
-    if (sl->QueryInterface(IID_IPersistFile, (void**)&pf) == S_OK) {
-        if (pf->Load(lnk.c_str(), STGM_READ) == S_OK) {
-            wchar_t path[1024] = {0};
-            WIN32_FIND_DATAW fd{};
-            if (sl->GetPath(path, 1024, &fd, SLGP_UNCPRIORITY) == S_OK && path[0]) {
-                target = ExpandEnvLocal(path);
-                ok = true;
+//
+// The shell-link COM object is created once per scan and re-Load()ed per link.
+// CoCreateInstance + QueryInterface per file meant hundreds of object
+// creations for a typical Start Menu.
+class LnkResolver {
+    IShellLinkW* m_sl;
+    IPersistFile* m_pf;
+public:
+    LnkResolver() : m_sl(NULL), m_pf(NULL) {
+        if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                                       IID_IShellLinkW, (void**)&m_sl)) && m_sl) {
+            if (FAILED(m_sl->QueryInterface(IID_IPersistFile, (void**)&m_pf))) {
+                m_sl->Release();
+                m_sl = NULL;
             }
         }
-        pf->Release();
     }
-    sl->Release();
-    return ok;
-}
+    ~LnkResolver() {
+        if (m_pf) m_pf->Release();
+        if (m_sl) m_sl->Release();
+    }
+    bool Resolve(const std::wstring& lnk, std::wstring& target) {
+        if (!m_pf) return false;
+        if (FAILED(m_pf->Load(lnk.c_str(), STGM_READ))) return false;
+        // MAX_PATH-sized buffer, plus a long-path probe: a deep .lnk target can
+        // exceed 1023 chars, and GetPath returning S_OK with a truncated path
+        // would yield a wrong extension (and so a wrong runnable/not decision).
+        wchar_t path[1024] = {0};
+        WIN32_FIND_DATAW fd{};
+        HRESULT hr = m_sl->GetPath(path, 1024, &fd, SLGP_UNCPRIORITY);
+        if (hr == S_OK && path[0]) {
+            // Expand only when the target actually holds an env reference.
+            // Callers use the result solely for its extension, so the expansion
+            // (two ExpandEnvironmentStringsW passes plus an allocation) was
+            // thrown away for essentially every link.
+            target = (wcschr(path, L'%') != NULL) ? ExpandEnvLocal(path) : path;
+            return true;
+        }
+        if (hr != S_FALSE) return false; // S_OK-but-empty: unresolvable link
+        // S_FALSE = buffer too small: retry once at a larger size.
+        std::vector<wchar_t> big(32768, L'\0');
+        if (FAILED(m_sl->GetPath(big.data(), (int)big.size(), &fd,
+                                 SLGP_UNCPRIORITY)) || !big[0])
+            return false;
+        target = (wcschr(big.data(), L'%') != NULL) ? ExpandEnvLocal(big.data())
+                                                    : big.data();
+        return true;
+    }
+};
 
 // Only executable targets belong in the index: drops .txt/.chm/.pdf links etc.
 static bool IsRunnableTarget(const std::wstring& target) {
@@ -53,15 +91,21 @@ static bool IsRunnableTarget(const std::wstring& target) {
     size_t sep = target.find_last_of(L"\\/");
     if (dot == std::wstring::npos || (sep != std::wstring::npos && dot < sep))
         return true; // no extension: keep (some tools are extensionless)
-    std::wstring ext = ToLower(target.substr(dot + 1));
-    return ext == L"exe" || ext == L"msc" || ext == L"bat" ||
-           ext == L"cmd" || ext == L"com" || ext == L"pif" ||
-           ext == L"scr" || ext == L"cpl";
+    // Compare case-insensitively in place, without materializing the extension.
+    size_t n = target.size() - (dot + 1);
+    const wchar_t* ext = target.c_str() + dot + 1;
+    auto is = [&](const wchar_t* want) {
+        size_t wl = 0;
+        while (want[wl]) wl++;
+        return wl == n && _wcsnicmp(ext, want, n) == 0;
+    };
+    return is(L"exe") || is(L"msc") || is(L"bat") || is(L"cmd") ||
+           is(L"com") || is(L"pif") || is(L"scr") || is(L"cpl");
 }
 
 static bool StartsWithUninstall(const std::wstring& name) {
-    std::wstring n = ToLower(name);
-    return n.compare(0, 9, L"uninstall") == 0;
+    return name.size() >= 9 &&
+           _wcsnicmp(name.c_str(), L"uninstall", 9) == 0;
 }
 
 // True for direct filesystem paths ("C:\...", "\\server\..."): the only
@@ -76,6 +120,8 @@ static bool IsAbsoluteFilePath(const std::wstring& p) {
 }
 
 static void ScanLnkDir(const std::wstring& root, std::vector<AppEntry>& out) {
+    // One COM shell-link for the whole directory walk (see LnkResolver).
+    LnkResolver lnk;
     std::vector<std::wstring> stack;
     stack.push_back(root);
 
@@ -111,14 +157,15 @@ static void ScanLnkDir(const std::wstring& root, std::vector<AppEntry>& out) {
             std::wstring full = dir + L"\\" + fd.cFileName;
             if (isLnk) {
                 std::wstring target;
-                if (ResolveLnk(full, target) && !IsRunnableTarget(target))
+                if (lnk.Resolve(full, target) && !IsRunnableTarget(target))
                     continue; // .lnk to a doc/help file: drop
             }
             AppEntry e;
-            e.name = base;
-            e.lower = ToLower(base);
             e.target = full;
             e.isStore = false;
+            e.lower = base;   // fold the copy we keep, not the original
+            ToLowerInPlace(e.lower);
+            e.name = std::move(base);
             out.push_back(std::move(e));
         } while (FindNextFileW(h, &fd));
         FindClose(h);
@@ -144,8 +191,12 @@ static bool ItemToStoreApp(IShellItem* it, AppEntry& out) {
     if (it->QueryInterface(IID_IShellItem2, (void**)&i2) == S_OK) {
         LPWSTR aumid = NULL;
         if (i2->GetString(kKeyAumid, &aumid) == S_OK && aumid && *aumid) {
+            // `name` is COM-allocated and freed below, so it must be copied twice here:
+            // once for display, once folded for search. Fold the second copy in
+            // place rather than running the whole name through a third buffer.
             out.name = name;
-            out.lower = ToLower(name);
+            out.lower = name;
+            ToLowerInPlace(out.lower);
             out.target = std::wstring(L"shell:AppsFolder\\") + aumid;
             out.isStore = true;
             ok = true;
@@ -246,7 +297,8 @@ static void ScanPathExes(std::vector<AppEntry>& out) {
             std::wstring fn = fd.cFileName;
             auto dot = fn.rfind(L'.');
             e.name = (dot == std::wstring::npos) ? fn : fn.substr(0, dot);
-            e.lower = ToLower(e.name);
+            e.lower = e.name;   // fold the copy we keep
+            ToLowerInPlace(e.lower);
             e.isStore = false;
             out.push_back(std::move(e));
             if (++perDir > 150 || out.size() >= 6000) break;
@@ -376,7 +428,8 @@ static void ScanStartAppsPS(std::vector<AppEntry>& out, const std::atomic<bool>*
             continue;
         AppEntry e;
         e.name = name;
-        e.lower = ToLower(name);
+        e.lower = name;   // fold the copy we keep
+        ToLowerInPlace(e.lower);
         if (appid.find(L'!') != std::wstring::npos) {
             e.target = L"shell:AppsFolder\\" + appid; // Store app
             e.isStore = true;
@@ -387,7 +440,10 @@ static void ScanStartAppsPS(std::vector<AppEntry>& out, const std::atomic<bool>*
             size_t sep = appid.find_last_of(L"\\/");
             if (dot != std::wstring::npos &&
                 (sep == std::wstring::npos || dot > sep)) {
-                std::wstring ext = ToLower(appid.substr(dot + 1));
+                // Same runnable-extension policy as ScanLnkDir, plus .lnk
+                // (Start-apps can hand back a link to a link).
+                std::wstring ext = appid.substr(dot + 1);
+                ToLowerInPlace(ext);
                 if (!(ext == L"exe" || ext == L"msc" || ext == L"bat" ||
                       ext == L"cmd" || ext == L"com" || ext == L"pif" ||
                       ext == L"scr" || ext == L"cpl" || ext == L"lnk"))
@@ -434,19 +490,20 @@ void BuildAppIndex(std::vector<AppEntry>& out, bool includePathExes,
     if (com) CoUninitialize();
 
     // Sort by name; .lnk wins ties over Store/PATH dupes. Then de-dupe.
+    // One compare() instead of != followed by <: the old form scanned every
+    // name twice per sort comparison (thousands of entries at most).
     std::sort(out.begin(), out.end(), [](const AppEntry& a, const AppEntry& b) {
-        if (a.lower != b.lower) return a.lower < b.lower;
+        int c = a.lower.compare(b.lower);
+        if (c != 0) return c < 0;
         return (a.isStore ? 1 : 0) < (b.isStore ? 1 : 0);
     });
     std::vector<AppEntry> uniq;
     uniq.reserve(out.size());
-    std::wstring prev;
-    bool first = true;
+    // Compare against the last kept entry instead of copying into `prev`,
+    // which allocated one string per unique app (~6000 on a big machine).
     for (auto& e : out) {
-        if (!first && e.lower == prev) continue;
-        prev = e.lower;
+        if (!uniq.empty() && e.lower == uniq.back().lower) continue;
         uniq.push_back(std::move(e));
-        first = false;
     }
     out.swap(uniq);
 }
@@ -501,6 +558,33 @@ int FuzzyScore(const std::wstring& nameLower, const std::wstring& queryLower) {
     return total > 0 ? total : 1; // every full subsequence still matches, weakly
 }
 
+// Filter + rank against an ALREADY lowercased, trimmed query. The palette
+// lowercases the query once per keystroke and reuses it for apps, settings
+// pages and chips, so this variant skips that copy.
+std::vector<ScoredApp> SearchAppsLower(const std::vector<AppEntry>& apps,
+                                       const std::wstring& q,
+                                       size_t limit) {
+    if (q.empty()) return {};
+    std::vector<ScoredApp> hits;
+    hits.reserve(32);
+    for (const auto& app : apps) {
+        int s = FuzzyScore(app.lower, q);
+        if (s >= 0) hits.push_back({&app, s});
+    }
+    // Only `limit` rows are ever used, so sort just that prefix. A 1-2 char
+    // query matches most of the index as a weak subsequence, and the previous
+    // full std::sort ranked thousands of entries only to keep 4.
+    if (limit && hits.size() > limit) {
+        std::partial_sort(hits.begin(), hits.begin() + (std::ptrdiff_t)limit,
+                          hits.end(),
+                          [](const ScoredApp& x, const ScoredApp& y) {
+                              return x.score > y.score;
+                          });
+        hits.resize(limit);
+    }
+    return hits;
+}
+
 std::vector<ScoredApp> SearchApps(const std::vector<AppEntry>& apps,
                                  const std::wstring& query,
                                  size_t limit) {
@@ -509,18 +593,7 @@ std::vector<ScoredApp> SearchApps(const std::vector<AppEntry>& apps,
     if (a == std::wstring::npos) return {};
     size_t b = q.find_last_not_of(L" \t");
     q = q.substr(a, b - a + 1);
-    if (q.empty()) return {};
-
-    std::vector<ScoredApp> hits;
-    hits.reserve(32);
-    for (const auto& app : apps) {
-        int s = FuzzyScore(app.lower, q);
-        if (s >= 0) hits.push_back({&app, s});
-    }
-    std::sort(hits.begin(), hits.end(),
-              [](const ScoredApp& x, const ScoredApp& y) { return x.score > y.score; });
-    if (hits.size() > limit) hits.resize(limit);
-    return hits;
+    return SearchAppsLower(apps, q, limit);
 }
 
 // ------------------------------------------------------- persisted index cache
@@ -602,7 +675,8 @@ bool LoadAppCache(const std::wstring& path, std::vector<AppEntry>& out) {
         if (!ReadWStr(p, end, e.name) || !ReadWStr(p, end, e.target) ||
             !ReadU32(p, end, flags))
             return false;
-        e.lower = ToLower(e.name);
+        e.lower = e.name;   // recomputed, never stored: fold the copy we keep
+        ToLowerInPlace(e.lower);
         e.isStore = (flags & 1u) != 0;
         fresh.push_back(std::move(e));
     }

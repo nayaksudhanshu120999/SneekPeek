@@ -5,6 +5,7 @@
 #include <shlobj.h>
 #include <shellapi.h>
 #include <cstdio>
+#include <cwchar> // _wcsicmp in HistoryKeyEq / ParseThemeLine
 #include <string>
 #include <vector>
 #include "bangs.h"
@@ -129,25 +130,28 @@ struct HistoryItem {
 };
 inline constexpr size_t kMaxHistory = 20;
 // Dedupe identity: same kind + same target (engine searches match on title).
-inline std::wstring HistoryKey(const HistoryItem& h) {
-    std::wstring key;
-    key += (h.kind == ResultKind::App) ? L'A' : (h.kind == ResultKind::Web) ? L'W' : L'F';
-    key += L'|';
-    key += h.action;
-    if (h.kind == ResultKind::Web && h.action.empty()) {
-        key += L'|';
-        key += h.title;
-    }
-    return key;
+// Compared field by field rather than via a serialized key string: HistoryAdd
+// used to rebuild every existing entry's key inside its scan loop, so one
+// insert allocated up to kMaxHistory strings. App/file/web targets are short
+// and this runs on every launch, search and folder drill.
+inline bool HistoryKeyEq(const HistoryItem& a, const HistoryItem& b) {
+    auto tag = [](ResultKind k) {
+        return (k == ResultKind::App) ? L'A' : (k == ResultKind::Web) ? L'W' : L'F';
+    };
+    if (tag(a.kind) != tag(b.kind)) return false;
+    if (_wcsicmp(a.action.c_str(), b.action.c_str()) != 0) return false;
+    // Engine searches carry no target, so they dedupe on the query instead.
+    if (a.kind == ResultKind::Web && a.action.empty() && b.action.empty())
+        return _wcsicmp(a.title.c_str(), b.title.c_str()) == 0;
+    return true;
 }
 inline void HistoryAdd(std::vector<HistoryItem>& h, const HistoryItem& item) {
     if (item.title.empty() && item.action.empty()) return;
     if (item.kind != ResultKind::App && item.kind != ResultKind::Web &&
         item.kind != ResultKind::File && item.kind != ResultKind::Folder)
         return;
-    std::wstring key = HistoryKey(item);
     for (auto it = h.begin(); it != h.end(); ++it) {
-        if (_wcsicmp(HistoryKey(*it).c_str(), key.c_str()) == 0) {
+        if (HistoryKeyEq(*it, item)) {
             h.erase(it);
             break;
         }
@@ -264,19 +268,29 @@ struct Settings {
     std::vector<HistoryItem> history; // merged recency: apps, files, searches
 };
 
-inline std::wstring SettingsPath() {
-    wchar_t appdata[MAX_PATH];
-    if (FAILED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appdata)))
-        return L"settings.ini";
-    std::wstring dir = std::wstring(appdata) + L"\\SneekPeek";
-    CreateDirectoryW(dir.c_str(), NULL);
-    return dir + L"\\settings.ini";
+// Resolved once per process: every load/save/cache/theme path needs this, and
+// each call used to cost a SHGetFolderPathW + a CreateDirectoryW syscall.
+inline const std::wstring& SettingsPath() {
+    static const std::wstring path = [] {
+        wchar_t appdata[MAX_PATH];
+        if (FAILED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appdata)))
+            return std::wstring(L"settings.ini");
+        std::wstring dir = std::wstring(appdata) + L"\\SneekPeek";
+        CreateDirectoryW(dir.c_str(), NULL);
+        return dir + L"\\settings.ini";
+    }();
+    return path;
 }
 
-inline std::wstring AppCachePath() {
-    std::wstring ini = SettingsPath(); // ensures the directory exists
+// Directory holding settings.ini, apps.cache and theme.ini. SettingsPath()
+// resolves (and creates) it once per process.
+inline std::wstring SettingsDir() {
+    const std::wstring& ini = SettingsPath();
     size_t p = ini.rfind(L'\\');
-    return (p == std::wstring::npos ? L"" : ini.substr(0, p + 1)) + L"apps.cache";
+    return (p == std::wstring::npos) ? std::wstring(L"") : ini.substr(0, p + 1);
+}
+inline std::wstring AppCachePath() {
+    return SettingsDir() + L"apps.cache";
 }
 
 // Split on '|' (single-line INI value <-> lines).
@@ -293,15 +307,6 @@ inline std::vector<std::wstring> SplitPipe(const std::wstring& s) {
     return out;
 }
 
-inline std::wstring JoinPipe(const std::vector<std::wstring>& v) {
-    std::wstring s;
-    for (size_t i = 0; i < v.size(); i++) {
-        if (i) s += L"|";
-        s += v[i];
-    }
-    return s;
-}
-
 // Boot-cheap core: General section only (a handful of INI reads) plus
 // in-memory defaults for the lists, so the palette works before the full
 // lists are loaded. Call LoadSettingsLists() (via EnsureSettingsLists in
@@ -311,7 +316,7 @@ inline void LoadSettingsCore(Settings& s) {
     // Seed one example so the feature is discoverable until lists load.
     s.quicks = {{L"Gmail", L"https://mail.google.com"}};
     s.hiddenApps.clear();
-    std::wstring ini = SettingsPath();
+    const std::wstring& ini = SettingsPath(); // resolved once per process
     wchar_t buf[4096];
     GetPrivateProfileStringW(L"General", L"EngineUrl", s.engineUrl.c_str(),
                              buf, 4096, ini.c_str());
@@ -342,7 +347,7 @@ inline void LoadSettingsCore(Settings& s) {
 // Deferred lists: hidden apps + bangs + quick links (dozens of INI reads).
 // Runs once on first palette show / Settings open / pre-save, never at boot.
 inline void LoadSettingsLists(Settings& s) {
-    std::wstring ini = SettingsPath();
+    const std::wstring& ini = SettingsPath();
     wchar_t buf[4096];
     int hcount = GetPrivateProfileIntW(L"General", L"HiddenCount", -1, ini.c_str());
     if (hcount >= 0) {
@@ -358,7 +363,12 @@ inline void LoadSettingsLists(Settings& s) {
         s.hiddenApps = SplitPipe(buf); // legacy single-value format
     }
 
-    int count = GetPrivateProfileIntW(L"Bangs", L"Count", 0, ini.c_str());
+    // -1 (key absent) = never configured: keep the defaults seeded by
+    // LoadSettingsCore. 0 = the user deleted every bang, which must stay
+    // deleted. Reading the default as 0 conflated those two cases, so deleting
+    // the last bang resurrected all 11 defaults on the next launch. This now
+    // mirrors the [Quick] block below exactly.
+    int count = GetPrivateProfileIntW(L"Bangs", L"Count", -1, ini.c_str());
     count = ClampCustomCount(count); // clamp, never drop all
     if (count > 0) {
         std::vector<Bang> custom;
@@ -370,7 +380,13 @@ inline void LoadSettingsLists(Settings& s) {
             Bang b;
             if (ParseBangLine(buf, b)) custom.push_back(std::move(b));
         }
-        if (!custom.empty()) s.bangs = std::move(custom);
+        // A Count>0 means the user has a custom list, so keep what parsed even if
+        // some lines were rejected. Falling back to the defaults when the
+        // custom list comes back empty would silently resurrect bangs the user
+        // deleted - the old code did exactly that.
+        s.bangs = std::move(custom);
+    } else if (count == 0) {
+        s.bangs.clear(); // explicitly emptied: stay empty
     }
 
     // -1 = never configured: keep the seeded example from LoadSettingsCore.
@@ -414,69 +430,149 @@ inline void LoadSettings(Settings& s) {
     LoadSettingsLists(s);
 }
 
-inline void SaveSettings(const Settings& s) {
-    std::wstring ini = SettingsPath();
-    WritePrivateProfileStringW(L"General", L"EngineUrl", s.engineUrl.c_str(), ini.c_str());
-    WritePrivateProfileStringW(L"General", L"EngineName", s.engineName.c_str(), ini.c_str());
-    WritePrivateProfileStringW(L"General", L"BrowserPath", s.browserPath.c_str(), ini.c_str());
-    WritePrivateProfileStringW(L"General", L"HiddenApps", JoinPipe(s.hiddenApps).c_str(), ini.c_str());
+// ------------------------------------------------- one-shot INI serialization
+// WritePrivateProfileStringW rewrites (and relocks) the WHOLE file on every
+// single key, so the old SaveSettings turned one save into hundreds of
+// read-modify-write cycles of settings.ini (~2000 with a long hidden list).
+// We own the whole schema, so we serialize it in memory and write it once.
+//
+// Quoting mirrors the profile API's own rule: a value is wrapped in quotes when
+// it has leading/trailing whitespace or contains ';' (the only INI comment
+// character on Windows). '#' is not special in Windows INI files, and embedded
+// quotes are deliberately left unquoted because Windows has no escape for them.
+inline std::wstring IniQuote(const std::wstring& v) {
+    bool ws = !v.empty() && (v.front() == L' ' || v.front() == L'\t' ||
+                             v.back() == L' ' || v.back() == L'\t');
+    if (!ws && v.find(L';') != std::wstring::npos) ws = true;
+    return ws ? (L"\"" + v + L"\"") : v;
+}
+
+struct IniBuf {
+    std::wstring text;
+    bool haveSection = false;
+    void open(const wchar_t* s) {
+        if (haveSection) text += L"\r\n";
+        haveSection = true;
+        text += L"[";
+        text += s;
+        text += L"]\r\n";
+    }
+    void put(const wchar_t* key, const std::wstring& val) {
+        if (!haveSection) open(L"General");
+        text += key;
+        text += L"=";
+        text += IniQuote(val);
+        text += L"\r\n";
+    }
+    void putInt(const wchar_t* key, int n) {
+        wchar_t b[16];
+        swprintf_s(b, 16, L"%d", n);
+        put(key, b);
+    }
+};
+
+// Write atomically via a temp file + rename: a crash mid-write can no longer
+// leave a half-written settings.ini (the per-key API could).
+inline bool WriteTextFileAtomic(const std::wstring& path, const std::wstring& body) {
+    std::wstring tmp = path + L".tmp";
+    // UTF-16LE BOM: without it the profile API treats the file as ANSI and
+    // non-ASCII app names / queries come back as mojibake.
+    std::wstring payload;
+    payload.reserve(body.size() + 1);
+    payload.push_back((wchar_t)0xFEFF);
+    payload += body;
+
+    HANDLE hf = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, NULL,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+    const char* p = (const char*)payload.data();
+    DWORD left = (DWORD)(payload.size() * sizeof(wchar_t));
+    bool ok = true;
+    while (left) {
+        DWORD n = 0;
+        if (!WriteFile(hf, p, left, &n, NULL) || n == 0) { ok = false; break; }
+        p += n;
+        left -= n;
+    }
+    CloseHandle(hf);
+    if (!ok) { DeleteFileW(tmp.c_str()); return false; }
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+// Returns false if the file could not be written (read-only profile, disk
+// full, locked by a sync client). Callers treat Settings as the source of
+// truth regardless, so a failed write only costs persistence, never state.
+inline bool SaveSettings(const Settings& s) {
+    IniBuf ini;
+
+    ini.open(L"General");
+    ini.put(L"EngineUrl", s.engineUrl);
+    ini.put(L"EngineName", s.engineName);
+    ini.put(L"BrowserPath", s.browserPath);
+    // Legacy pipe-joined HiddenApps is intentionally not written: it is only
+    // ever read as a fallback when HiddenCount is absent, and we always write
+    // HiddenCount. Keeping it meant serializing the whole list twice.
     {
-        wchar_t hc[16];
         size_t hn = s.hiddenApps.size() < 2000 ? s.hiddenApps.size() : 2000;
-        swprintf_s(hc, 16, L"%d", (int)hn);
-        WritePrivateProfileStringW(L"General", L"HiddenCount", hc, ini.c_str());
+        ini.putInt(L"HiddenCount", (int)hn);
         wchar_t key[32];
         for (size_t i = 0; i < hn; i++) {
             swprintf_s(key, 32, L"Hidden%d", (int)i);
-            WritePrivateProfileStringW(L"General", key, s.hiddenApps[i].c_str(), ini.c_str());
+            ini.put(key, s.hiddenApps[i]);
         }
     }
-    WritePrivateProfileStringW(L"General", L"IncludePathExes", s.includePathExes ? L"1" : L"0", ini.c_str());
-    WritePrivateProfileStringW(L"General", L"RunAtStartup", s.runAtStartup ? L"1" : L"0", ini.c_str());
-    WritePrivateProfileStringW(L"General", L"Awake", s.awakeOn ? L"1" : L"0", ini.c_str());
-    WritePrivateProfileStringW(L"General", L"FileGrid", s.fileGrid ? L"1" : L"0", ini.c_str());
-    {
-        wchar_t nr[16], nc[16];
-        swprintf_s(nr, 16, L"%d", s.gridRows);
-        swprintf_s(nc, 16, L"%d", s.gridCols);
-        WritePrivateProfileStringW(L"General", L"GridRows", nr, ini.c_str());
-        WritePrivateProfileStringW(L"General", L"GridCols", nc, ini.c_str());
-    }
-    {
-        for (int i = 0; i < ThemeFieldCount(); i++)
-            WritePrivateProfileStringW(L"Theme", kThemeFields[i].key,
-                SerializeColor(s.theme.*(kThemeFields[i].member)).c_str(),
-                ini.c_str());
-    }
+    ini.put(L"IncludePathExes", s.includePathExes ? L"1" : L"0");
+    ini.put(L"RunAtStartup", s.runAtStartup ? L"1" : L"0");
+    ini.put(L"Awake", s.awakeOn ? L"1" : L"0");
+    ini.put(L"FileGrid", s.fileGrid ? L"1" : L"0");
+    ini.putInt(L"GridRows", s.gridRows);
+    ini.putInt(L"GridCols", s.gridCols);
+
+    ini.open(L"Theme");
+    for (int i = 0; i < ThemeFieldCount(); i++)
+        ini.put(kThemeFields[i].key,
+                SerializeColor(s.theme.*(kThemeFields[i].member)));
+
+    ini.open(L"Bangs");
     size_t nbangs = s.bangs.size() < (size_t)kMaxCustomEntries
         ? s.bangs.size() : (size_t)kMaxCustomEntries;
-    wchar_t count[16];
-    swprintf_s(count, 16, L"%d", (int)nbangs);
-    WritePrivateProfileStringW(L"Bangs", L"Count", count, ini.c_str());
-    wchar_t key[32];
-    for (size_t i = 0; i < nbangs; i++) {
-        swprintf_s(key, 32, L"Bang%d", (int)i);
-        WritePrivateProfileStringW(L"Bangs", key, SerializeBang(s.bangs[i]).c_str(), ini.c_str());
+    ini.putInt(L"Count", (int)nbangs);
+    {
+        wchar_t key[32];
+        for (size_t i = 0; i < nbangs; i++) {
+            swprintf_s(key, 32, L"Bang%d", (int)i);
+            ini.put(key, SerializeBang(s.bangs[i]));
+        }
     }
+
+    ini.open(L"Quick");
     size_t nquick = s.quicks.size() < (size_t)kMaxCustomEntries
         ? s.quicks.size() : (size_t)kMaxCustomEntries;
-    wchar_t qcount[16];
-    swprintf_s(qcount, 16, L"%d", (int)nquick);
-    WritePrivateProfileStringW(L"Quick", L"Count", qcount, ini.c_str());
-    for (size_t i = 0; i < nquick; i++) {
-        swprintf_s(key, 32, L"Quick%d", (int)i);
-        std::wstring line = s.quicks[i].name + L" | " + s.quicks[i].url;
-        WritePrivateProfileStringW(L"Quick", key, line.c_str(), ini.c_str());
+    ini.putInt(L"Count", (int)nquick);
+    {
+        wchar_t key[32];
+        for (size_t i = 0; i < nquick; i++) {
+            swprintf_s(key, 32, L"Quick%d", (int)i);
+            ini.put(key, s.quicks[i].name + L" | " + s.quicks[i].url);
+        }
     }
+
+    ini.open(L"History");
     size_t nhist = s.history.size() < kMaxHistory ? s.history.size() : kMaxHistory;
-    wchar_t hcount[16];
-    swprintf_s(hcount, 16, L"%d", (int)nhist);
-    WritePrivateProfileStringW(L"History", L"Count", hcount, ini.c_str());
-    for (size_t i = 0; i < nhist; i++) {
-        swprintf_s(key, 32, L"Item%d", (int)i);
-        WritePrivateProfileStringW(L"History", key,
-            SerializeHistoryItem(s.history[i]).c_str(), ini.c_str());
+    ini.putInt(L"Count", (int)nhist);
+    {
+        wchar_t key[32];
+        for (size_t i = 0; i < nhist; i++) {
+            swprintf_s(key, 32, L"Item%d", (int)i);
+            ini.put(key, SerializeHistoryItem(s.history[i]));
+        }
     }
+
+    return WriteTextFileAtomic(SettingsPath(), ini.text); // resolved once
 }
 
 // ------------------------------------------------- theme.ini (plain-text theme file)
@@ -484,9 +580,7 @@ inline void SaveSettings(const Settings& s) {
 // who'd rather edit colors in Notepad than click swatches. settings.ini stays
 // the store: "Edit file" exports the live theme, "Reload" imports + saves.
 inline std::wstring ThemeIniPath() {
-    std::wstring ini = SettingsPath(); // ensures the directory exists
-    size_t p = ini.rfind(L'\\');
-    return (p == std::wstring::npos ? L"" : ini.substr(0, p + 1)) + L"theme.ini";
+    return SettingsDir() + L"theme.ini";
 }
 
 // One theme.ini line: "Key = #RRGGBB" (spacing/case tolerant). False for
