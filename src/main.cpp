@@ -233,6 +233,7 @@ static int         g_bangChipW = 0;  // 0 = hidden
 // Hover preview row (results index, -1 = none): painted as a subtle fill,
 // never touches selection or the multi-set.
 static int         g_hoverRow = -1;
+static bool        g_hexOpen = false; // color-picker modal loop guard
 static HWND        g_hwndSettings = NULL;
 static int         g_settingsPage = 0;
 static HWND        g_hwndEngineCombo = NULL;
@@ -1137,11 +1138,13 @@ static void ExecuteFileSelected(bool inExplorer) {
 // One merged recency list across apps, files/folders, and web searches
 // (persisted in [History]). Up on an empty box shows it newest-first;
 // Enter acts per row kind. Names only, never paths or URLs.
+static bool g_historyDirty = false; // set when history changes in-flight
+
 static void HistoryRecord(const HistoryItem& item) {
     if (item.title.empty() && item.action.empty()) return;
     EnsureSettingsLists(); // SaveSettings rewrites every section
     HistoryAdd(g_settings.history, item);
-    SaveNow(); // instant persist, like the rest of Settings
+    g_historyDirty = true; // persist on next explicit SaveNow() or at exit
 }
 // Up on an empty box: replace results with the merged recency list.
 // Returns false when there is nothing to show (caller falls through to
@@ -2003,9 +2006,17 @@ static LRESULT CALLBACK ListSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
         // or disturbs the multi-set.
         int hov = ListRowFromPoint(h, l);
         if (hov != g_hoverRow) {
+            int old = g_hoverRow;
             g_hoverRow = hov;
+            auto invalidateRow = [&](int row) {
+                if (row < 0 || !h) return;
+                RECT r{};
+                if (SendMessageW(h, LB_GETITEMRECT, row, (LPARAM)&r) != LB_ERR)
+                    InvalidateRect(h, &r, FALSE);
+            };
             if (hov >= 0) TrackHoverLeave(h);
-            InvalidateRect(h, NULL, FALSE);
+            invalidateRow(old);
+            invalidateRow(hov);
         }
         return DefSubclassProc(h, m, w, l);
     }
@@ -2663,16 +2674,41 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         // Hover preview only: never moves selection or the multi-set.
         int hov = GridHitTest(GET_X_LPARAM(l), GET_Y_LPARAM(l));
         if (hov != g_hoverRow) {
+            int old = g_hoverRow;
             g_hoverRow = hov;
+            auto invalidateTile = [&](int idx) {
+                if (idx < 0 || !hwnd) return;
+                size_t base = (!g_results.empty() &&
+                               g_results.front().kind == ResultKind::Header) ? 1 : 0;
+                int y = base ? kGridHeadH : 0;
+                RECT cl;
+                if (!GetClientRect(hwnd, &cl)) return;
+                int cols = GridColsEff();
+                if (cols < 1) cols = 1;
+                int tw = (cl.right - cl.left) / cols;
+                if (tw <= 0) return;
+                size_t t = (size_t)idx - base;
+                int r = (int)(t / (size_t)cols) - g_gridTopRow;
+                int c = (int)(t % (size_t)cols);
+                if (r < 0 || r >= GridRows() || c < 0 || c >= cols) return;
+                RECT tile{cl.left + c * tw + Dpx(2), y + r * kGridTileH,
+                          cl.left + (c + 1) * tw - Dpx(2), y + (r + 1) * kGridTileH};
+                InvalidateRect(hwnd, &tile, FALSE);
+            };
             if (hov >= 0) TrackHoverLeave(hwnd);
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidateTile(old);
+            invalidateTile(hov);
         }
         break;
     }
     case WM_MOUSELEAVE:
         if (g_hoverRow >= 0) {
             g_hoverRow = -1;
-            InvalidateRect(hwnd, NULL, FALSE);
+            // Invalidate every tile region that could have shown a hover fill.
+            {
+                RECT cl;
+                if (GetClientRect(hwnd, &cl)) InvalidateRect(hwnd, &cl, FALSE);
+            }
         }
         return 0;
     case WM_MOUSEWHEEL: // wheel over tiles moves through them
@@ -3722,6 +3758,10 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_APP_INDEX: { // background index published: adopt on the UI thread
+        if (g_quitting.load()) { // shutting down: drop any in-flight index
+            delete g_pendingIndex.exchange(nullptr);
+            break;
+        }
         auto* p = g_pendingIndex.exchange(nullptr);
         if (p) {
             g_apps.swap(*p);
@@ -4218,7 +4258,7 @@ static LRESULT CALLBACK PlainEditSubclass(HWND h, UINT m, WPARAM w, LPARAM l,
 // (Replaces the system color dialog: hex-only, per the theme-file format.)
 static const wchar_t* kHexDlgClass = L"SneekPeekHexEdit";
 static bool g_hexAccepted = false;
-static bool g_hexOpen = false; // modal loop guard (never PostQuitMessage here:
+// g_hexOpen declared above; modal loop guard (never PostQuitMessage here:
 static COLORREF g_hexValue = RGB(0, 0, 0); // that would quit the whole app)
 static HWND g_hexEdit = NULL;
 static bool g_hexClassReady = false;
@@ -5104,8 +5144,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmd, int) {
 
     g_quitting.store(true); // deferred startup work must stand down too
     if (g_hwndPalette) KillTimer(g_hwndPalette, IDT_DEFERRED_REFRESH);
-    g_indexStop.store(true); // stop the indexer, then join it (bounded: ~2s)
-    if (g_indexThread.joinable()) g_indexThread.join();
+    g_indexStop.store(true); // stop the indexer; it exits on its own at next check
+    // Do not join at shutdown: ScanStartAppsPS can wait up to ~20s for a
+    // stuck PowerShell child, which would make the process appear not
+    // responding at quit. Process exit reclaims the thread; g_quitting +
+    // g_indexStop make it stand down cleanly.
+    if (g_historyDirty) SaveNow(); // persist any in-flight history entries
     delete g_pendingIndex.exchange(nullptr); // published but never consumed
     UnregisterHotKey(g_hwndPalette, HOTKEY_ID);
     if (g_oleInit) OleUninitialize(); // drop-target revoked in WM_DESTROY
