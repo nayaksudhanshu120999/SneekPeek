@@ -37,7 +37,7 @@
 #include <cstdio>
 #include <cstddef>
 #include <cstring> // memcpy in the tile ellipsis probe
-#include <new>     // std::nothrow
+#include <new>     // std::nothrow for the OLE drag/drop objects
 #include <wchar.h>
 #include <string>
 #include <vector>
@@ -209,7 +209,9 @@ static COLORREF ChipFill(COLORREF c) {
 // pass instead of one per pill. Lifetime is strictly bounded by the paint.
 struct PillPainter {
     Gdiplus::Graphics* g;
-    explicit PillPainter(HDC dc) : g(new (std::nothrow) Gdiplus::Graphics(dc)) {
+    // Plain new, not std::nothrow: GdiplusBase declares its own operator new,
+    // which takes no placement/nothrow form.
+    explicit PillPainter(HDC dc) : g(new Gdiplus::Graphics(dc)) {
         if (g) g->SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     }
     ~PillPainter() { delete g; }
@@ -256,6 +258,10 @@ static int         g_hoverRow = -1;
 // change must drop it, see ApplyThemeFromSettings).
 static HBRUSH      g_hoverBrush = NULL;
 static COLORREF    g_hoverBrushFor = (COLORREF)-1;
+// Both are defined with the code below but used earlier in the file
+// (ApplyThemeFromSettings, the palette chip/menu handlers, teardown).
+static void ReleaseHoverBrush();
+static void SaveOrWarn(const wchar_t* what);
 static bool        g_hexOpen = false; // color-picker modal loop guard
 static HWND        g_hwndSettings = NULL;
 static int         g_settingsPage = 0;
@@ -568,10 +574,6 @@ static void OpenSettings();
 static void CloseSettings();
 static void SaveNow();
 static void OnTrayCommand(UINT id);
-// Drop the theme-derived hover-fill brush. Defined with the painters further
-// down; declared here because ApplyThemeFromSettings and teardown both call it
-// before that point in the file.
-static void ReleaseHoverBrush();
 static void RebuildHiddenSet();
 static bool IsHiddenAppLower(const std::wstring& nameLower);
 static void ActivateBang(int idx, const std::wstring& query);
@@ -2624,7 +2626,7 @@ static void PaintHoverFill(HDC dc, const RECT& r) {
         g_hoverBrush = CreateSolidBrush(want);
         g_hoverBrushFor = want;
     }
-    if (g_hoverBrush) FillRect(dc, r, g_hoverBrush);
+    if (g_hoverBrush) FillRect(dc, &r, g_hoverBrush);
 }
 // Drop the cached hover brush. Idempotent; safe even if it was never made.
 static void ReleaseHoverBrush() {
@@ -2820,7 +2822,7 @@ static LRESULT CALLBACK FileGridProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
             bool isCur = ((int)i == sel);
             if (isCur) FillRect(dc, &tile, g_brSel);
             // Hover preview: subtle fill, visual only.
-            if (!isCur && (int)i == g_hoverRow) PaintHoverFill(dc, &tile);
+            if (!isCur && (int)i == g_hoverRow) PaintHoverFill(dc, tile);
             int gz = Dpx(32);
             int gx = tile.left + (tile.right - tile.left - gz) / 2;
             RECT gcell{gx, tile.top + Dpx(8), gx + gz, tile.top + Dpx(8) + gz};
@@ -3838,7 +3840,7 @@ static LRESULT CALLBACK PaletteProc(HWND hwnd, UINT m, WPARAM w, LPARAM l) {
         // Hover preview: a half-step between background and highlight.
         // Visual only — selection and the multi-set are untouched.
         if (!isHead && !sel && (int)ri == g_hoverRow)
-            PaintHoverFill(dc, &d->rcItem);
+            PaintHoverFill(dc, d->rcItem);
         if ((int)ri < (int)g_results.size()) {
             const ResultItem& r = g_results[ri];
             SetBkMode(dc, TRANSPARENT);
