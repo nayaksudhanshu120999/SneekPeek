@@ -876,13 +876,30 @@ int main() {
             IniBuf bad;
             bad.open(L"Bangs");
             bad.putInt(L"Count", 2);
-            bad.put(L"Bang0", L"this is not a valid bang line");
-            bad.put(L"Bang1", L"also|bad|novars%s");
+            bad.put(L"Bang0", L"this is not a valid bang line"); // no '|' at all
+            bad.put(L"Bang1", L"also|bad|novars");               // url has no %s
             CHECK(WriteTextFileAtomic(real, bad.text));
             Settings loaded;
             LoadSettingsCore(loaded, real);   // seeds the defaults...
             LoadSettingsLists(loaded, real);
             CHECK(loaded.bangs.empty()); // ...which the explicit list must win over
+
+            // Partially malformed: Count>0 still means "custom list", so the
+            // line that parsed is kept and only the broken one is dropped.
+            // Never the defaults, and never an all-or-nothing rollback.
+            IniBuf mixedLines;
+            mixedLines.open(L"Bangs");
+            mixedLines.putInt(L"Count", 2);
+            mixedLines.put(L"Bang0", L"this is not a valid bang line");
+            mixedLines.put(L"Bang1", L"y, yy | Y | https://example.com/?q=%s");
+            CHECK(WriteTextFileAtomic(real, mixedLines.text));
+            Settings partial;
+            LoadSettingsCore(partial, real);
+            LoadSettingsLists(partial, real);
+            CHECK(partial.bangs.size() == 1 &&
+                  partial.bangs[0].name == L"Y" &&
+                  partial.bangs[0].aliases.size() == 2);
+
             // Sanity: a well-formed list of the same shape does load.
             IniBuf good;
             good.open(L"Bangs");
