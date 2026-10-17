@@ -1609,13 +1609,14 @@ static void MatchSysPages(const std::wstring& qlower, std::vector<ResultItem>& o
         int s = s1 > s2 ? s1 : s2;
         if (s >= 0) hits.push_back({&kSysPages[i], s});
     }
-    // Only the best `limit` rows are ever read, so sort just that prefix
-    // instead of the whole match list.
-    if (limit && hits.size() > limit) {
+    // Always rank best-first, even when everything fits under the limit.
+    auto better = [](const Hit& a, const Hit& b) { return a.score > b.score; };
+    if (hits.size() > limit) {
         std::partial_sort(hits.begin(), hits.begin() + (std::ptrdiff_t)limit,
-                          hits.end(),
-                          [](const Hit& a, const Hit& b) { return a.score > b.score; });
+                          hits.end(), better);
         hits.resize(limit);
+    } else {
+        std::sort(hits.begin(), hits.end(), better);
     }
     for (size_t i = 0; i < hits.size() && out.size() < limit; i++) {
         ResultItem r{ResultKind::Setting, hits[i].p->name, L"",

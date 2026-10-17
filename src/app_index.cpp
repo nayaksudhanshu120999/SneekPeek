@@ -564,23 +564,26 @@ int FuzzyScore(const std::wstring& nameLower, const std::wstring& queryLower) {
 std::vector<ScoredApp> SearchAppsLower(const std::vector<AppEntry>& apps,
                                        const std::wstring& q,
                                        size_t limit) {
-    if (q.empty()) return {};
+    if (q.empty() || limit == 0) return {};
     std::vector<ScoredApp> hits;
     hits.reserve(32);
     for (const auto& app : apps) {
         int s = FuzzyScore(app.lower, q);
         if (s >= 0) hits.push_back({&app, s});
     }
-    // Only `limit` rows are ever used, so sort just that prefix. A 1-2 char
-    // query matches most of the index as a weak subsequence, and the previous
-    // full std::sort ranked thousands of entries only to keep 4.
-    if (limit && hits.size() > limit) {
+    // Results are ALWAYS returned best-first, so the sort must run even when
+    // everything already fits under the limit. A 1-2 char query matches most
+    // of the index as a weak subsequence, so only the prefix of that size is
+    // ranked rather than the whole match list.
+    auto better = [](const ScoredApp& x, const ScoredApp& y) {
+        return x.score > y.score;
+    };
+    if (hits.size() > limit) {
         std::partial_sort(hits.begin(), hits.begin() + (std::ptrdiff_t)limit,
-                          hits.end(),
-                          [](const ScoredApp& x, const ScoredApp& y) {
-                              return x.score > y.score;
-                          });
+                          hits.end(), better);
         hits.resize(limit);
+    } else {
+        std::sort(hits.begin(), hits.end(), better);
     }
     return hits;
 }

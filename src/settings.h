@@ -311,12 +311,15 @@ inline std::vector<std::wstring> SplitPipe(const std::wstring& s) {
 // in-memory defaults for the lists, so the palette works before the full
 // lists are loaded. Call LoadSettingsLists() (via EnsureSettingsLists in
 // main.cpp) on first interactive use.
-inline void LoadSettingsCore(Settings& s) {
+//
+// `ini` defaults to the real %APPDATA% path. It is a parameter only so the
+// unit tests can point the loader at a scratch file; production callers always
+// take the default.
+inline void LoadSettingsCore(Settings& s, const std::wstring& ini = SettingsPath()) {
     s.bangs = DefaultBangs();
     // Seed one example so the feature is discoverable until lists load.
     s.quicks = {{L"Gmail", L"https://mail.google.com"}};
     s.hiddenApps.clear();
-    const std::wstring& ini = SettingsPath(); // resolved once per process
     wchar_t buf[4096];
     GetPrivateProfileStringW(L"General", L"EngineUrl", s.engineUrl.c_str(),
                              buf, 4096, ini.c_str());
@@ -346,8 +349,8 @@ inline void LoadSettingsCore(Settings& s) {
 
 // Deferred lists: hidden apps + bangs + quick links (dozens of INI reads).
 // Runs once on first palette show / Settings open / pre-save, never at boot.
-inline void LoadSettingsLists(Settings& s) {
-    const std::wstring& ini = SettingsPath();
+// `ini` defaults to the real %APPDATA% path; see LoadSettingsCore.
+inline void LoadSettingsLists(Settings& s, const std::wstring& ini = SettingsPath()) {
     wchar_t buf[4096];
     int hcount = GetPrivateProfileIntW(L"General", L"HiddenCount", -1, ini.c_str());
     if (hcount >= 0) {
@@ -368,9 +371,13 @@ inline void LoadSettingsLists(Settings& s) {
     // deleted. Reading the default as 0 conflated those two cases, so deleting
     // the last bang resurrected all 11 defaults on the next launch. This now
     // mirrors the [Quick] block below exactly.
+    //
+    // The clamp must stay INSIDE the count>0 arm: ClampCustomCount maps -1 to 0,
+    // so clamping first would make "key absent" indistinguishable from
+    // "explicitly 0" and wipe the defaults on every first run.
     int count = GetPrivateProfileIntW(L"Bangs", L"Count", -1, ini.c_str());
-    count = ClampCustomCount(count); // clamp, never drop all
     if (count > 0) {
+        count = ClampCustomCount(count);
         std::vector<Bang> custom;
         wchar_t key[32];
         for (int i = 0; i < count; i++) {

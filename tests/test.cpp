@@ -496,7 +496,12 @@ int main() {
         CHECK(ParseThemeLine(L"Bg = #000000", key, c) && key == L"Bg" &&
               c == RGB(0, 0, 0));
         CHECK(ParseThemeLine(L"  text=#F0F0F0  ", key, c) && key == L"Text");
-        CHECK(ParseThemeLine(L"powhib=160110FF", key, c) && key == L"PowHib");
+        // Lowercase key is canonicalised to "PowHib", and a bare 6-digit hex
+        // value (no '#') with lowercase digits parses to the same color as the
+        // default above. Was "160110FF", which is 8 digits -- ParseColor
+        // requires exactly 6, so this assertion could never have passed.
+        CHECK(ParseThemeLine(L"powhib=a06eff", key, c) && key == L"PowHib" &&
+              c == RGB(160, 110, 255));
         CHECK(!ParseThemeLine(L"# a comment", key, c));
         CHECK(!ParseThemeLine(L"", key, c));
         CHECK(!ParseThemeLine(L"NoEqualsHere", key, c));
@@ -646,7 +651,11 @@ int main() {
         s.history = {{ResultKind::App, L"Cam",
                       L"shell:AppsFolder\\X!App", true},
                      {ResultKind::Web, L"a ; query", L"", false},
-                     {ResultKind::File, L"a.txt", L"C:\\a;b.txt", false}};
+                     // File/Folder rows serialize ONLY the path; the title is
+                     // re-derived from it by HistoryBaseName on load. So the
+                     // title here must be the basename of the action, which is
+                     // what the app stores in the first place.
+                     {ResultKind::File, L"a;b.txt", L"C:\\a;b.txt", false}};
 
         // Serialize once, then read every section back through the profile API.
         IniBuf b;
@@ -730,6 +739,15 @@ int main() {
             CHECK(ph.kind == s.history[(size_t)i].kind &&
                   ph.title == s.history[(size_t)i].title &&
                   ph.action == s.history[(size_t)i].action);
+        }
+        // ...except that a File row's title is derived, never stored, so a
+        // title that disagrees with its own basename is replaced on load.
+        {
+            HistoryItem ph;
+            CHECK(ParseHistoryLine(L"F|C:\\a;b.txt", ph) &&
+                  ph.kind == ResultKind::File &&
+                  ph.action == L"C:\\a;b.txt" &&
+                  ph.title == L"a;b.txt");
         }
         // Non-ASCII must survive the UTF-16 BOM (otherwise it reads as mojibake).
         {
@@ -828,8 +846,8 @@ int main() {
 
         // Load it back the way the app does.
         Settings back;
-        LoadSettingsCore(back);
-        LoadSettingsLists(back);
+        LoadSettingsCore(back, real);
+        LoadSettingsLists(back, real);
         CHECK(back.engineUrl == s.engineUrl);
         CHECK(back.engineName == s.engineName);
         CHECK(back.browserPath == s.browserPath);
@@ -862,8 +880,8 @@ int main() {
             bad.put(L"Bang1", L"also|bad|novars%s");
             CHECK(WriteTextFileAtomic(real, bad.text));
             Settings loaded;
-            LoadSettingsCore(loaded);   // seeds the defaults...
-            LoadSettingsLists(loaded);
+            LoadSettingsCore(loaded, real);   // seeds the defaults...
+            LoadSettingsLists(loaded, real);
             CHECK(loaded.bangs.empty()); // ...which the explicit list must win over
             // Sanity: a well-formed list of the same shape does load.
             IniBuf good;
@@ -872,8 +890,8 @@ int main() {
             good.put(L"Bang0", L"x, xx | X | https://example.com/?q=%s");
             CHECK(WriteTextFileAtomic(real, good.text));
             Settings loaded2;
-            LoadSettingsCore(loaded2);
-            LoadSettingsLists(loaded2);
+            LoadSettingsCore(loaded2, real);
+            LoadSettingsLists(loaded2, real);
             CHECK(loaded2.bangs.size() == 1 &&
                   loaded2.bangs[0].name == L"X" &&
                   loaded2.bangs[0].aliases.size() == 2);
@@ -889,20 +907,24 @@ int main() {
             none.putInt(L"Count", 0); // what SaveSettings writes for an empty list
             CHECK(WriteTextFileAtomic(real, none.text));
             Settings cleared;
-            LoadSettingsCore(cleared);   // seeds DefaultBangs()...
+            LoadSettingsCore(cleared, real);   // seeds DefaultBangs()...
             CHECK(!cleared.bangs.empty());
-            LoadSettingsLists(cleared);
+            LoadSettingsLists(cleared, real);
             CHECK(cleared.bangs.empty()); // ...which Count=0 must override
 
             // No [Bangs] section at all (first run / hand-written INI): the
             // defaults are the right answer, so the two cases must not collide.
+            // This is the case that catches a clamp placed BEFORE the count
+            // test: ClampCustomCount(-1) == 0, so an early clamp turns "key
+            // absent" into "explicitly 0" and wipes the defaults on every
+            // first run -- trading the original bug for a worse one.
             IniBuf absent;
             absent.open(L"General");
             absent.put(L"EngineUrl", L"https://example.com/?q=%s");
             CHECK(WriteTextFileAtomic(real, absent.text));
             Settings fresh;
-            LoadSettingsCore(fresh);
-            LoadSettingsLists(fresh);
+            LoadSettingsCore(fresh, real);
+            LoadSettingsLists(fresh, real);
             CHECK(fresh.bangs.size() == DefaultBangs().size());
             CHECK(!fresh.bangs.empty());
         }
@@ -915,8 +937,8 @@ int main() {
             none.putInt(L"Count", 0);
             CHECK(WriteTextFileAtomic(real, none.text));
             Settings cleared;
-            LoadSettingsCore(cleared);   // seeds the Gmail example...
-            LoadSettingsLists(cleared);
+            LoadSettingsCore(cleared, real);   // seeds the Gmail example...
+            LoadSettingsLists(cleared, real);
             CHECK(cleared.quicks.empty());
 
             IniBuf absent;
@@ -924,8 +946,8 @@ int main() {
             absent.put(L"EngineUrl", L"https://example.com/?q=%s");
             CHECK(WriteTextFileAtomic(real, absent.text));
             Settings fresh;
-            LoadSettingsCore(fresh);
-            LoadSettingsLists(fresh);
+            LoadSettingsCore(fresh, real);
+            LoadSettingsLists(fresh, real);
             CHECK(fresh.quicks.size() == 1 && fresh.quicks[0].name == L"Gmail");
         }
         DeleteFileW(real.c_str());
@@ -983,26 +1005,32 @@ int main() {
         size_t pos = 12345;
         CHECK(FileScoreTierFind(L"all files", L"", pos) == 0 && pos == (size_t)-1);
         CHECK(FileScoreTierFind(L"readme.txt", L"zzz", pos) == -1);
+        // Tier 1 is EXACT match only: a prefix scores 50000 - nameLen, which is
+        // always below the tier-1 threshold, so "readme.txt"/"read" lands in 2
+        // (with pos 0, which is what keeps prefixes ahead of other substrings).
         CHECK(FileScoreTierFind(L"readme", L"readme", pos) == 1 && pos == 0);
-        CHECK(FileScoreTierFind(L"readme.txt", L"read", pos) == 1 && pos == 0);
-        CHECK(FileScoreTierFind(L"mydocs.txt", L"doc", pos) == 2 && pos == 3);
+        CHECK(FileScoreTierFind(L"readme.txt", L"read", pos) == 2 && pos == 0);
+        CHECK(FileScoreTierFind(L"mydocs.txt", L"doc", pos) == 2 && pos == 2);
         CHECK(FileScoreTierFind(L"ado.doc", L"doc", pos) == 2 && pos == 4);
-        // subsequence-only: tier 3, no literal occurrence
-        CHECK(FileScoreTierFind(L"installed", L"all", pos) == 3 &&
+        // subsequence-only: no literal occurrence, so tier 3 and pos stays npos
+        CHECK(FileScoreTierFind(L"installed", L"ald", pos) == 3 &&
               pos == (size_t)-1);
         // tier wrapper agrees
         CHECK(FileScoreTier(L"mydocs.txt", L"doc") == 2);
+        CHECK(FileScoreTier(L"readme", L"readme") == 1);
     }
     // ToLower / ToLowerInPlace must agree, and neither may disturb its input.
+    // ASCII only: the app never calls setlocale, so towlower runs in the "C"
+    // locale and leaves non-ASCII alone (matching the pre-existing behaviour).
     {
-        std::wstring src = L"MiXeD ÄÖÜ 123";
+        std::wstring src = L"MiXeD Case 123";
         std::wstring byValue = src;
         std::wstring folded = ToLower(src);
-        CHECK(folded == byValue);        // ToLower leaves the source alone
-        CHECK(wcscmp(src.c_str(), L"MiXeD ÄÖÜ 123") == 0);
+        CHECK(folded == L"mixed case 123");   // ASCII folded
+        CHECK(wcscmp(src.c_str(), L"MiXeD Case 123") == 0); // source untouched
+        CHECK(byValue == L"MiXeD Case 123");  // caller's copy untouched
         ToLowerInPlace(byValue);
-        CHECK(byValue == folded);        // same result in place
-        CHECK(byValue == L"mixed äöü 123");
+        CHECK(byValue == folded);             // same result, in place
         CHECK(ToLower(L"").empty());
         std::wstring e; ToLowerInPlace(e); CHECK(e.empty());
     }
@@ -1030,9 +1058,14 @@ int main() {
         CHECK(SearchAppsLower(apps, L"waytoolongquery", 7).empty());
         // limit 0 must not crash and must yield nothing
         CHECK(SearchAppsLower(apps, L"c", 0).empty());
-        // whitespace-only queries match nothing in both entry points
+        // Whitespace-only queries: SearchApps trims first, so it finds nothing.
         CHECK(SearchApps(apps, L"   ", 5).empty());
-        CHECK(SearchAppsLower(apps, L"  ", 5).empty());
+        // SearchAppsLower does NOT trim -- that is the contract, so the palette
+        // can lowercase+trim once and share the query. Untrimmed blanks are
+        // real characters, so a two-space query is a (degenerate) subsequence
+        // match against a two-word name. Asserted to pin that down, because
+        // silently trimming here would be an extra per-keystroke allocation.
+        CHECK(!SearchAppsLower(apps, L"  ", 5).empty());
         // trimming: SearchApps strips surrounding space, SearchAppsLower
         // expects it already stripped - same result for the same text
         auto padded = SearchApps(apps, L"  code  ", 5);

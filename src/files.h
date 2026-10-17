@@ -55,8 +55,11 @@ inline int FileFuzzyScore(const std::wstring& nameLower, const std::wstring& fil
     return FuzzyScore(nameLower, filterLower);
 }
 
-// Coarse tier so ranking stays predictable: exact/prefix (1) beats
-// contiguous substring (2) beats fuzzy subsequence (3); -1 never matches.
+// Coarse tier so ranking stays predictable: exact (1) beats contiguous
+// substring (2) beats fuzzy subsequence (3); -1 never matches. Note that
+// FuzzyScore's prefix bonus (50000 - nameLen) sits just below the tier-1
+// threshold, so a prefix is tier 2 with pos 0 -- which still outranks every
+// other substring because position is compared within the tier.
 // Within a tier, earliest occurrence wins (keeps "mydocs" ahead of "ado.doc"
 // for "doc"), then Explorer's natural order. Pure, unit-tested.
 //
@@ -70,7 +73,7 @@ inline int FileScoreTierFind(const std::wstring& nameLower,
     if (filterLower.empty()) return 0;
     int s = FileFuzzyScore(nameLower, filterLower);
     if (s < 0) return -1;
-    if (s >= 50000) { posOut = 0; return 1; } // exact or prefix: starts at 0
+    if (s >= 50000) { posOut = 0; return 1; } // exact match only: starts at 0
     posOut = nameLower.find(filterLower);
     return posOut != std::wstring::npos ? 2 : 3;
 }
